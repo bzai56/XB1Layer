@@ -33,8 +33,8 @@ macro_rules! wlog {
 /// a title makes every frame do not flood the log.
 macro_rules! wlog_rare {
     ($($t:tt)*) => {{
-        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        static RARE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = RARE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if n <= 20 || n.is_power_of_two() {
             crate::raw_log(format_args!($($t)*))
         }
