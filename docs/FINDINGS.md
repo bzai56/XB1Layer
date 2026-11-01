@@ -122,13 +122,12 @@ So no fixed index installed by hand is reliable. Two partial mitigations are in 
 After the TLS and allocator fixes the title survives loading `WindowsCodecs.dll` and continues, and the end of the run changed several times:
 1. **Fast-fail from `terminate()`.** The title requests `CoreApplication`'s second console-only interface, `42A6A529-3CC6-4867-B5B7-6D1FAF5325F9`, gets `E_NOINTERFACE`, C++/CX throws `InvalidCastException`, nothing catches it, and the C runtime calls `terminate()`. (The other extension interface, `9FF3799E-...`, is tolerated by the title, and serving it with the generic stand-in breaks things, so it stays unimplemented.) The factory now serves `42A6A529` with the generic stand-in. The title then calls **slot 7 with the value `1`** on it; the stand-in reports success and writes nothing.
 2. ~~A NULL write at `title+0x1960158`~~ Explained above (console protection bits), fixed.
-3. **Another fault at `title+0x17cdbe0`** with TLS intact, in the runs where the TLS fault does not occur first. Not investigated.
+3. **The one remaining fault, at `title+0x17cdbe0`**, now the end of every run. A render-side thread (started through the title's own `CreateThread`) loads a graphics object from `[r14+0x40]`, which is NULL, and calls **vtable slot 321** on it (`call [rax+0xA08]`, argument `1`). Desktop `ID3D11DeviceContext` has around 115 methods, so slot 321 can only be a console-only method of the extended context (`ID3D11DeviceContextX`). So even with the pointer set, the desktop context handed out by `D3D11XCreateDeviceX` would be read past the end of its vtable. The graphics shim has to provide an extended device and context.
 
 ## Next investigation steps
-1. Make `ntdll` own the title's static TLS (helper DLL with a TLS directory), then re-check the faults that remain.
-2. Investigate `title+0x17cdbe0`.
-3. Work out what slot 7 of `42A6A529` is (it takes a small value `1`).
-4. Pin down the console `ICoreWindow` layout: keep logging slots as the title uses more of them, and keep stand-in behavior per slot only where the call pattern justifies it.
+1. Provide an extended `ID3D11DeviceX` / `ID3D11DeviceContextX` (proxy objects with the console vtable layout forwarding the standard methods to desktop D3D11), and find out why `[r14+0x40]` is NULL.
+2. Work out what slot 7 of `42A6A529` is (it takes a small value `1`).
+3. Pin down the console `ICoreWindow` layout: keep logging slots as the title uses more of them, and keep stand-in behavior per slot only where the call pattern justifies it.
 3. Implement `DXGIXSetVLineNotification`, `DXGIXPresentArray` and any other `DXGIX*` the title uses.
 3. Work out the real shape of the `PackageTransferManager` interfaces, from the title's own usage or from the console SDK's published API reference if available, and implement them for real.
 3. Implement `DXGIXSetVLineNotification` and the rest of the `d3d11_x` surface.

@@ -14,8 +14,8 @@
 3i. ~~**NULL read at `title+0x156fab7`**~~ Done: the title's `ICoreWindow` has a console layout (slot 7 = Dispatcher). The title's main loop now runs.
 3j. ~~**Worker-thread fault at `ntdll+0x5ac00`**~~ Done: the TLS pointer array was allocated with `VirtualAlloc` and `ntdll` freed it as a heap block when the title loaded `WindowsCodecs.dll`. Now allocated from the process heap.
 3j2. ~~NULL write at `title+0x1960158`~~ Done: the title's own allocator crash after a `VirtualAlloc` with console-only protection bits (`0x10000`) failed; the shim now masks protection.
-3j4. **Static TLS owned by `ntdll`**: a helper DLL with a TLS directory, so the loader keeps the title's block for every thread through DLL loads. Replaces the hand-built TEB vector.
-3j5. **Fault at `title+0x17cdbe0`.**
+3j4. ~~**Static TLS owned by `ntdll`**~~ Done: a toolchain-built helper DLL, patched so the loader's block starts at the title's template. The hand-built vector remains as `--legacy-tls`.
+3j5. **Extended D3D11 device and context** (`ID3D11DeviceX`, `ID3D11DeviceContextX`): the title's last fault calls vtable slot 321 of the context, far past the desktop vtable. Needs proxy objects with the console layout, and the reason `[r14+0x40]` is NULL.
 3j3. **Decode the two `CoreApplication` console extension interfaces** (`42A6A529`, `9FF3799E`).
 3k. **Console `ICoreWindow` layout**: pin down the member list, then raise window events (activation, size, visibility, input).
 4. **`kernelx` shim**: real implementations of the most-called functions, driven by stub-hit logs.

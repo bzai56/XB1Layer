@@ -8,6 +8,7 @@
 //! Usage: xb1layer <file.exe> [--run]
 
 mod gpu;
+mod tlsdll;
 mod winrt;
 
 use std::collections::{BTreeMap, HashSet};
@@ -215,8 +216,12 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
             let teb: usize;
             std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb, options(nostack, readonly, preserves_flags));
             let arr = *((teb + 0x58) as *const usize);
-            let entry = if arr > 0x10000 { *((arr + TLS_TITLE_INDEX * 8) as *const usize) } else { 0 };
-            rlog!("  thread {}: TLS array {arr:#x}, entry[{TLS_TITLE_INDEX}] = {entry:#x}", GetCurrentThreadId());
+            let idx = match NTDLL_TLS_INDEX.load(Ordering::Relaxed) {
+                usize::MAX => TLS_TITLE_INDEX,
+                i => i,
+            };
+            let entry = if arr > 0x10000 { *((arr + idx * 8) as *const usize) } else { 0 };
+            rlog!("  thread {}: TLS array {arr:#x}, entry[{idx}] = {entry:#x}", GetCurrentThreadId());
             // ThreadQuerySetWin32StartAddress = 9
             let mut start = 0usize;
             if NtQueryInformationThread(GetCurrentThread(), 9, &mut start as *mut usize as *mut c_void, 8, ptr::null_mut()) == 0 {
@@ -351,6 +356,34 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
 /// notion of the current size, so a high index (100 was tried) is lost; this one is kept low
 /// enough to stay inside that range while being above any index real modules receive.
 const TLS_TITLE_INDEX: usize = 60;
+
+/// TLS index assigned by the loader to the helper DLL, or `usize::MAX` when the hand-built
+/// vector is used instead.
+static NTDLL_TLS_INDEX: AtomicUsize = AtomicUsize::new(usize::MAX);
+static LEGACY_TLS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Loads the helper DLL that makes `ntdll` own the title's static TLS. Must run before the
+/// thread that executes title code is created.
+unsafe fn prepare_ntdll_tls(base: *mut u8, tls: (u32, u32)) -> Result<u32, String> {
+    let d = unsafe { base.add(tls.0 as usize) };
+    let (start, end, zero_fill) = unsafe { (*(d as *const u64) as usize, *(d.add(8) as *const u64) as usize, *(d.add(32) as *const u32) as usize) };
+    let template = unsafe { std::slice::from_raw_parts(start as *const u8, end - start) };
+    // Snapshot this thread's TLS vector so the loader's effect is visible.
+    let snapshot = || -> Vec<usize> {
+        let teb: usize;
+        unsafe { std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb, options(nostack, readonly, preserves_flags)) };
+        let vector = unsafe { *((teb + 0x58) as *const *const usize) };
+        (0..24).map(|i| unsafe { *vector.add(i) }).collect()
+    };
+    let before = snapshot();
+    println!("host executable's own TLS index: {:?}", unsafe { tlsdll::host_tls_index() });
+    let index = unsafe { tlsdll::load_helper(template, zero_fill)? };
+    let after = snapshot();
+    let changed: Vec<usize> = (0..24).filter(|&i| before[i] != after[i]).collect();
+    println!("TLS vector slots changed by loading the helper DLL: {changed:?}");
+    NTDLL_TLS_INDEX.store(index as usize, Ordering::Relaxed);
+    Ok(index)
+}
 static TLS_TEMPLATE: AtomicUsize = AtomicUsize::new(0);
 static TLS_LEN: AtomicUsize = AtomicUsize::new(0);
 static TLS_TOTAL: AtomicUsize = AtomicUsize::new(0);
@@ -389,6 +422,9 @@ thread_local! {
 
 /// Installs the title's static TLS on the calling thread once.
 fn ensure_tls_on_current_thread() {
+    if NTDLL_TLS_INDEX.load(Ordering::Relaxed) != usize::MAX {
+        return; // the loader already gave this thread its block
+    }
     TLS_READY.with(|ready| {
         if !ready.get() {
             unsafe { install_tls_for_current_thread() };
@@ -481,12 +517,33 @@ unsafe fn bootstrap(base: *mut u8, size: usize, tls: (u32, u32), exc: (u32, u32)
         let zero_fill = *(d.add(32) as *const u32) as usize;
         let len = end - start;
 
-        TLS_TEMPLATE.store(start, Ordering::Relaxed);
-        TLS_LEN.store(len, Ordering::Relaxed);
-        TLS_TOTAL.store(len + zero_fill, Ordering::Relaxed);
-        *idx_ptr = TLS_TITLE_INDEX as u32;
-        install_tls_for_current_thread();
-        println!("static TLS: {len} bytes + {zero_fill} zero-fill at index {TLS_TITLE_INDEX}");
+        let ntdll_index = NTDLL_TLS_INDEX.load(Ordering::Relaxed);
+        if ntdll_index != usize::MAX {
+            // The loader owns the block (see tlsdll.rs): every thread already has it.
+            *idx_ptr = ntdll_index as u32;
+            println!("static TLS: {len} bytes + {zero_fill} zero-fill, owned by ntdll at index {ntdll_index} (helper DLL)");
+            // Check that this thread's block really starts with the title's template.
+            let teb: usize;
+            std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb, options(nostack, readonly, preserves_flags));
+            let vector = *((teb + 0x58) as *const *const usize);
+            let block = *vector.add(ntdll_index) as *const u8;
+            if block.is_null() {
+                println!("TLS check: this thread has no block at index {ntdll_index}");
+            } else {
+                let (a, b) = (std::slice::from_raw_parts(block, len), std::slice::from_raw_parts(start as *const u8, len));
+                match a.iter().zip(b).position(|(x, y)| x != y) {
+                    None => println!("TLS check: block at {block:p} matches the title's template ({len} bytes)"),
+                    Some(i) => println!("TLS check: block at {block:p} differs from the template at offset {i:#x} ({:#x} vs {:#x})", a[i], b[i]),
+                }
+            }
+        } else {
+            TLS_TEMPLATE.store(start, Ordering::Relaxed);
+            TLS_LEN.store(len, Ordering::Relaxed);
+            TLS_TOTAL.store(len + zero_fill, Ordering::Relaxed);
+            *idx_ptr = TLS_TITLE_INDEX as u32;
+            install_tls_for_current_thread();
+            println!("static TLS: {len} bytes + {zero_fill} zero-fill at index {TLS_TITLE_INDEX} (hand-built vector)");
+        }
 
         if !callbacks.is_null() {
             let mut i = 0;
@@ -1175,6 +1232,12 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool, dump_iat: bool) -> Res
         // TLS setup in `bootstrap` patches the calling thread's TEB, so do both on a
         // dedicated thread.
         let (base_addr, entry_addr) = (base as usize, base as usize + entry as usize);
+        if tls_dir.0 != 0 && !LEGACY_TLS.load(Ordering::Relaxed) {
+            match unsafe { prepare_ntdll_tls(base, tls_dir) } {
+                Ok(index) => println!("helper TLS DLL loaded; the loader assigned TLS index {index}"),
+                Err(e) => println!("helper TLS DLL failed ({e}); falling back to the hand-built TLS vector"),
+            }
+        }
         let worker = std::thread::Builder::new()
             .stack_size(256 << 20)
             .spawn(move || -> Result<u32, String> {
@@ -1214,6 +1277,38 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool, dump_iat: bool) -> Res
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
+    if let Some(dll) = args.iter().find_map(|a| a.strip_prefix("--test-tls-load=")) {
+        // Diagnostic: does loading a DLL that has static TLS change this thread's TLS vector?
+        let snapshot = || -> Vec<usize> {
+            let teb: usize;
+            unsafe { std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb, options(nostack, readonly, preserves_flags)) };
+            let vector = unsafe { *((teb + 0x58) as *const *const usize) };
+            (0..48).map(|i| unsafe { *vector.add(i) }).collect()
+        };
+        let before = snapshot();
+        let wide: Vec<u16> = dll.encode_utf16().chain(std::iter::once(0)).collect();
+        let m = unsafe { LoadLibraryExW(wide.as_ptr(), ptr::null_mut(), 0) };
+        let after = snapshot();
+        let changed: Vec<usize> = (0..48).filter(|&i| before[i] != after[i]).collect();
+        println!("LoadLibraryExW({dll}) -> {m:p}; TLS vector slots changed: {changed:?}");
+        unsafe { tlsdll::report_loader_entry(m as usize) };
+        // If the DLL exports `xb1_block`, report where that buffer sits inside the loader's block.
+        let proc = unsafe { GetProcAddress(m, c"xb1_block".as_ptr()) };
+        if !proc.is_null() {
+            let f: extern "system" fn() -> *mut u8 = unsafe { std::mem::transmute(proc) };
+            let buf = f() as usize;
+            let teb: usize;
+            unsafe { std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb, options(nostack, readonly, preserves_flags)) };
+            let vector = unsafe { *((teb + 0x58) as *const *const usize) };
+            for &i in &changed {
+                let block = unsafe { *vector.add(i) };
+                if buf >= block && buf - block < 0x2000 {
+                    println!("xb1_block() = {buf:#x}; TLS slot {i} block = {block:#x}; buffer offset inside the block = {:#x}", buf - block);
+                }
+            }
+        }
+        process::exit(0);
+    }
     if args.iter().any(|a| a == "--test-d3d") {
         // Exercises the D3D11.X -> desktop D3D11 device creation without loading a title.
         let (mut dev, mut ctx) = (ptr::null_mut(), ptr::null_mut());
@@ -1241,6 +1336,7 @@ fn main() {
             process::exit(1);
         }
     }
+    LEGACY_TLS.store(args.iter().any(|a| a == "--legacy-tls"), Ordering::Relaxed);
     NO_PEB_PATCH.store(args.iter().any(|a| a == "--no-peb-patch"), Ordering::Relaxed);
     TRACE_WINDOW.store(args.iter().any(|a| a == "--trace-window"), Ordering::Relaxed);
     TRACE_API.store(ring_path.is_some() || args.iter().any(|a| a == "--trace-api"), Ordering::Relaxed);

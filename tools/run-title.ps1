@@ -7,7 +7,8 @@ param(
     [int]$Seconds = 20,
     [switch]$Ring,                       # also write a crash-proof trace to trace.ring
     [string[]]$ExtraArgs = @(),
-    [int]$Tail = 0                       # when > 0, only show the last N stderr lines
+    [int]$Tail = 0,                      # when > 0, only show the last N stderr lines
+    [switch]$Stdout                      # also print what the layer wrote to stdout (setup messages)
 )
 
 $root = Split-Path -Parent $PSScriptRoot
@@ -28,6 +29,7 @@ $out = $p.StandardOutput.ReadToEndAsync()
 $done = $p.WaitForExit($Seconds * 1000)
 if (-not $done) { $p.Kill(); $p.WaitForExit() }
 "exited on its own: $done, exit code: 0x{0:X}" -f $p.ExitCode
+if ($Stdout) { "--- stdout"; $out.Result -split "`r?`n" | Where-Object { $_ }; "--- stderr" }
 $lines = $err.Result -split "`r?`n"
 if ($Tail -gt 0) { $lines = $lines | Select-Object -Last $Tail }
 $lines
