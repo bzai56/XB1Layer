@@ -569,6 +569,8 @@ struct GenericObj {
     refs: AtomicU32,
     class: String,
     iid: GUID,
+    /// 0 = fully generic; 1 = the console audio extension of the MMDevice enumerator.
+    kind: u8,
 }
 
 unsafe extern "system" fn generic_qi(this: *mut c_void, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
@@ -615,8 +617,21 @@ fn is_writable(p: *mut c_void) -> bool {
 /// `this` is treated as a possible out-parameter: if it points at writable memory, a new
 /// stand-in object is stored there and the call reports success (the common shape of a
 /// property getter or factory method). Otherwise the call fails with E_NOTIMPL.
-unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: *mut c_void) -> HRESULT {
+unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: *mut c_void, arg2: *mut c_void) -> HRESULT {
     let o = unsafe { &*(this as *const GenericObj) };
+    if o.kind == 1 {
+        // Console audio extension: the title calls slot 9 with a pointer to its own object
+        // (looks like registering a callback) and slot 8 with two out-pointers that look
+        // like 32-bit values. Meaning unknown; report zeros and success.
+        if N == 8 && is_writable(arg1) && is_writable(arg2) {
+            unsafe {
+                *(arg1 as *mut u32) = 0;
+                *(arg2 as *mut u32) = 0;
+            }
+        }
+        wlog!("[winrt] {} slot {N} called (arg1={arg1:p}, arg2={arg2:p}) -> S_OK", o.class);
+        return HRESULT(0);
+    }
     if is_writable(arg1) {
         let child = create_generic(&format!("{}#slot{N}", o.class), &o.iid);
         unsafe { *(arg1 as *mut *mut c_void) = child };
@@ -653,7 +668,104 @@ fn generic_vtbl() -> *const usize {
 }
 
 fn create_generic(class: &str, iid: &GUID) -> *mut c_void {
-    Box::into_raw(Box::new(GenericObj { vtbl: generic_vtbl(), refs: AtomicU32::new(1), class: class.to_owned(), iid: *iid })) as *mut c_void
+    Box::into_raw(Box::new(GenericObj { vtbl: generic_vtbl(), refs: AtomicU32::new(1), class: class.to_owned(), iid: *iid, kind: 0 })) as *mut c_void
+}
+
+// ---------------------------------------------------------------------------------------
+// MMDevice enumerator proxy
+// ---------------------------------------------------------------------------------------
+//
+// The title creates the standard MMDeviceEnumerator, then queries it for an interface that
+// only exists on the console (an audio extension). The proxy forwards everything standard
+// to the real enumerator and answers that one IID with a stand-in.
+
+const CLSID_MM_DEVICE_ENUMERATOR: GUID = GUID::from_u128(0xBCDE0395_E52F_467C_8E3D_C4579291692E);
+const IID_MM_DEVICE_ENUMERATOR: GUID = GUID::from_u128(0xA95664D2_9614_4F35_A746_DE8DB63617E6);
+const IID_XBOX_AUDIO_EXTENSION: GUID = GUID::from_u128(0x8B557ADC_555E_47A0_B223_43477E481DAD);
+
+#[repr(C)]
+struct MmProxy {
+    vtbl: *const usize,
+    refs: AtomicU32,
+    real: *mut c_void,
+}
+
+unsafe extern "system" fn mm_qi(this: *mut c_void, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    let p = unsafe { &*(this as *const MmProxy) };
+    let iid = unsafe { *iid };
+    if iid == IUnknown::IID || iid == IID_MM_DEVICE_ENUMERATOR {
+        p.refs.fetch_add(1, Ordering::AcqRel);
+        unsafe { *out = this };
+        return HRESULT(0);
+    }
+    if iid == IID_XBOX_AUDIO_EXTENSION {
+        let o = create_generic("MMDevAPI console audio extension", &iid);
+        unsafe {
+            (*(o as *mut GenericObj)).kind = 1;
+            *out = o;
+        }
+        wlog!("[winrt] MMDeviceEnumerator: QueryInterface for the console audio extension -> stand-in");
+        return HRESULT(0);
+    }
+    // Anything else goes to the real object.
+    let real_qi: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT =
+        unsafe { std::mem::transmute(*(*(p.real as *const *const usize))) };
+    unsafe { real_qi(p.real, &iid, out) }
+}
+
+unsafe extern "system" fn mm_add_ref(this: *mut c_void) -> u32 {
+    unsafe { (*(this as *const MmProxy)).refs.fetch_add(1, Ordering::AcqRel) + 1 }
+}
+
+unsafe extern "system" fn mm_release(this: *mut c_void) -> u32 {
+    let left = unsafe { (*(this as *const MmProxy)).refs.fetch_sub(1, Ordering::AcqRel) - 1 };
+    if left == 0 {
+        let p = unsafe { Box::from_raw(this as *mut MmProxy) };
+        let real_release: unsafe extern "system" fn(*mut c_void) -> u32 =
+            unsafe { std::mem::transmute(*((*(p.real as *const *const usize)).add(2))) };
+        unsafe { real_release(p.real) };
+    }
+    left
+}
+
+/// Forwards IMMDeviceEnumerator method `N` (slots 3..=7, at most 4 arguments) to the real object.
+unsafe extern "system" fn mm_forward<const N: usize>(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize) -> HRESULT {
+    let p = unsafe { &*(this as *const MmProxy) };
+    let f: unsafe extern "system" fn(*mut c_void, usize, usize, usize, usize) -> HRESULT =
+        unsafe { std::mem::transmute(*((*(p.real as *const *const usize)).add(N))) };
+    unsafe { f(p.real, a1, a2, a3, a4) }
+}
+
+fn mm_vtbl() -> *const usize {
+    static VTBL: OnceLock<[usize; 8]> = OnceLock::new();
+    VTBL.get_or_init(|| {
+        [
+            mm_qi as usize,
+            mm_add_ref as usize,
+            mm_release as usize,
+            mm_forward::<3> as usize,
+            mm_forward::<4> as usize,
+            mm_forward::<5> as usize,
+            mm_forward::<6> as usize,
+            mm_forward::<7> as usize,
+        ]
+    })
+    .as_ptr()
+}
+
+/// Called after a successful `CoCreateInstance`. If the object is the standard MMDevice
+/// enumerator, replaces `*out` with a proxy that owns the real object.
+pub fn wrap_co_created(clsid: &GUID, iid: &GUID, out: *mut *mut c_void) {
+    if *clsid != CLSID_MM_DEVICE_ENUMERATOR || (*iid != IID_MM_DEVICE_ENUMERATOR && *iid != IUnknown::IID) {
+        return;
+    }
+    let real = unsafe { *out };
+    if real.is_null() {
+        return;
+    }
+    let proxy = Box::into_raw(Box::new(MmProxy { vtbl: mm_vtbl(), refs: AtomicU32::new(1), real }));
+    unsafe { *out = proxy as *mut c_void };
+    wlog!("[winrt] wrapped MMDeviceEnumerator in a proxy");
 }
 
 // ---------------------------------------------------------------------------------------
@@ -674,6 +786,10 @@ pub fn try_activation_factory(class: &str, iid: &GUID, out: *mut *mut c_void) ->
     let obj = Com::<CoreAppTag>::create(());
     let hr = unsafe { com_query_interface::<CoreAppTag>(obj, iid, out) };
     unsafe { com_release::<CoreAppTag>(obj) };
+    // Note: the title also asks this factory for two console-only extension interfaces
+    // (9FF3799E-6E83-468C-A5B0-501CE6BB0FA1, 42A6A529-3CC6-4867-B5B7-6D1FAF5325F9). Answering
+    // them with the generic stand-in made the title jump to a bogus address (it called a
+    // returned pointer as code), so they are left as E_NOINTERFACE, which the title handles.
     wlog!("[winrt] activation factory for {class}: iid={iid:?} -> {:#x}", hr.0 as u32);
     Some(hr)
 }

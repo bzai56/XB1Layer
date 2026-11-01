@@ -575,6 +575,9 @@ fn override_for(dll: &str, func: &str) -> Option<usize> {
     if dll.eq_ignore_ascii_case("vccorlib140.dll") && func.starts_with("?GetActivationFactoryByPCWSTR") {
         return Some(xb_get_activation_factory as usize);
     }
+    if func == "CoCreateInstance" {
+        return Some(xb_co_create_instance as usize);
+    }
     if !dll.eq_ignore_ascii_case("kernelx.dll") && !dll.eq_ignore_ascii_case("kernel32.dll") {
         return None;
     }
@@ -714,6 +717,22 @@ extern "system" fn xb_get_activation_factory(name: *const u16, guid: *const u8, 
         "  GetActivationFactoryByPCWSTR({:?}, iid={:02x?}) -> hr={:#x}\n",
         wide_to_string(name), g, hr as u32
     ));
+    hr
+}
+
+#[link(name = "ole32")]
+unsafe extern "system" {
+    fn CoCreateInstance(clsid: *const windows::core::GUID, outer: *mut c_void, ctx: u32, iid: *const windows::core::GUID, out: *mut *mut c_void) -> i32;
+}
+
+/// `CoCreateInstance`: passed through to Windows, logging the CLSID, IID and result.
+extern "system" fn xb_co_create_instance(clsid: *const windows::core::GUID, outer: *mut c_void, ctx: u32, iid: *const windows::core::GUID, out: *mut *mut c_void) -> i32 {
+    let hr = unsafe { CoCreateInstance(clsid, outer, ctx, iid, out) };
+    let (c, i) = unsafe { (*clsid, *iid) };
+    if hr == 0 {
+        winrt::wrap_co_created(&c, &i, out);
+    }
+    ring_write(format_args!("  CoCreateInstance(clsid={c:?}, ctx={ctx:#x}, iid={i:?}) -> hr={:#x}\n", hr as u32));
     hr
 }
 
