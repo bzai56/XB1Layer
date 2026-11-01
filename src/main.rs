@@ -7,8 +7,9 @@
 //!
 //! Usage: xb1layer <file.exe> [--run]
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::{c_void, CString};
+use std::path::Path;
 use std::sync::Mutex;
 use std::{env, fs, process, ptr};
 
@@ -95,7 +96,47 @@ impl StubArena {
     }
 }
 
-fn load(data: &[u8], run: bool) -> Result<(), String> {
+/// Prefers a DLL shipped next to the title, then falls back to the system search path.
+fn load_dll(dir: &Path, name: &str) -> *mut c_void {
+    // kernelx.dll is the console's kernel API surface; nearly all of its
+    // exports are standard Win32 names, so forward them to kernel32.
+    // Console-only exports (XMem*, TitleMemoryStatus) are still not found
+    // there and fall through to logging stubs.
+    if name.eq_ignore_ascii_case("kernelx.dll") {
+        return unsafe { LoadLibraryA(c"kernel32.dll".as_ptr()) };
+    }
+    let local = dir.join(name);
+    if local.is_file() {
+        if let Ok(c) = CString::new(local.to_string_lossy().as_bytes()) {
+            let m = unsafe { LoadLibraryA(c.as_ptr()) };
+            if !m.is_null() {
+                return m;
+            }
+        }
+    }
+    let c = CString::new(name).unwrap();
+    unsafe { LoadLibraryA(c.as_ptr()) }
+}
+
+/// Prints every stubbed import grouped by DLL.
+fn print_import_report() {
+    let names = STUB_NAMES.lock().unwrap();
+    let mut by_dll: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for n in names.iter() {
+        let (dll, func) = n.split_once('!').unwrap_or((n, ""));
+        by_dll.entry(dll).or_default().push(func);
+    }
+    println!("\nstubbed imports by DLL:");
+    for (dll, mut funcs) in by_dll {
+        funcs.sort();
+        println!("\n[{dll}] {} functions", funcs.len());
+        for f in funcs {
+            println!("  {f}");
+        }
+    }
+}
+
+fn load(data: &[u8], dir: &Path, run: bool, report: bool) -> Result<(), String> {
     let pe = Pe(data);
     if pe.u16(0)? != 0x5A4D {
         return Err("not an MZ executable".into());
@@ -184,8 +225,7 @@ fn load(data: &[u8], run: bool) -> Result<(), String> {
                 break;
             }
             let dll = unsafe { cstr_at(base, name_rva) };
-            let cdll = CString::new(dll.clone()).unwrap();
-            let module = unsafe { LoadLibraryA(cdll.as_ptr()) };
+            let module = load_dll(dir, &dll);
             let lookup = if oft != 0 { oft } else { ft } as usize;
             let mut i = 0;
             loop {
@@ -223,6 +263,9 @@ fn load(data: &[u8], run: bool) -> Result<(), String> {
         }
     }
     println!("imports: {real} resolved natively, {stubbed} stubbed");
+    if report {
+        print_import_report();
+    }
 
     if run {
         println!("jumping to entry point {:#x}", base as usize + entry as usize);
@@ -234,16 +277,19 @@ fn load(data: &[u8], run: bool) -> Result<(), String> {
 }
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    let Some(path) = args.get(1) else {
-        eprintln!("usage: xb1layer <file.exe> [--run]");
+    let args: Vec<String> = env::args().skip(1).collect();
+    let Some(path) = args.iter().find(|a| !a.starts_with("--")) else {
+        eprintln!("usage: xb1layer <file.exe> [--run] [--imports]");
         process::exit(2);
     };
     let data = fs::read(path).unwrap_or_else(|e| {
         eprintln!("cannot read {path}: {e}");
         process::exit(1);
     });
-    if let Err(e) = load(&data, args.iter().any(|a| a == "--run")) {
+    let dir = Path::new(path).parent().unwrap_or(Path::new("."));
+    let run = args.iter().any(|a| a == "--run");
+    let report = args.iter().any(|a| a == "--imports");
+    if let Err(e) = load(&data, dir, run, report) {
         eprintln!("load failed: {e}");
         process::exit(1);
     }

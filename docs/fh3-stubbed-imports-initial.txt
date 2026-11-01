@@ -1,0 +1,195 @@
+﻿image base 0x140000000 -> mapped at 0x140000000, 16 sections
+  missing DLL (stubbed): EtwPlus.dll
+  missing DLL (stubbed): kernelx.dll
+  missing DLL (stubbed): commonEventLoggingLibrary_Release.dll
+  missing DLL (stubbed): xg_x.dll
+  missing DLL (stubbed): d3d11_x.dll
+  missing DLL (stubbed): AcpHal.dll
+imports: 569 resolved natively, 171 stubbed
+
+stubbed imports by DLL:
+
+[AcpHal.dll] 8 functions
+  AcpHalAllocateShapeContexts
+  AcpHalCreate
+  AcpHalReleaseShapeContexts
+  ApuAlloc
+  ApuCreateHeap
+  ApuFree
+  ApuIsVirtualAddressValid
+  ApuMapVirtualAddress
+
+[EtwPlus.dll] 4 functions
+  EtxEventWrite
+  EtxFillCommonFields_v7
+  EtxRegister
+  EtxUnregister
+
+[MMDevAPI.DLL] 1 functions
+  SetWasapiThreadAffinityMask
+
+[commonEventLoggingLibrary_Release.dll] 9 functions
+  ?CreateCellInternal@CellGlobal@CELL@i343@@CAPEAVICell@details@23@XZ
+  ?Destroy@IEventsIterator@details@CELL@i343@@CAXPEAV1234@@Z
+  ?DestroyCellInternal@CellGlobal@CELL@i343@@CAXPEAVICell@details@23@@Z
+  ?Get@CellGlobalAllocator@details@CELL@i343@@SAPEAVICellAllocator@34@XZ
+  ?Get@CellGlobalAssertHandle@details@CELL@i343@@SAPEAVICellAssertHandle@34@XZ
+  ?Initialize@CellGlobal@CELL@i343@@SAXAEBUCellGlobalConfig@23@@Z
+  ?get_GlobalCellCategorySettings@CELL@i343@@YAPEA_KXZ
+  ?get_GlobalCellPriorities@CELL@i343@@YAPEAEXZ
+  ?get_GlobalEventCreators@CELL@i343@@YAPEAPEAVIEventsCreator@12@XZ
+
+[d3d11_x.dll] 4 functions
+  D3D11XCreateDeviceX
+  D3DMapEsramMemory
+  DXGIXPresentArray
+  DXGIXSetVLineNotification
+
+[kernelx.dll] 138 functions
+  AcquireSRWLockExclusive
+  CancelThreadpoolIo
+  CloseHandle
+  CloseThreadpoolIo
+  CompareFileTime
+  ConvertFiberToThread
+  ConvertThreadToFiber
+  CopyFile2
+  CreateDirectoryA
+  CreateDirectoryW
+  CreateEventA
+  CreateEventExW
+  CreateEventW
+  CreateFiber
+  CreateFile2
+  CreateFileA
+  CreateFileW
+  CreateMutexA
+  CreateMutexW
+  CreateSemaphoreExW
+  CreateThread
+  CreateThreadpoolIo
+  DecodePointer
+  DeleteCriticalSection
+  DeleteFiber
+  DeleteFileA
+  DeleteFileW
+  DuplicateHandle
+  EnterCriticalSection
+  FileTimeToLocalFileTime
+  FileTimeToSystemTime
+  FindClose
+  FindFirstFileExA
+  FindFirstFileW
+  FindNextFileA
+  FindNextFileW
+  FlsAlloc
+  FlushFileBuffers
+  FormatMessageW
+  FreeLibrary
+  GetCurrentProcess
+  GetCurrentProcessId
+  GetCurrentThread
+  GetCurrentThreadId
+  GetDateFormatEx
+  GetDiskFreeSpaceExW
+  GetExitCodeThread
+  GetFileAttributesExA
+  GetFileAttributesExW
+  GetFileAttributesW
+  GetFileInformationByHandleEx
+  GetFileSizeEx
+  GetFullPathNameW
+  GetLastError
+  GetModuleHandleW
+  GetOverlappedResultEx
+  GetProcAddress
+  GetProcessHeap
+  GetStartupInfoW
+  GetSystemTime
+  GetSystemTimeAsFileTime
+  GetThreadId
+  GetThreadPriority
+  GetThreadTimes
+  GetTickCount
+  GetTickCount64
+  GetTimeFormatEx
+  GetUserDefaultLocaleName
+  HeapAlloc
+  HeapFree
+  InitializeConditionVariable
+  InitializeCriticalSection
+  InitializeCriticalSectionAndSpinCount
+  InitializeCriticalSectionEx
+  InitializeSListHead
+  InitializeSRWLock
+  IsDebuggerPresent
+  IsProcessorFeaturePresent
+  LeaveCriticalSection
+  LoadLibraryExW
+  LocaleNameToLCID
+  MoveFileExW
+  MultiByteToWideChar
+  OpenThread
+  OutputDebugStringA
+  OutputDebugStringW
+  QueryPerformanceCounter
+  QueryPerformanceFrequency
+  RaiseException
+  ReadFile
+  ReleaseMutex
+  ReleaseSRWLockExclusive
+  ReleaseSemaphore
+  RemoveDirectoryA
+  ResetEvent
+  ResumeThread
+  RtlCaptureContext
+  RtlLookupFunctionEntry
+  RtlVirtualUnwind
+  SetEndOfFile
+  SetEvent
+  SetFilePointer
+  SetFilePointerEx
+  SetThreadAffinityMask
+  SetThreadIdealProcessorEx
+  SetThreadPriority
+  SetUnhandledExceptionFilter
+  Sleep
+  SleepConditionVariableCS
+  SleepEx
+  StartThreadpoolIo
+  SuspendThread
+  SwitchToFiber
+  SwitchToThread
+  SystemTimeToFileTime
+  TerminateProcess
+  TitleMemoryStatus
+  TlsAlloc
+  TlsFree
+  TlsGetValue
+  TlsSetValue
+  TryEnterCriticalSection
+  UnhandledExceptionFilter
+  VirtualAlloc
+  VirtualFree
+  WaitForMultipleObjects
+  WaitForMultipleObjectsEx
+  WaitForSingleObject
+  WaitForSingleObjectEx
+  WaitForThreadpoolIoCallbacks
+  WakeAllConditionVariable
+  WideCharToMultiByte
+  WriteFile
+  XMemAlloc
+  XMemAllocDefault
+  XMemFree
+  XMemFreeDefault
+  XMemSetAllocationHooks
+
+[xg_x.dll] 7 functions
+  XGComputeOptimalDepthStencilTileModes
+  XGComputeOptimalTileMode
+  XGComputeTexture2DLayout
+  XGComputeTexture3DLayout
+  XGCreateTexture1DComputer
+  XGCreateTexture2DComputer
+  XGCreateTexture3DComputer
