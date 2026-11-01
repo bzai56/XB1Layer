@@ -34,6 +34,7 @@ unsafe extern "system" {
     fn CreateThreadpoolIo(file: *mut c_void, callback: usize, context: *mut c_void, env: *mut c_void) -> *mut c_void;
     fn CreateThread(attrs: *mut c_void, stack: usize, routine: usize, param: *mut c_void, flags: u32, tid: *mut u32) -> *mut c_void;
     fn VirtualFree(addr: *mut c_void, size: usize, ty: u32) -> i32;
+    fn TerminateProcess(process: *mut c_void, code: u32) -> i32;
     fn HeapCreate(options: u32, initial: usize, max: usize) -> *mut c_void;
     fn HeapValidate(heap: *mut c_void, flags: u32, mem: *const c_void) -> i32;
     fn GetProcessHeap() -> *mut c_void;
@@ -67,6 +68,36 @@ static IMG_SIZE: AtomicUsize = AtomicUsize::new(0);
 static TITLE_TID: AtomicU32 = AtomicU32::new(0);
 static WATCH_SECS: AtomicU32 = AtomicU32::new(0);
 static HEAPCHECK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Addresses where `int 0x29` (fast-fail) was replaced by a breakpoint (`--patch-fastfail`).
+static FASTFAIL_SITES: [AtomicUsize; 512] = [const { AtomicUsize::new(0) }; 512];
+
+/// Finds `mov ecx, imm32 (imm32 < 256); int 0x29` sequences in the mapped image and replaces the
+/// `int 0x29` with `int3; nop`, so the crash logger can report the site and the fast-fail code
+/// instead of the process dying silently. Returns how many sites were patched.
+unsafe fn patch_fastfail_sites(base: *mut u8, size: usize) -> usize {
+    let mut n = 0;
+    let mut i = 5;
+    while i + 2 <= size && n < FASTFAIL_SITES.len() {
+        let p = unsafe { base.add(i) };
+        // B9 xx 00 00 00 CD 29
+        if unsafe { *p == 0xCD && *p.add(1) == 0x29 && *p.sub(5) == 0xB9 && *p.sub(3) == 0 && *p.sub(2) == 0 && *p.sub(1) == 0 } {
+            unsafe {
+                *p = 0xCC;
+                *p.add(1) = 0x90;
+            }
+            FASTFAIL_SITES[n].store(p as usize, Ordering::Relaxed);
+            n += 1;
+        }
+        i += 1;
+    }
+    n
+}
+
+/// `(base, size)` of the mapped title image, for modules that log title addresses.
+pub fn image_range() -> (usize, usize) {
+    (IMG_BASE.load(Ordering::Relaxed), IMG_SIZE.load(Ordering::Relaxed))
+}
+
 static SEEN_FAULTS: [AtomicUsize; 64] = [const { AtomicUsize::new(0) }; 64];
 static SEEN_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -193,6 +224,41 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
     unsafe {
         let rec = *info;
         let code = *(rec as *const u32);
+        if code == 0x8000_0003 {
+            // A patched fast-fail site: report it, then end the process the way the original would.
+            let addr = *(rec.add(16) as *const usize);
+            if FASTFAIL_SITES.iter().any(|s| s.load(Ordering::Relaxed) == addr) {
+                let ctx = *info.add(1);
+                let ecx = *(ctx.add(0x80) as *const u64);
+                let (base, _) = (IMG_BASE.load(Ordering::Relaxed), 0);
+                rlog!("[fast-fail] at title+{:#x}, fast-fail code (ecx) = {ecx:#x}", addr - base);
+                let mut frames = [ptr::null_mut::<c_void>(); 32];
+                let n = RtlCaptureStackBackTrace(0, 32, frames.as_mut_ptr(), ptr::null_mut()) as usize;
+                for f in frames[..n].iter().map(|f| *f as usize).filter(|f| *f >= base && *f < base + IMG_SIZE.load(Ordering::Relaxed)).take(8) {
+                    rlog!("  caller title+{:#x}", f - base);
+                }
+                let rsp = *(ctx.add(0x98) as *const usize);
+                let stack_base: usize;
+                std::arch::asm!("mov {}, gs:[8]", out(reg) stack_base, options(nostack, readonly, preserves_flags));
+                let (base, size) = (IMG_BASE.load(Ordering::Relaxed), IMG_SIZE.load(Ordering::Relaxed));
+                let mut shown = 0;
+                for i in 0..512 {
+                    if rsp + i * 8 + 8 > stack_base {
+                        break;
+                    }
+                    let v = *((rsp + i * 8) as *const usize);
+                    if v >= base + 8 && v < base + size && (*((v - 5) as *const u8) == 0xE8 || (*((v - 6) as *const u8) == 0xFF && *((v - 5) as *const u8) == 0x15)) {
+                        rlog!("  stack+{:#x}: return address title+{:#x}", i * 8, v - base);
+                        shown += 1;
+                        if shown == 12 {
+                            break;
+                        }
+                    }
+                }
+                TerminateProcess(GetCurrentProcess(), 0xC000_0409);
+            }
+            return 0;
+        }
         // Fatal-looking codes, plus MSVC C++ throws (0xE06D7363), which are routine but
         // worth seeing while a title is failing: they show where it throws.
         static CPP_LOGGED: AtomicUsize = AtomicUsize::new(0);
@@ -212,6 +278,7 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
         describe(addr, &mut loc);
         rlog!("[exception] {code:#x} at {}", loc.as_str());
         rlog!("  committed by the title so far: {} MiB", COMMITTED_BYTES.load(Ordering::Relaxed) >> 20);
+        gpu::report_context_changes();
         {
             let teb: usize;
             std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb, options(nostack, readonly, preserves_flags));
@@ -360,6 +427,7 @@ const TLS_TITLE_INDEX: usize = 60;
 /// TLS index assigned by the loader to the helper DLL, or `usize::MAX` when the hand-built
 /// vector is used instead.
 static NTDLL_TLS_INDEX: AtomicUsize = AtomicUsize::new(usize::MAX);
+static PATCH_FASTFAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static LEGACY_TLS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Loads the helper DLL that makes `ntdll` own the title's static TLS. Must run before the
@@ -1238,6 +1306,10 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool, dump_iat: bool) -> Res
                 Err(e) => println!("helper TLS DLL failed ({e}); falling back to the hand-built TLS vector"),
             }
         }
+        if PATCH_FASTFAIL.load(Ordering::Relaxed) {
+            let n = unsafe { patch_fastfail_sites(base, size_of_image) };
+            println!("patched {n} fast-fail sites with breakpoints (--patch-fastfail)");
+        }
         let worker = std::thread::Builder::new()
             .stack_size(256 << 20)
             .spawn(move || -> Result<u32, String> {
@@ -1360,6 +1432,7 @@ fn main() {
             process::exit(1);
         }
     }
+    PATCH_FASTFAIL.store(args.iter().any(|a| a == "--patch-fastfail"), Ordering::Relaxed);
     LEGACY_TLS.store(args.iter().any(|a| a == "--legacy-tls"), Ordering::Relaxed);
     NO_PEB_PATCH.store(args.iter().any(|a| a == "--no-peb-patch"), Ordering::Relaxed);
     TRACE_WINDOW.store(args.iter().any(|a| a == "--trace-window"), Ordering::Relaxed);

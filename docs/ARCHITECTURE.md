@@ -52,6 +52,9 @@ Objects behind that lifecycle: a `CoreApplicationView` (`ICoreApplicationView`),
 - `GetImmediateContext`, `CreateDeferredContext` and the context's `GetDevice` are custom, so they return proxies, not raw objects.
 - `QueryInterface`: standard non-D3D11 interfaces are answered by the real object; D3D11 device/context interfaces by the proxy; interfaces the real object rejects (console-only IIDs) by the proxy itself.
 - Vtable slots beyond the standard range, and every 8-byte slot of the context proxy's embedded region (offsets `0x18` to `0x4018`), are logging stubs that return 0. The embedded region exists because the title calls function pointers stored inside the context object (`call [obj+0xA08]`), not through its vtable.
+- The embedded region holds a copy of the desktop context method table starting at offset `0x3E0` (slot *n* at `0x3E0 + 8n`; see [FINDINGS.md](FINDINGS.md#decoding-the-embedded-context-functions)). Slots 0 to 23 forward to the real context (`QueryInterface`, `AddRef`, `Release` and `GetDevice` are the proxy's own), and `+0x5B8`/`+0x5D8` forward to desktop slots 60 and 64.
+- The logging stubs capture `this` and the next three arguments, show what each pointer points at, name the call site in the title, and log only the first six calls of each stub and then powers of two.
+- On a crash, the logger lists which embedded fields differ from their original stub pointers, i.e. the state the title has written.
 
 The `DXGIX*` functions are not provided (`DXGIXPresentArray` and `DXGIXSetVLineNotification` are still stubs). `xb1layer --test-d3d` creates a device and exercises the proxies without loading a title.
 
@@ -82,6 +85,7 @@ Some imports are implemented by us instead of forwarded to Windows:
 | `--trace-api` | Logs every natively resolved import call through a register-preserving thunk (noisy calls are filtered, capped at 20,000 lines) |
 | `--trace-heap` | Logs `HeapAlloc`, `HeapFree` and `VirtualAlloc` arguments and results |
 | `--ring=<path>` | Crash-proof trace: every native import call, with the title address that made it, goes into a 64 MB memory-mapped circular buffer that survives the process dying (fast-fails included). Also logs arguments and results for file calls (`CreateFile2`, `CreateFileW`, `ReadFile`, `GetFileInformationByHandleEx`, `FindFirstFileExA`, `GetFileAttributesExA`) and `GetActivationFactoryByPCWSTR`. Read it with `tools\read-ring.ps1` |
+| `--patch-fastfail` | Replaces `mov ecx, code; int 0x29` sequences in the title with a breakpoint so the crash logger can report a fast-fail's site and code |
 | `--legacy-tls` | Uses the hand-built TLS vector instead of the helper DLL |
 | `--test-tls-load=<dll>` | Loads a DLL and reports which slots of the calling thread's TLS vector changed, and where its `xb1_block` buffer sits in its block. Used to check how the loader treats DLLs with static TLS |
 | `--no-peb-patch` | Leaves `PEB.ImageBaseAddress` pointing at the host (used to rule the patch out as a cause) |

@@ -74,6 +74,54 @@ struct Proxy {
     embedded: [usize; EMBED_SLOTS],
 }
 
+/// Offset in the context object where the title's calls suggest a copy of the desktop
+/// `ID3D11DeviceContext` method table begins: slot `n` is at `EMBED_TABLE + 8n`.
+///
+/// Evidence (from logged calls, not documentation): `+0x450` and `+0x458` are called back to
+/// back with a real D3D11 resource, subresource 0 and 4 (= `D3D11_MAP_WRITE_DISCARD`), which is
+/// `Map`/`Unmap` (desktop slots 14 and 15); `+0x438` and `+0x498` are called with a NULL first
+/// argument in a "reset shaders" sequence, matching `VSSetShader` and `GSSetShader` (slots 11
+/// and 23). All four agree with a table base of `0x3E0`.
+const EMBED_TABLE: usize = 0x3E0;
+
+/// Highest desktop slot forwarded through the embedded table (`GSSetShader`).
+const EMBED_FORWARD_MAX: usize = 23;
+
+/// Observed calls at `+0x5B8` and `+0x5D8` (same NULL-argument reset sequence) sit one slot
+/// before the desktop `HSSetShader` (60) and `DSSetShader` (64), so the console table appears
+/// to be missing one method between slots 24 and 59. Only these two are mapped.
+const EMBED_SHIFTED: [(usize, usize); 2] = [(0x5B8, 60), (0x5D8, 64)];
+
+/// `(embedded index, entry)` pairs that forward to the real context. Built once.
+fn forwarded_entries() -> &'static Vec<(usize, usize)> {
+    static ENTRIES: OnceLock<Vec<(usize, usize)>> = OnceLock::new();
+    let entries = ENTRIES.get_or_init(|| {
+        let thunks = unsafe { VirtualAlloc(ptr::null_mut(), 4096, 0x3000, 0x40) } as *mut u8;
+        assert!(!thunks.is_null(), "thunk allocation failed");
+        let mut v = Vec::new();
+        let index_of = |offset: usize| (offset - EMBED_BASE) / 8;
+        for slot in 0..=EMBED_FORWARD_MAX {
+            let entry = match slot {
+                0 => proxy_qi as usize,
+                1 => proxy_add_ref as usize,
+                2 => proxy_release as usize,
+                3 => context_get_device as usize,
+                s => forward_thunk(unsafe { thunks.add(s * 16) }, s),
+            };
+            v.push((index_of(EMBED_TABLE + slot * 8), entry));
+        }
+        for (i, (offset, desktop_slot)) in EMBED_SHIFTED.iter().enumerate() {
+            v.push((index_of(*offset), forward_thunk(unsafe { thunks.add((32 + i) * 16) }, *desktop_slot)));
+        }
+        v
+    });
+    FORWARDED_INDEXES.get_or_init(|| entries.iter().map(|(i, _)| *i).collect());
+    entries
+}
+
+/// Embedded indexes that forward to the real context, so state reports can skip them.
+static FORWARDED_INDEXES: OnceLock<Vec<usize>> = OnceLock::new();
+
 /// Allocates a zeroed proxy and initializes it. `embedded` stubs are filled only for contexts.
 fn new_proxy(real: *mut c_void, kind: Kind) -> *mut Proxy {
     let layout = std::alloc::Layout::new::<Proxy>();
@@ -90,27 +138,36 @@ fn new_proxy(real: *mut c_void, kind: Kind) -> *mut Proxy {
                     (*p).embedded[i] = *slot;
                 }
             }
+            // The entries we understand forward to the real context instead of logging.
+            for (index, entry) in forwarded_entries() {
+                (*p).embedded[*index] = *entry;
+            }
         }
     }
     p
 }
 
-/// One logging stub per embedded slot; shared by every context proxy.
+static EMBEDDED_STUBS: OnceLock<Vec<usize>> = OnceLock::new();
+
+/// One argument-logging stub per embedded slot; shared by every context proxy.
 fn embedded_stubs() -> &'static Vec<usize> {
-    static STUBS: OnceLock<Vec<usize>> = OnceLock::new();
-    STUBS.get_or_init(|| {
-        let mut arena = Box::new(crate::StubArena::new());
+    EMBEDDED_STUBS.get_or_init(|| {
+        // Two blocks of arena: the stubs for 2048 slots need 2048 * ARG_SLOT bytes.
+        let mut arenas = vec![ArgArena::new(), ArgArena::new()];
         let stubs = (0..EMBED_SLOTS)
             .map(|i| {
                 let offset = EMBED_BASE + i * 8;
                 if offset >= EMBED_FILL_FROM {
-                    arena.make_trace(format!("[gpu] ID3D11DeviceContextX embedded function at +{offset:#x}"), ret_zero as usize as u64) as usize
+                    let arena = if arenas[0].used + ARG_SLOT <= ARG_ARENA_BYTES { 0 } else { 1 };
+                    arenas[arena].make(format!("[gpu] context embedded function +{offset:#x}"), ret_zero as usize as u64)
                 } else {
                     0
                 }
             })
             .collect();
-        Box::leak(arena);
+        for a in arenas {
+            std::mem::forget(a);
+        }
         stubs
     })
 }
@@ -120,6 +177,167 @@ static CONTEXT_PROXY: AtomicUsize = AtomicUsize::new(0);
 
 extern "system" fn ret_zero() -> usize {
     0
+}
+
+// ---------------------------------------------------------------------------------------
+// Argument-logging stubs
+// ---------------------------------------------------------------------------------------
+
+unsafe extern "system" {
+    fn GetCurrentProcess() -> *mut c_void;
+    fn ReadProcessMemory(process: *mut c_void, addr: *const c_void, buf: *mut c_void, size: usize, read: *mut usize) -> i32;
+}
+
+/// Names and call counts of the argument-logging stubs, indexed by the stub's number.
+static ARG_STUBS: std::sync::Mutex<Vec<(String, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// A stub's slot size: the thunk below is about 135 bytes.
+const ARG_SLOT: usize = 192;
+
+/// Executable memory for the stubs, allocated in blocks.
+struct ArgArena {
+    mem: *mut u8,
+    used: usize,
+}
+
+const ARG_ARENA_BYTES: usize = ARG_SLOT * 1024;
+
+impl ArgArena {
+    fn new() -> Self {
+        let mem = unsafe { VirtualAlloc(ptr::null_mut(), ARG_ARENA_BYTES, 0x3000, 0x40) } as *mut u8;
+        assert!(!mem.is_null(), "stub arena allocation failed");
+        Self { mem, used: 0 }
+    }
+
+    /// A stub that logs its arguments and then jumps to `real`.
+    ///
+    /// The thunk preserves rcx, rdx, r8, r9 and xmm0-3, calls
+    /// `arg_stub_hit(index, return_address, rcx, rdx, r8, r9)` and then tail-jumps to `real`.
+    fn make(&mut self, label: String, real: u64) -> usize {
+        assert!(self.used + ARG_SLOT <= ARG_ARENA_BYTES, "argument-stub arena full");
+        let idx = {
+            let mut v = ARG_STUBS.lock().unwrap();
+            v.push((label, 0));
+            v.len() - 1
+        };
+        let slot = unsafe { self.mem.add(self.used) };
+        self.used += ARG_SLOT;
+        let mut c: Vec<u8> = vec![
+            0x51, // push rcx
+            0x52, // push rdx
+            0x41, 0x50, // push r8
+            0x41, 0x51, // push r9
+            0x48, 0x81, 0xEC, 0x88, 0x00, 0x00, 0x00, // sub rsp, 0x88
+            0xF3, 0x0F, 0x7F, 0x44, 0x24, 0x40, // movdqu [rsp+40h], xmm0
+            0xF3, 0x0F, 0x7F, 0x4C, 0x24, 0x50, // xmm1
+            0xF3, 0x0F, 0x7F, 0x54, 0x24, 0x60, // xmm2
+            0xF3, 0x0F, 0x7F, 0x5C, 0x24, 0x70, // xmm3
+            0x48, 0x8B, 0x84, 0x24, 0x90, 0x00, 0x00, 0x00, // mov rax, [rsp+90h]  (original r8)
+            0x48, 0x89, 0x44, 0x24, 0x20, // mov [rsp+20h], rax   (5th argument)
+            0x48, 0x8B, 0x84, 0x24, 0x88, 0x00, 0x00, 0x00, // mov rax, [rsp+88h]  (original r9)
+            0x48, 0x89, 0x44, 0x24, 0x28, // mov [rsp+28h], rax   (6th argument)
+            0x4C, 0x8B, 0x8C, 0x24, 0x98, 0x00, 0x00, 0x00, // mov r9, [rsp+98h]   (original rdx)
+            0x4C, 0x8B, 0x84, 0x24, 0xA0, 0x00, 0x00, 0x00, // mov r8, [rsp+0A0h]  (original rcx)
+            0x48, 0x8B, 0x94, 0x24, 0xA8, 0x00, 0x00, 0x00, // mov rdx, [rsp+0A8h] (return address)
+            0x48, 0xB9, // mov rcx, idx
+        ];
+        c.extend_from_slice(&(idx as u64).to_le_bytes());
+        c.extend_from_slice(&[0x48, 0xB8]); // mov rax, arg_stub_hit
+        c.extend_from_slice(&(arg_stub_hit as usize as u64).to_le_bytes());
+        c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+        c.extend_from_slice(&[
+            0xF3, 0x0F, 0x6F, 0x44, 0x24, 0x40, // movdqu xmm0, [rsp+40h]
+            0xF3, 0x0F, 0x6F, 0x4C, 0x24, 0x50,
+            0xF3, 0x0F, 0x6F, 0x54, 0x24, 0x60,
+            0xF3, 0x0F, 0x6F, 0x5C, 0x24, 0x70,
+            0x48, 0x81, 0xC4, 0x88, 0x00, 0x00, 0x00, // add rsp, 0x88
+            0x41, 0x59, // pop r9
+            0x41, 0x58, // pop r8
+            0x5A, // pop rdx
+            0x59, // pop rcx
+            0x48, 0xB8, // mov rax, real
+        ]);
+        c.extend_from_slice(&real.to_le_bytes());
+        c.extend_from_slice(&[0xFF, 0xE0]); // jmp rax
+        assert!(c.len() <= ARG_SLOT, "stub is {} bytes", c.len());
+        unsafe { ptr::copy_nonoverlapping(c.as_ptr(), slot, c.len()) };
+        slot as usize
+    }
+}
+
+/// Formats a value: if it points at readable memory, also shows the first qword there.
+fn show(v: u64, out: &mut crate::RawBuf) {
+    use std::fmt::Write;
+    let mut first = 0u64;
+    let mut got = 0usize;
+    let readable = v > 0x10000
+        && unsafe { ReadProcessMemory(GetCurrentProcess(), v as *const c_void, &mut first as *mut u64 as *mut c_void, 8, &mut got) } != 0
+        && got == 8;
+    if readable {
+        let _ = write!(out, "{v:#x}->[{first:#x}]");
+    } else {
+        let _ = write!(out, "{v:#x}");
+    }
+}
+
+/// Called by every argument-logging stub. Logs the first calls of each stub, then only
+/// powers of two, so a function called every frame does not flood the log.
+extern "system" fn arg_stub_hit(idx: u64, ret: u64, this: u64, a2: u64, a3: u64, a4: u64) {
+    let (name, count) = {
+        let Ok(mut v) = ARG_STUBS.try_lock() else { return };
+        let e = &mut v[idx as usize];
+        e.1 += 1;
+        (e.0.clone(), e.1)
+    };
+    if count > 6 && !count.is_power_of_two() {
+        return;
+    }
+    let (base, size) = crate::image_range();
+    let mut line = crate::RawBuf::new();
+    {
+        use std::fmt::Write;
+        let _ = write!(line, "{name} (call #{count}) this=");
+    }
+    show(this, &mut line);
+    for (label, a) in [("a2", a2), ("a3", a3), ("a4", a4)] {
+        use std::fmt::Write;
+        let _ = write!(line, " {label}=");
+        show(a, &mut line);
+    }
+    {
+        use std::fmt::Write;
+        let r = ret as usize;
+        if r >= base && r < base + size {
+            let _ = write!(line, " <- title+{:#x}", r - base);
+        }
+    }
+    glog!("{}", line.as_str());
+}
+
+/// Prints the fields of the context proxy's embedded region that no longer hold their original
+/// stub pointer, i.e. the state the title has written. Allocation-free (used from the crash
+/// logger).
+pub fn report_context_changes() {
+    let p = CONTEXT_PROXY.load(Ordering::Acquire);
+    if p == 0 {
+        return;
+    }
+    let Some(stubs) = EMBEDDED_STUBS.get() else { return };
+    let proxy = unsafe { &*(p as *const Proxy) };
+    let forwarded = FORWARDED_INDEXES.get();
+    let mut shown = 0;
+    for i in 0..EMBED_SLOTS {
+        if forwarded.is_some_and(|f| f.contains(&i)) {
+            continue;
+        }
+        if proxy.embedded[i] != stubs[i] {
+            glog!("  context field +{:#x} = {:#x} (was {:#x})", EMBED_BASE + i * 8, proxy.embedded[i], stubs[i]);
+            shown += 1;
+            if shown == 40 {
+                break;
+            }
+        }
+    }
 }
 
 fn kind_name(k: Kind) -> &'static str {
@@ -276,7 +494,7 @@ fn build_vtable(kind: Kind) -> Vec<usize> {
     // Executable memory for the forwarding thunks (16 bytes each) and a private stub arena.
     let thunks = unsafe { VirtualAlloc(ptr::null_mut(), 4096 * 2, 0x3000, 0x40) } as *mut u8;
     assert!(!thunks.is_null(), "thunk allocation failed");
-    let mut stubs = Box::new(crate::StubArena::new());
+    let mut arenas = vec![ArgArena::new(), ArgArena::new()];
 
     let mut v = vec![0usize; PROXY_SLOTS];
     v[0] = proxy_qi as usize;
@@ -294,9 +512,12 @@ fn build_vtable(kind: Kind) -> Vec<usize> {
     }
     // Console-only extension slots: log the slot, return 0.
     for i in standard..PROXY_SLOTS {
-        v[i] = stubs.make_trace(format!("[gpu] {} extension slot {i}", kind_name(kind)), ret_zero as usize as u64) as usize;
+        let arena = if arenas[0].used + ARG_SLOT <= ARG_ARENA_BYTES { 0 } else { 1 };
+        v[i] = arenas[arena].make(format!("[gpu] {} extension slot {i}", kind_name(kind)), ret_zero as usize as u64);
     }
-    Box::leak(stubs);
+    for a in arenas {
+        std::mem::forget(a);
+    }
     v
 }
 

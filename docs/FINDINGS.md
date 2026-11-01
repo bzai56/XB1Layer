@@ -145,9 +145,34 @@ After the TLS and allocator fixes the title survives loading `WindowsCodecs.dll`
 
 **What is established:** the title's graphics layer calls into embedded function pointers and state fields of the console context, and into console-only device methods. **What is not:** what any of those functions do. A reasonable expectation, not verified, is that the real ones write GPU command packets for the console's AMD GPU into command buffers; if so, a working layer has to either interpret those packets or reimplement each function at a high level, and the second requires knowing what each one does. This is where the project's scope grows sharply.
 
+## Decoding the embedded context functions
+The logging stubs now record `this`, three arguments (with what each pointer points at), the call site in the title, and a per-stub call count. That gave enough to identify part of the table:
+
+**The embedded region contains a copy of the desktop `ID3D11DeviceContext` method table.** Evidence from the logged calls:
+- `+0x450` and `+0x458` are called back to back with a real D3D11 resource (its vtable pointer is inside `d3d11.dll`, so it was created by the real device through the forwarded `CreateBuffer`), subresource `0`, and `4`. `4` is `D3D11_MAP_WRITE_DISCARD`. That is `Map` and `Unmap`, desktop slots 14 and 15.
+- `+0x438` and `+0x498` are called with a NULL first argument in a "reset" sequence, matching `VSSetShader` and `GSSetShader` (slots 11 and 23).
+- All four agree with the table starting at object offset **`0x3E0`**: slot *n* is at `0x3E0 + 8n`.
+- `+0x5B8` and `+0x5D8` are called in the same NULL-argument sequence but sit one slot before the desktop `HSSetShader` (60) and `DSSetShader` (64). So the console table seems to lack one method somewhere between slots 24 and 59. Which one is unknown.
+
+So the proxy now forwards embedded slots 0 to 23 to the real desktop context (with `QueryInterface`, `AddRef`, `Release` and `GetDevice` handled by the proxy), plus the two shifted shader slots. With that, the title's `Map`/`Unmap` and shader-unbind calls reach real D3D11 and no longer appear in the stub log. Everything else in the table is still a logging stub. Not forwarded yet because the mapping is unknown: the rest of the table above slot 23 and below the shift, and anything beyond slot 64.
+
+**Device extension slots** (all return 0 for now, so the title gets no objects):
+- **Slot 59** `(device, desc*, out*)`, called twice with descriptors `{1, 0x10000}` and `{2, 0x10000}` and consecutive 8-byte outputs in the title's own memory pool (`0x60028710170`, `0x60028710178`). It creates two objects.
+- **Slot 64** `(device, desc*, 0xe or similar, 0)`. In one run the descriptor starts with `0x43800000780`, which is the dwords `0x780` and `0x438`: **1920 and 1080**. So this is a display-sized object, probably a swap chain or display plane. In earlier runs the first qword looked like a pointer instead, so the descriptor format varies.
+- **Slot 65** `(device, desc*, 0xd, 0)` with a descriptor starting `{16, 16}`.
+
+**Context `+0xA08(this, 1)`** is called once per context (the immediate context and one deferred context). Meaning not known.
+
+## Two bugs found along the way (mine, not the title's)
+- The console CoreWindow stand-in treated vtable slot 3 as `IInspectable::GetIids` and wrote through its arguments. The title calls slot 3 with non-pointers, a misaligned write panicked in the debug build, and the abort showed up as exit code `0xC0000409` (identical to a real fast-fail). The console window now has its own vtable where slots 3 to 5 are logging slots. Some earlier "fast-fail" endings may have been this.
+- A tool for real fast-fails: `--patch-fastfail` replaces the compiler's `mov ecx, code; int 0x29` sequences with a breakpoint, so the crash logger reports the site and the code. Only one such site exists in the image, and it was not reached in the runs checked.
+
+## Where the run ends now
+The title's main loop runs (hundreds of `window->Dispatcher` calls), then it faults at `title+0x17b75fb` reading NULL, with a register set that looks like it is using one of the objects slot 59 should have created.
+
 ## Next investigation steps
-1. Find out what the embedded context functions and the device extension slots do: their arguments (the stubs log only the offset), and what the title reads back from the context's fields.
-2. Look at the two new faults (`title+0x17741b0`, `title+0x17b75fb`).
+1. Implement device extension slots 59, 64 and 65 enough to hand back objects: they look like creation functions (two objects of kinds 1 and 2; a 1920x1080 display-sized object; something 16x16).
+2. Map the rest of the embedded context table (which method is missing between slots 24 and 59) as more calls show up.
 3. Work out what slot 7 of `42A6A529` is (it takes a small value `1`).
 4. Pin down the console `ICoreWindow` layout: keep logging slots as the title uses more of them, and keep stand-in behavior per slot only where the call pattern justifies it.
 3. Implement `DXGIXSetVLineNotification`, `DXGIXPresentArray` and any other `DXGIX*` the title uses.

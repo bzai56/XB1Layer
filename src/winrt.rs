@@ -75,7 +75,10 @@ fn shell() -> &'static Shell {
         window: Window.into(),
         console_window: {
             let o = create_generic("Windows.UI.Core.CoreWindow (console layout)", &ICoreWindow::IID);
-            unsafe { (*(o as *mut GenericObj)).kind = 2 };
+            unsafe {
+                (*(o as *mut GenericObj)).kind = 2;
+                (*(o as *mut GenericObj)).vtbl = console_window_vtbl();
+            }
             o
         },
         dispatcher: Com::<DispatcherTag>::create(()),
@@ -694,6 +697,29 @@ fn generic_vtbl() -> *const usize {
         v[3] = com_get_iids as usize;
         v[4] = generic_class_name as usize;
         v[5] = com_get_trust_level as usize;
+        let slots = generic_slots!(
+            6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
+            35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
+        );
+        v[6..].copy_from_slice(&slots);
+        v
+    })
+    .as_ptr()
+}
+
+/// Vtable for the console CoreWindow stand-in. Unlike the generic one, slots 3 to 5 are plain
+/// logging slots too: the title's window interface does not follow IInspectable's layout, and
+/// it calls slot 3 with arguments that are not `GetIids`' pointers.
+fn console_window_vtbl() -> *const usize {
+    static VTBL: OnceLock<[usize; GENERIC_SLOTS]> = OnceLock::new();
+    VTBL.get_or_init(|| {
+        let mut v = [0usize; GENERIC_SLOTS];
+        v[0] = generic_qi as usize;
+        v[1] = generic_add_ref as usize;
+        v[2] = generic_release as usize;
+        v[3] = generic_slot::<3> as usize;
+        v[4] = generic_slot::<4> as usize;
+        v[5] = generic_slot::<5> as usize;
         let slots = generic_slots!(
             6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
             35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
