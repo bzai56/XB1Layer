@@ -112,7 +112,7 @@ unsafe extern "system" fn context_grow_command_buffer(this: *mut c_void) -> usiz
         glog!("[gpu] packet address {addr:#x}: {name}");
     }
     // XB1_DUMP_CMD=<dir> writes the first few flushed buffers there for offline decoding.
-    if n < 3 {
+    if n < 16 {
         if let Some(dir) = std::env::var_os("XB1_DUMP_CMD") {
             let bytes = unsafe { std::slice::from_raw_parts(p.cmd_base as *const u8, used) };
             let path = std::path::Path::new(&dir).join(format!("cmd_flush_{n}.bin"));
@@ -150,6 +150,10 @@ const EMBED_SHIFTED_FROM: usize = 34;
 /// Last console index forwarded (desktop `FinishCommandList` is 114, so console 113).
 /// Only indexes up to 63 have direct evidence; the rest is extrapolated.
 const EMBED_SHIFTED_TO: usize = 63;
+/// Shifted console indices backed by logged calls: 34 `OMSetBlendState`, 46 `CopyResource`,
+/// 49 `ClearRenderTargetView`, 59 and 63 the hull and domain `SetShader` (NULL). The debug layer
+/// showed the rest of 34 to 63 receiving garbage (`RSSetViewports`, `ExecuteCommandList`).
+const EMBED_VERIFIED_SHIFTED: [usize; 5] = [34, 46, 49, 59, 63];
 
 /// `(embedded index, entry)` pairs that forward to the real context. Built once.
 fn forwarded_entries() -> &'static Vec<(usize, usize)> {
@@ -177,6 +181,11 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
             v.push((index_of(EMBED_TABLE + slot * 8), entry));
         }
         for console_slot in EMBED_SHIFTED_FROM..=EMBED_SHIFTED_TO {
+            // Only indices with direct evidence forward (see EMBED_VERIFIED_SHIFTED); the others log
+            // their arguments so they can be identified from the calls.
+            if !EMBED_VERIFIED_SHIFTED.contains(&console_slot) {
+                continue;
+            }
             let thunk = forward_context_thunk(unsafe { thunks.add((64 + console_slot - EMBED_SHIFTED_FROM) * 32) }, console_slot + 1);
             v.push((index_of(EMBED_TABLE + console_slot * 8), thunk));
         }
@@ -230,9 +239,29 @@ fn new_proxy(real: *mut c_void, kind: Kind) -> *mut Proxy {
             (*p).embedded[(CMD_CURSOR - EMBED_BASE) / 8] = buffer;
             (*p).embedded[(CMD_END - EMBED_BASE) / 8] = buffer + CMD_BUFFER_BYTES;
             (*p).embedded[(CMD_GROW - EMBED_BASE) / 8] = context_grow_command_buffer as usize;
+            CONTEXT_PROXIES.lock().unwrap().push(p as usize);
         }
     }
     p
+}
+
+/// Every context proxy created, so their command buffers can be inspected while they are partly full.
+static CONTEXT_PROXIES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// Writes the used part of every context's command buffer to `<dir>/ctx<N>_<tag>.bin` (XB1_DUMP_CMD).
+pub fn dump_all_contexts(dir: &std::path::Path, tag: &str) {
+    let list = CONTEXT_PROXIES.lock().unwrap().clone();
+    for (i, p) in list.iter().enumerate() {
+        let p = unsafe { &*(*p as *const Proxy) };
+        let cursor = p.embedded[(CMD_CURSOR - EMBED_BASE) / 8];
+        let used = cursor.saturating_sub(p.cmd_base);
+        if used == 0 || used > CMD_BUFFER_BYTES {
+            continue;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(p.cmd_base as *const u8, used) };
+        let _ = std::fs::write(dir.join(format!("ctx{i}_{tag}.bin")), bytes);
+        glog!("[gpu] context {i}: {used} bytes of commands dumped ({tag})");
+    }
 }
 
 static EMBEDDED_STUBS: OnceLock<Vec<usize>> = OnceLock::new();
@@ -1239,6 +1268,49 @@ unsafe fn create_view(this: *mut c_void, slot: usize, name: &str, resource: *mut
         }
         if retry.0 >= 0 {
             return retry;
+        }
+        // Second fallback (shader resource views of 2D textures): a description built from the
+        // resource's own description, as the title's console descriptions have a different layout
+        // and even the NULL default failed for cube maps.
+        if slot == 7 {
+            let vtbl = unsafe { *(resource as *const *const usize) };
+            let get_type: unsafe extern "system" fn(*mut c_void, *mut u32) = unsafe { std::mem::transmute(*vtbl.add(7)) };
+            let mut dim = 0u32;
+            unsafe { get_type(resource, &mut dim) };
+            if dim == 3 {
+                let get_desc: unsafe extern "system" fn(*mut c_void, *mut u32) = unsafe { std::mem::transmute(*vtbl.add(10)) };
+                let mut rd = [0u32; 12];
+                unsafe { get_desc(resource, rd.as_mut_ptr()) };
+                let (mips, array, format, misc) = (rd[2], rd[3], rd[4], rd[10]);
+                // D3D11_SHADER_RESOURCE_VIEW_DESC: format, dimension, then the union's dwords. Several
+                // candidates, most faithful first; the first the driver accepts is used.
+                let mut candidates: Vec<[u32; 6]> = Vec::new();
+                if misc & 4 != 0 {
+                    candidates.push([format, 9, 0, mips, 0, 0]); // TEXTURECUBE: MostDetailedMip, MipLevels
+                }
+                if array > 1 {
+                    candidates.push([format, 5, 0, mips, 0, array]); // TEXTURE2DARRAY
+                    candidates.push([format, 5, 0, 1, 0, array]); // TEXTURE2DARRAY, mip 0 only
+                } else {
+                    candidates.push([format, 4, 0, mips, 0, 0]); // TEXTURE2D
+                }
+                let mut r2 = HRESULT(0x8007000Eu32 as i32);
+                let mut used = 0usize;
+                for (i, c) in candidates.iter().enumerate() {
+                    r2 = unsafe { f(p.real, resource, c.as_ptr() as *const c_void, out) };
+                    used = i;
+                    if r2.0 >= 0 {
+                        break;
+                    }
+                }
+                static BUILT: AtomicU32 = AtomicU32::new(0);
+                if BUILT.fetch_add(1, Ordering::Relaxed) < 4 {
+                    glog!("[gpu] CreateShaderResourceView: built descriptions from the resource (format {format:#x}, mips {mips}, array {array}, misc {misc:#x}): candidate {used} of {} -> {:#x}", candidates.len(), r2.0 as u32);
+                }
+                if r2.0 >= 0 {
+                    return r2;
+                }
+            }
         }
     }
     if hr.0 < 0 {

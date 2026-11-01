@@ -1136,6 +1136,40 @@ static HWBP_SPEC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static POKE_SPEC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static PEEK_SPEC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static FILES_TO_STDERR: AtomicBool = AtomicBool::new(false);
+/// Logs (stderr) any single Rust heap allocation of 512 MiB or more with a backtrace: the layer's
+/// own memory use, as opposed to the title's.
+struct BigAllocLogger;
+
+unsafe impl std::alloc::GlobalAlloc for BigAllocLogger {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if layout.size() >= (512 << 20) {
+            eprintln!("[mem] LAYER allocation of {} MiB
+{}", layout.size() >> 20, std::backtrace::Backtrace::force_capture());
+        }
+        std::alloc::System.alloc(layout)
+    }
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if layout.size() >= (512 << 20) {
+            eprintln!("[mem] LAYER zeroed allocation of {} MiB
+{}", layout.size() >> 20, std::backtrace::Backtrace::force_capture());
+        }
+        std::alloc::System.alloc_zeroed(layout)
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        std::alloc::System.dealloc(ptr, layout)
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        if new_size >= (512 << 20) {
+            eprintln!("[mem] LAYER realloc to {} MiB
+{}", new_size >> 20, std::backtrace::Backtrace::force_capture());
+        }
+        std::alloc::System.realloc(ptr, layout, new_size)
+    }
+}
+
+#[global_allocator]
+static GLOBAL: BigAllocLogger = BigAllocLogger;
+
 static BACKTRACE_ON_CRASH: AtomicBool = AtomicBool::new(false);
 
 static CONTENT_DRIVE: Mutex<Option<Vec<u16>>> = Mutex::new(None);
@@ -1625,7 +1659,7 @@ fn override_for(dll: &str, func: &str) -> Option<usize> {
         "GetProcessHeap" => Some(xb_get_process_heap as usize),
         "ExitProcess" => Some(xb_exit_process as usize),
         "TerminateProcess" => Some(xb_terminate_process as usize),
-        "HeapAlloc" if TRACE_HEAP.load(Ordering::Relaxed) => Some(xb_heap_alloc as usize),
+        "HeapAlloc" => Some(xb_heap_alloc as usize),
         "HeapFree" => Some(xb_heap_free as usize),
         "VirtualAlloc" => Some(xb_virtual_alloc as usize),
         "XMemAlloc" | "XMemAllocDefault" => Some(xb_xmem_alloc as usize),
@@ -1654,8 +1688,37 @@ fn real_kernel32(name: &std::ffi::CStr) -> usize {
 extern "system" fn xb_heap_alloc(heap: *mut c_void, flags: u32, size: usize) -> *mut c_void {
     let real: extern "system" fn(*mut c_void, u32, usize) -> *mut c_void =
         unsafe { std::mem::transmute(real_kernel32(c"HeapAlloc")) };
+    // A single request above the cap (XB1_MAX_ALLOC_MB, off by default) is refused: the test title asks
+    // once for 8.8 GB (a garbage size, from an asset-loading thread), which exhausts the system commit
+    // limit and makes later GPU allocations fail with E_OUTOFMEMORY.
+    static CAP_MB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let cap = *CAP_MB.get_or_init(|| std::env::var("XB1_MAX_ALLOC_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+    if cap != 0 && size > (cap << 20) {
+        rlog!("[mem] refused a HeapAlloc of {} MiB (cap {cap} MiB)", size >> 20);
+        return ptr::null_mut();
+    }
     let p = real(heap, flags, size);
-    rlog!("HeapAlloc(heap={heap:p}, flags={flags:#x}, size={size}) -> {p:p}");
+    if TRACE_HEAP.load(Ordering::Relaxed) || (size >= (64 << 20) && std::env::var_os("XB1_BIG_ALLOCS").is_some()) {
+        rlog!("HeapAlloc(heap={heap:p}, flags={flags:#x}, size={size}) -> {p:p}");
+        if size >= (64 << 20) {
+            let (base, isize) = (IMG_BASE.load(Ordering::Relaxed), IMG_SIZE.load(Ordering::Relaxed));
+            let mut frames = [ptr::null_mut::<c_void>(); 24];
+            let n = unsafe { RtlCaptureStackBackTrace(0, 24, frames.as_mut_ptr(), ptr::null_mut()) } as usize;
+            for f in frames[..n].iter().map(|f| *f as usize).filter(|f| *f >= base && *f < base + isize).take(8) {
+                rlog!("  big HeapAlloc caller title+{:#x}", f - base);
+            }
+            // The unwinder loses the chain here, so also scan the stack for return-address-like values.
+            let sp = &frames as *const _ as usize;
+            let mut shown = 0;
+            for k in 0..1024usize {
+                let v = unsafe { *((sp + k * 8) as *const usize) };
+                if v >= base && v < base + isize && shown < 14 {
+                    rlog!("  big HeapAlloc stack[{k}] -> title+{:#x}", v - base);
+                    shown += 1;
+                }
+            }
+        }
+    }
     p
 }
 
@@ -1666,6 +1729,9 @@ extern "system" fn xb_xmem_alloc(size: usize, attrs: u64) -> *mut c_void {
     const GRANULE: usize = 64 << 10;
     let rounded = (size.max(1) + GRANULE - 1) & !(GRANULE - 1);
     let p = unsafe { VirtualAlloc(ptr::null_mut(), rounded, MEM_COMMIT_RESERVE, 0x04) };
+    if rounded >= (64 << 20) && std::env::var_os("XB1_BIG_ALLOCS").is_some() {
+        rlog!("[mem] XMemAlloc {} MiB attrs={attrs:#x} -> {p:p}", rounded >> 20);
+    }
     if !p.is_null() {
         COMMITTED_BYTES.fetch_add(rounded, Ordering::Relaxed);
         XMEM_BLOCKS.lock().unwrap().insert(p as usize);
@@ -1698,8 +1764,10 @@ extern "system" fn xb_title_memory_status(p: *mut u8) -> i32 {
         let len = (*(p as *const u32) as usize).min(256);
         ptr::write_bytes(p.add(4), 0, len.saturating_sub(4));
         if len >= 24 {
-            *(p.add(8) as *mut u64) = 5 << 30; // total title memory: 5 GiB
-            *(p.add(16) as *mut u64) = (9u64 << 30) / 2; // available: 4.5 GiB
+            // XB1_TITLE_MEM_MB overrides the reported total (experiment: what sizes the title's pools).
+            let total = std::env::var("XB1_TITLE_MEM_MB").ok().and_then(|v| v.parse::<u64>().ok()).map(|m| m << 20).unwrap_or(5 << 30);
+            *(p.add(8) as *mut u64) = total; // total title memory (5 GiB by default)
+            *(p.add(16) as *mut u64) = total / 10 * 9; // available: 90% of it
         }
     }
     ring_write(format_args!("  TitleMemoryStatus (layout guessed)\n"));
@@ -1727,7 +1795,14 @@ extern "system" fn xb_virtual_alloc(addr: *mut c_void, size: usize, ty: u32, pro
     let prot = prot & 0x7FF;
     let mut p = unsafe { VirtualAlloc(addr, size, clean, prot) };
     if !p.is_null() && clean & 0x1000 != 0 {
-        COMMITTED_BYTES.fetch_add(size, Ordering::Relaxed);
+        let before = COMMITTED_BYTES.fetch_add(size, Ordering::Relaxed);
+        // XB1_BIG_ALLOCS: report every 512 MiB crossed.
+        if (before >> 29) != ((before + size) >> 29) && std::env::var_os("XB1_BIG_ALLOCS").is_some() {
+            rlog!("[mem] the title has committed {} MiB (last commit {} KiB at {p:p})", (before + size) >> 20, size >> 10);
+        }
+    }
+    if size >= (64 << 20) && std::env::var_os("XB1_BIG_ALLOCS").is_some() {
+        rlog!("[mem] VirtualAlloc {} MiB type={clean:#x} protect={prot:#x} -> {p:p}", size >> 20);
     }
     let mut moved = false;
     if p.is_null() && !addr.is_null() && clean & 0x2000 != 0 {
@@ -2329,6 +2404,15 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool, dump_iat: bool) -> Res
                 TITLE_TID.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
                 unsafe { bootstrap(base_addr as *mut u8, size_of_image, tls_dir, exc_dir)? };
                 unsafe { init_guest_dlls() };
+        if let Some(dir) = std::env::var_os("XB1_DUMP_CMD") {
+            // Periodic snapshots of every context's live command buffer.
+            std::thread::spawn(move || {
+                for round in 1..=5 {
+                    std::thread::sleep(std::time::Duration::from_secs(15));
+                    gpu::dump_all_contexts(std::path::Path::new(&dir), &format!("t{}", round * 15));
+                }
+            });
+        }
         if std::env::var_os("XB1_VTABLES").is_some() {
             gpu::log_vtable_identities();
         }

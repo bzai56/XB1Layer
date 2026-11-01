@@ -102,7 +102,7 @@ pub fn raise_window_events() {
 static USER_HANDLERS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
 /// Raises every user-event delegate (`Invoke(sender, args)`): `args` is a generic object that hands
-/// out stand-ins (the signed-in user element for any getter). Only when `XB1_USER_EVENTS` is set.
+/// out stand-ins (the signed-in user element for any getter). On by default; `XB1_NO_USER_EVENTS=1` turns it off.
 pub fn raise_user_events() {
     // The title registers these during `Run`, so a helper thread waits for them to appear and raises
     // each handler once, a moment after it is registered.
@@ -393,7 +393,7 @@ fn run_view(source: &IFrameworkViewSource) -> Result<()> {
         h.Invoke(&app_view, &args)?;
     }
 
-    if std::env::var_os("XB1_USER_EVENTS").is_some() {
+    if std::env::var_os("XB1_NO_USER_EVENTS").is_none() {
         raise_user_events();
     }
     if std::env::var_os("XB1_WINDOW_EVENTS").is_some() {
