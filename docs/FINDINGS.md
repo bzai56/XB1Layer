@@ -110,15 +110,25 @@ A thread-pool worker crashed inside `ntdll` with a write exactly 16 bytes below 
 
 **Known risk of this design:** the title's TLS slot is a fixed index (100) in an array that `ntdll` can still reallocate and resize when later DLLs with static TLS load. If it rebuilds the array from its own bookkeeping, the title's entry would be lost for that thread. This has not been seen yet.
 
+## The NULL write: console-only protection bits
+The write to address 0 at `title+0x1960158` was not an accident. It is the title's own fatal-error path in its small-block pool allocator: when a page allocation fails it logs `Small block page alloc failed (itemsize %Id), GetLastError(%d)` and then deliberately writes to NULL to crash. The failing call, seen with `--trace-heap`, was `VirtualAlloc(0x800400000, 64 KB, commit, protect=0x10004)` returning NULL with error 50 (`ERROR_NOT_SUPPORTED`). `0x10004` is `PAGE_READWRITE` (`0x4`) plus a console-only bit (`0x10000`) that desktop Windows rejects, the same class of problem as the allocation-type bits seen earlier. The shim now masks the protection to `0x7FF` (`PAGE_*`, guard, no-cache, write-combine). With that, no `VirtualAlloc` fails or is relocated in a run.
+
+## Static TLS keeps getting lost
+With the allocator fixed, the next faults are title code reading its static TLS on a thread where the slot is garbage (`title+0x3366d5` and others). The crash report now shows the thread's start address, and for the failing thread it was `xb1layer.exe+0x2f760`, my own `CreateThread` trampoline. That thread did get TLS installed at startup and lost it later: when something loads a DLL with static TLS, `ntdll` allocates a new vector for every thread and copies only the entries below its own idea of the current size. The replacement vectors seen are small (about 14 to 20 populated entries), so index 100 was always lost, and index 60 (now used) survives in some runs and not in others.
+
+So no fixed index installed by hand is reliable. Two partial mitigations are in place: the index is 60 instead of 100, and thread-pool I/O callbacks (`CreateThreadpoolIo`) are wrapped so pool threads also get TLS. The proper fix is to make `ntdll` own the title's TLS block: load a small helper DLL with a static TLS directory so the loader allocates, grows and copies its block for every thread, and point the title's `_tls_index` at the index it received. That needs a helper image whose TLS block starts at offset 0 (the title addresses its data from the block start), which is a larger change that has not been started.
+
 ## The next walls
-After that fix the title survives loading `WindowsCodecs.dll` and continues, and the end of the run changed twice:
+After the TLS and allocator fixes the title survives loading `WindowsCodecs.dll` and continues, and the end of the run changed several times:
 1. **Fast-fail from `terminate()`.** The title requests `CoreApplication`'s second console-only interface, `42A6A529-3CC6-4867-B5B7-6D1FAF5325F9`, gets `E_NOINTERFACE`, C++/CX throws `InvalidCastException`, nothing catches it, and the C runtime calls `terminate()`. (The other extension interface, `9FF3799E-...`, is tolerated by the title, and serving it with the generic stand-in breaks things, so it stays unimplemented.) The factory now serves `42A6A529` with the generic stand-in. The title then calls **slot 7 with the value `1`** on it; the stand-in reports success and writes nothing.
-2. **A NULL write** at `title+0x1960158` follows (`rdi` points at a global that holds `0xffffffffffffffff`). The cause is not known.
+2. ~~A NULL write at `title+0x1960158`~~ Explained above (console protection bits), fixed.
+3. **Another fault at `title+0x17cdbe0`** with TLS intact, in the runs where the TLS fault does not occur first. Not investigated.
 
 ## Next investigation steps
-1. Find out what `title+0x1960158` writes through (probably something the previous step should have initialized).
-2. Work out what slot 7 of `42A6A529` is (it takes a small value `1`).
-3. Pin down the console `ICoreWindow` layout: keep logging slots as the title uses more of them, and keep stand-in behavior per slot only where the call pattern justifies it.
+1. Make `ntdll` own the title's static TLS (helper DLL with a TLS directory), then re-check the faults that remain.
+2. Investigate `title+0x17cdbe0`.
+3. Work out what slot 7 of `42A6A529` is (it takes a small value `1`).
+4. Pin down the console `ICoreWindow` layout: keep logging slots as the title uses more of them, and keep stand-in behavior per slot only where the call pattern justifies it.
 3. Implement `DXGIXSetVLineNotification`, `DXGIXPresentArray` and any other `DXGIX*` the title uses.
 3. Work out the real shape of the `PackageTransferManager` interfaces, from the title's own usage or from the console SDK's published API reference if available, and implement them for real.
 3. Implement `DXGIXSetVLineNotification` and the rest of the `d3d11_x` surface.

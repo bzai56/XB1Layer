@@ -28,7 +28,7 @@ jmp rax
 Done on a dedicated thread with a 256 MB stack reserve, because titles expect far more than Rust's default:
 - **Unwind tables:** the exception directory is registered with `RtlAddFunctionTable`, so SEH and C++ exceptions can unwind through title code.
 - **PEB image base:** `PEB.ImageBaseAddress` is pointed at the title so `GetModuleHandle(NULL)` returns it.
-- **Static TLS:** the TLS template is copied per thread and installed in `TEB.ThreadLocalStoragePointer` at a fixed high index (100); `_tls_index` is set to match. The array has no recorded length, so a larger copy of the first 16 entries is swapped in. **The array must be allocated from the process heap**, because `ntdll` frees and reallocates it with `RtlFreeHeap` when a DLL with static TLS is loaded; a `VirtualAlloc` block there crashes the loader. TLS callbacks run once for the main thread.
+- **Static TLS:** the TLS template is copied per thread and installed in `TEB.ThreadLocalStoragePointer` at a fixed high index (100); `_tls_index` is set to match. The array has no recorded length, so a larger copy of the first 16 entries is swapped in. **The array must be allocated from the process heap**, because `ntdll` frees and reallocates it with `RtlFreeHeap` when a DLL with static TLS is loaded; a `VirtualAlloc` block there crashes the loader. TLS callbacks run once for the main thread. The index is 60. **This design is fragile**: `ntdll` rebuilds every thread's vector when a DLL with static TLS loads and drops entries above its own size, so the title can lose its TLS mid-run (see [FINDINGS.md](FINDINGS.md#static-tls-keeps-getting-lost)).
 - **Threads:** `CreateThread` is overridden to wrap the start routine in a trampoline that installs TLS first.
 
 ### WinRT shell layer (`src/winrt.rs`)
@@ -60,7 +60,8 @@ Some imports are implemented by us instead of forwarded to Windows:
 |--------|-----|
 | `GetProcessHeap` | Returns a private guest heap so the title cannot corrupt the host's heap |
 | `VirtualAlloc` | Strips console-only allocation-type bits and falls back to any address if a fixed-address reservation is unavailable |
-| `CreateThread` | Installs static TLS on new threads |
+| `CreateThread`, `CreateThreadpoolIo` | Install static TLS on new threads and on thread-pool I/O callback threads |
+| `VirtualAlloc` | Also masks the protection argument to `0x7FF` (console-only bit `0x10000` otherwise fails with `ERROR_NOT_SUPPORTED`) |
 | `XMem*`, `TitleMemoryStatus` | Console memory API (see below) |
 | `GetActivationFactoryByPCWSTR` (vccorlib140) | Routes WinRT class lookups to the shell layer |
 

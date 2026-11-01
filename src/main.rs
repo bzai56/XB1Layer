@@ -30,12 +30,14 @@ unsafe extern "system" {
     fn ReadFile(h: *mut c_void, buf: *mut c_void, n: u32, read: *mut u32, ov: *mut c_void) -> i32;
     fn GetFileInformationByHandleEx(h: *mut c_void, class: u32, buf: *mut c_void, size: u32) -> i32;
     fn GetLastError() -> u32;
+    fn CreateThreadpoolIo(file: *mut c_void, callback: usize, context: *mut c_void, env: *mut c_void) -> *mut c_void;
     fn CreateThread(attrs: *mut c_void, stack: usize, routine: usize, param: *mut c_void, flags: u32, tid: *mut u32) -> *mut c_void;
     fn VirtualFree(addr: *mut c_void, size: usize, ty: u32) -> i32;
     fn HeapCreate(options: u32, initial: usize, max: usize) -> *mut c_void;
     fn HeapValidate(heap: *mut c_void, flags: u32, mem: *const c_void) -> i32;
     fn GetProcessHeap() -> *mut c_void;
     fn HeapAlloc(heap: *mut c_void, flags: u32, size: usize) -> *mut c_void;
+    fn HeapSize(heap: *mut c_void, flags: u32, mem: *const c_void) -> usize;
     fn VirtualQuery(addr: *const c_void, info: *mut c_void, len: usize) -> usize;
     fn GetStdHandle(which: u32) -> *mut c_void;
     fn WriteFile(h: *mut c_void, buf: *const u8, n: u32, written: *mut u32, overlapped: *mut c_void) -> i32;
@@ -209,6 +211,34 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
         describe(addr, &mut loc);
         rlog!("[exception] {code:#x} at {}", loc.as_str());
         rlog!("  committed by the title so far: {} MiB", COMMITTED_BYTES.load(Ordering::Relaxed) >> 20);
+        {
+            let teb: usize;
+            std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb, options(nostack, readonly, preserves_flags));
+            let arr = *((teb + 0x58) as *const usize);
+            let entry = if arr > 0x10000 { *((arr + TLS_TITLE_INDEX * 8) as *const usize) } else { 0 };
+            rlog!("  thread {}: TLS array {arr:#x}, entry[{TLS_TITLE_INDEX}] = {entry:#x}", GetCurrentThreadId());
+            // ThreadQuerySetWin32StartAddress = 9
+            let mut start = 0usize;
+            if NtQueryInformationThread(GetCurrentThread(), 9, &mut start as *mut usize as *mut c_void, 8, ptr::null_mut()) == 0 {
+                let mut s = RawBuf::new();
+                describe(start, &mut s);
+                rlog!("  thread start address: {}", s.as_str());
+            }
+            if arr > 0x10000 {
+                let mut q = [0u64; 8];
+                if VirtualQuery(arr as *const c_void, q.as_mut_ptr() as *mut c_void, 48) != 0 {
+                    rlog!("  array region base={:#x} size={:#x} alloc_base={:#x}", q[0], q[3], q[1]);
+                }
+                let mut shown = 0;
+                for i in 0..160 {
+                    let v = *((arr + i * 8) as *const usize);
+                    if v != 0 && shown < 14 {
+                        rlog!("    TLS[{i}] = {v:#x}");
+                        shown += 1;
+                    }
+                }
+            }
+        }
         let ctx = *info.add(1);
         let reg = |off: usize| *(ctx.add(off) as *const u64);
         rlog!(
@@ -316,7 +346,11 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
     0
 }
 
-const TLS_TITLE_INDEX: usize = 100;
+/// Index of the title's static TLS in `TEB.ThreadLocalStoragePointer`. When a DLL with static
+/// TLS loads, ntdll grows every thread's vector and copies only the entries below its own
+/// notion of the current size, so a high index (100 was tried) is lost; this one is kept low
+/// enough to stay inside that range while being above any index real modules receive.
+const TLS_TITLE_INDEX: usize = 60;
 static TLS_TEMPLATE: AtomicUsize = AtomicUsize::new(0);
 static TLS_LEN: AtomicUsize = AtomicUsize::new(0);
 static TLS_TOTAL: AtomicUsize = AtomicUsize::new(0);
@@ -345,6 +379,44 @@ unsafe fn install_tls_for_current_thread() {
     }
     *arr.add(TLS_TITLE_INDEX) = block as *mut c_void;
     *slot = arr;
+    rlog!("[tls] thread {} got the title's static TLS (array {arr:p})", GetCurrentThreadId());
+}
+
+thread_local! {
+    /// Whether this thread already has the title's static TLS installed.
+    static TLS_READY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Installs the title's static TLS on the calling thread once.
+fn ensure_tls_on_current_thread() {
+    TLS_READY.with(|ready| {
+        if !ready.get() {
+            unsafe { install_tls_for_current_thread() };
+            ready.set(true);
+        }
+    });
+}
+
+/// A thread-pool I/O callback registered by the title, wrapped so pool threads get TLS first.
+struct PoolIo {
+    callback: usize,
+    context: usize,
+}
+
+type PoolIoCallback = extern "system" fn(*mut c_void, *mut c_void, *mut c_void, u32, usize, *mut c_void);
+
+extern "system" fn pool_io_trampoline(instance: *mut c_void, context: *mut c_void, overlapped: *mut c_void, result: u32, bytes: usize, io: *mut c_void) {
+    ensure_tls_on_current_thread();
+    let wrapped = unsafe { &*(context as *const PoolIo) };
+    let f: PoolIoCallback = unsafe { std::mem::transmute(wrapped.callback) };
+    f(instance, wrapped.context as *mut c_void, overlapped, result, bytes, io);
+}
+
+/// `CreateThreadpoolIo(file, callback, context, environment)`.
+extern "system" fn xb_create_threadpool_io(file: *mut c_void, callback: usize, context: usize, env: *mut c_void) -> *mut c_void {
+    // Leaked on purpose: the callback runs for every completion until the object is closed.
+    let wrapped = Box::into_raw(Box::new(PoolIo { callback, context }));
+    unsafe { CreateThreadpoolIo(file, pool_io_trampoline as usize, wrapped as *mut c_void, env) }
 }
 
 struct ThreadStart {
@@ -354,7 +426,7 @@ struct ThreadStart {
 
 extern "system" fn thread_trampoline(p: *mut c_void) -> u32 {
     let ThreadStart { routine, param } = *unsafe { Box::from_raw(p as *mut ThreadStart) };
-    unsafe { install_tls_for_current_thread() };
+    ensure_tls_on_current_thread();
     let f: extern "system" fn(*mut c_void) -> u32 = unsafe { std::mem::transmute(routine) };
     f(param as *mut c_void)
 }
@@ -659,6 +731,7 @@ fn override_for(dll: &str, func: &str) -> Option<usize> {
         "XMemSetAllocationHooks" => Some(xb_xmem_set_hooks as usize),
         "TitleMemoryStatus" => Some(xb_title_memory_status as usize),
         "CreateThread" => Some(xb_create_thread as usize),
+        "CreateThreadpoolIo" => Some(xb_create_threadpool_io as usize),
         "LoadLibraryExW" if RING.load(Ordering::Relaxed) != 0 => Some(xb_load_library_ex_w as usize),
         "CreateFile2" if RING.load(Ordering::Relaxed) != 0 => Some(xb_create_file2 as usize),
         "FindFirstFileExA" if RING.load(Ordering::Relaxed) != 0 => Some(xb_find_first_file_ex_a as usize),
@@ -746,6 +819,10 @@ const VALID_ALLOC_TYPE: u32 = 0x1000 | 0x2000 | 0x80000 | 0x100000 | 0x200000 | 
 /// falling back to any address for a reservation if that range is not available here.
 extern "system" fn xb_virtual_alloc(addr: *mut c_void, size: usize, ty: u32, prot: u32) -> *mut c_void {
     let clean = ty & VALID_ALLOC_TYPE;
+    // Same for the protection: the title passes console-only bits (observed: 0x10000 on top of
+    // PAGE_READWRITE), which fail with ERROR_NOT_SUPPORTED. Keep the PAGE_* value, PAGE_GUARD,
+    // PAGE_NOCACHE and PAGE_WRITECOMBINE.
+    let prot = prot & 0x7FF;
     let mut p = unsafe { VirtualAlloc(addr, size, clean, prot) };
     if !p.is_null() && clean & 0x1000 != 0 {
         COMMITTED_BYTES.fetch_add(size, Ordering::Relaxed);
@@ -800,6 +877,12 @@ extern "system" fn xb_get_activation_factory(name: *const u16, guid: *const u8, 
         wide_to_string(name), g, hr as u32
     ));
     hr
+}
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtQueryInformationThread(thread: *mut c_void, class: u32, info: *mut c_void, len: u32, ret: *mut u32) -> i32;
+    fn GetCurrentThread() -> *mut c_void;
 }
 
 #[link(name = "ole32")]
