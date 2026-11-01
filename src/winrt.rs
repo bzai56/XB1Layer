@@ -286,6 +286,29 @@ fn to_hr(r: Result<()>) -> HRESULT {
 
 struct CoreAppTag;
 
+/// `Windows.UI.Core.CoreWindow` statics (`ICoreWindowStatic`): `GetForCurrentThread` returns the
+/// shell's window, since the real runtime has none for this process.
+struct CoreWindowStaticsTag;
+
+impl Iface for CoreWindowStaticsTag {
+    const IID: GUID = ICoreWindowStatic::IID;
+    const NAME: &'static str = "Windows.UI.Core.CoreWindow";
+    type Vtbl = ICoreWindowStatic_Vtbl;
+    type State = ();
+    const VTBL: &'static Self::Vtbl = &ICoreWindowStatic_Vtbl {
+        base__: inspectable::<CoreWindowStaticsTag>(),
+        GetForCurrentThread: core_window_for_current_thread,
+    };
+}
+
+unsafe extern "system" fn core_window_for_current_thread(_this: *mut c_void, out: *mut *mut c_void) -> HRESULT {
+    wlog!("[winrt] CoreWindow::GetForCurrentThread");
+    // The console-layout window: titles call slot 7 expecting the dispatcher (the desktop layout has
+    // Bounds there).
+    unsafe { *out = generic_add_ref_ret(shell().console_window) };
+    HRESULT(0)
+}
+
 impl Iface for CoreAppTag {
     const IID: GUID = ICoreApplication::IID;
     const NAME: &'static str = "Windows.ApplicationModel.Core.CoreApplication";
@@ -913,7 +936,7 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
     }
     // `Controller` statics slot 6 is the controller list, an IVectorView<IController> (the title
     // calls `get_Size` and `GetAt(index, &out)` on it). Empty for now: no controllers connected.
-    if o.class == "Windows.Xbox.Input.Controller" && N == 6 && is_writable(arg1) {
+    if (o.class == "Windows.Xbox.Input.Controller" || o.class == "Windows.Xbox.Input.Gamepad") && N == 6 && is_writable(arg1) {
         let list = create_vector_view("Windows.Xbox.Input.Controller.Controllers", &o.iid, 0);
         unsafe { *(arg1 as *mut *mut c_void) = list };
         wlog!("[winrt] {} slot 6 (Controllers) -> an empty vector view", o.class);
@@ -1280,6 +1303,13 @@ pub fn try_activation_factory(class: &str, iid: &GUID, out: *mut *mut c_void) ->
         wlog!("[winrt] generic stand-in for {class} (iid {iid:?})");
         return Some(HRESULT(0));
     }
+    if class == CoreWindowStaticsTag::NAME {
+        let obj = Com::<CoreWindowStaticsTag>::create(());
+        let hr = unsafe { com_query_interface::<CoreWindowStaticsTag>(obj, iid, out) };
+        unsafe { com_release::<CoreWindowStaticsTag>(obj) };
+        wlog!("[winrt] CoreWindow statics: iid={iid:?} -> {:#x}", hr.0 as u32);
+        return Some(hr);
+    }
     if class != CoreAppTag::NAME {
         return None;
     }
@@ -1293,6 +1323,14 @@ pub fn try_activation_factory(class: &str, iid: &GUID, out: *mut *mut c_void) ->
     //  - 42A6A529-3CC6-4867-B5B7-6D1FAF5325F9: the title does not tolerate its absence (C++/CX
     //    throws InvalidCastException, nothing catches it, terminate() is called), so it gets the
     //    generic stand-in.
+    // 9FF3799E: Forza tolerates E_NOINTERFACE (a generic stand-in made it jump to a bogus address),
+    // Sonic Mania throws InvalidCastException without it. A null object (every method succeeds and
+    // writes nothing) is used when XB1_COREAPP_9FF=1; the loader sets it for titles that need it.
+    if hr == E_NOINTERFACE && *iid == GUID::from_u128(0x9FF3799E_6E83_468C_A5B0_501CE6BB0FA1) && std::env::var_os("XB1_COREAPP_9FF").is_some() {
+        unsafe { *out = crate::null_object() as *mut c_void };
+        wlog!("[winrt] CoreApplication extension 9FF3799E -> null object");
+        hr = HRESULT(0);
+    }
     if hr == E_NOINTERFACE && *iid == GUID::from_u128(0x42A6A529_3CC6_4867_B5B7_6D1FAF5325F9) {
         unsafe { *out = create_generic(&format!("{class} (console extension 42A6A529)"), iid) };
         hr = HRESULT(0);

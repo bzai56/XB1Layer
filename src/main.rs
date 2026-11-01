@@ -7,6 +7,7 @@
 //!
 //! Usage: xb1layer <file.exe> [--run]
 
+mod display;
 mod gpu;
 mod tlsdll;
 mod winrt;
@@ -370,7 +371,7 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                             let slot = match rname {
                                 "rax" => 0x78, "rcx" => 0x80, "rdx" => 0x88, "rbx" => 0x90, "rsi" => 0xA8, "rdi" => 0xB0,
                                 "r8" => 0xB8, "r9" => 0xC0, "r10" => 0xC8, "r11" => 0xD0, "r12" => 0xD8, "r13" => 0xE0,
-                                "r14" => 0xE8, "r15" => 0xF0, _ => continue,
+                                "r14" => 0xE8, "r15" => 0xF0, "title" => 0x00, _ => continue,
                             };
                             // "reg+off>off2": read the qword at reg+off first, then use it + off2.
                             let (off, off2) = match off.split_once('>') {
@@ -379,7 +380,9 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                             };
                             let off = usize::from_str_radix(off.trim_start_matches("0x"), 16).unwrap_or(0);
                             let len = len.parse::<usize>().unwrap_or(8).min(32);
-                            let mut p = (reg(slot) as usize).wrapping_add(off);
+                            // "title+0xRVA:len": a fixed address inside the title image.
+                            let regval = if rname == "title" { IMG_BASE.load(Ordering::Relaxed) } else { reg(slot) as usize };
+                            let mut p = regval.wrapping_add(off);
                             if let Some(off2) = off2 {
                                 let mut q = 0usize;
                                 let mut got0 = 0usize;
@@ -1280,7 +1283,7 @@ extern "system" fn stub_open(_this: *mut c_void, out: *mut *mut c_void) -> usize
 
 /// A COM-shaped object whose methods all succeed and write nothing (out-pointers stay as the
 /// caller initialised them, normally NULL), for objects the title expects but nothing provides.
-fn null_object() -> usize {
+pub fn null_object() -> usize {
     static OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *OBJ.get_or_init(|| {
         let mut v = vec![stub_ok as usize; 96];
@@ -1622,6 +1625,59 @@ extern "system" fn acp_release_shape_contexts(a1: usize, a2: usize, a3: usize, a
     0
 }
 
+/// `D3D11CreateDevice(adapter, driver_type, software, flags, feature_levels*, n_levels, sdk_version, device**, level*, context**)`.
+extern "system" fn xb_d3d11_create_device(
+    adapter: *mut c_void, driver_type: u32, software: *mut c_void, flags: u32, levels: *const u32, n_levels: u32, sdk: u32,
+    device: *mut *mut c_void, level: *mut u32, context: *mut *mut c_void,
+) -> i32 {
+    let m = unsafe { LoadLibraryA(c"d3d11.dll".as_ptr()) };
+    let f = unsafe { GetProcAddress(m, c"D3D11CreateDevice".as_ptr()) };
+    let real: extern "system" fn(*mut c_void, u32, *mut c_void, u32, *const u32, u32, u32, *mut *mut c_void, *mut u32, *mut *mut c_void) -> i32 =
+        unsafe { std::mem::transmute(f) };
+    let first = if !levels.is_null() && n_levels > 0 { unsafe { *levels } } else { 0 };
+    // The console SDK version (131090) is not a desktop one; D3D11_SDK_VERSION is 7.
+    let hr = real(adapter, driver_type, software, flags, levels, n_levels, 7, device, level, context);
+    rlog!(
+        "[gpu] D3D11CreateDevice(adapter {adapter:p}, driver {driver_type}, flags {flags:#x}, {n_levels} level(s), first {first:#x}, sdk {sdk}) -> {:#x}",
+        hr as u32
+    );
+    if hr >= 0 {
+        unsafe { gpu::wrap_created_device(device, context) };
+        display::install();
+    }
+    hr
+}
+
+/// `CreateXAudio2Object(IXAudio2** out, UINT32 flags, XAUDIO2_PROCESSOR processor)`: the console
+/// runtime's entry point, taken to have `XAudio2Create`'s shape (the desktop DLL does not export it).
+extern "system" fn xb_create_xaudio2_object(out: *mut *mut c_void, flags: u32, processor: u32) -> i32 {
+    let m = unsafe { LoadLibraryA(c"xaudio2_9.dll".as_ptr()) };
+    let f = unsafe { GetProcAddress(m, c"XAudio2Create".as_ptr()) };
+    if f.is_null() {
+        return 0x8007007Fu32 as i32;
+    }
+    let create: extern "system" fn(*mut *mut c_void, u32, u32) -> i32 = unsafe { std::mem::transmute(f) };
+    // The console processor selector is not a desktop one; XAUDIO2_DEFAULT_PROCESSOR is 1.
+    let hr = create(out, flags & 0, 1);
+    let _ = processor;
+    rlog!("[audio] CreateXAudio2Object -> XAudio2Create -> {:#x}", hr as u32);
+    hr
+}
+
+/// `GetProcAddress` for the title: names that only exist in console DLLs are redirected.
+extern "system" fn xb_get_proc_address(module: *mut c_void, name: *const i8) -> *mut c_void {
+    let p = unsafe { GetProcAddress(module, name) };
+    if p.is_null() && (name as usize) > 0xFFFF {
+        let n = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
+        if n == "CreateXAudio2Object" {
+            rlog!("[audio] GetProcAddress(CreateXAudio2Object) -> shim over XAudio2Create");
+            return xb_create_xaudio2_object as usize as *mut c_void;
+        }
+        rlog!("[proc] GetProcAddress({n}) not found");
+    }
+    p
+}
+
 /// Imports we implement ourselves instead of forwarding to Windows.
 fn override_for(dll: &str, func: &str) -> Option<usize> {
     if dll.eq_ignore_ascii_case("vccorlib140.dll") && func.starts_with("?GetActivationFactoryByPCWSTR") {
@@ -1629,6 +1685,11 @@ fn override_for(dll: &str, func: &str) -> Option<usize> {
     }
     if dll.eq_ignore_ascii_case("d3d11_x.dll") && func == "D3D11XCreateDeviceX" {
         return Some(gpu::create_device_x as usize);
+    }
+    // Titles that use the plain `D3D11CreateDevice` export of the console runtime (same signature as
+    // the desktop one): forwarded to the real d3d11.dll, with the call and its result logged.
+    if dll.eq_ignore_ascii_case("d3d11_x.dll") && func == "D3D11CreateDevice" {
+        return Some(xb_d3d11_create_device as usize);
     }
     if dll.eq_ignore_ascii_case("d3d11_x.dll") && func == "DXGIXPresentArray" {
         return Some(gpu::present_array as usize);
@@ -1657,6 +1718,7 @@ fn override_for(dll: &str, func: &str) -> Option<usize> {
     }
     match func {
         "GetProcessHeap" => Some(xb_get_process_heap as usize),
+        "GetProcAddress" => Some(xb_get_proc_address as usize),
         "ExitProcess" => Some(xb_exit_process as usize),
         "TerminateProcess" => Some(xb_terminate_process as usize),
         "HeapAlloc" => Some(xb_heap_alloc as usize),
@@ -1876,6 +1938,7 @@ extern "system" fn xb_co_create_instance(clsid: *const windows::core::GUID, oute
         winrt::wrap_co_created(&c, &i, out);
     }
     ring_write(format_args!("  CoCreateInstance(clsid={c:?}, ctx={ctx:#x}, iid={i:?}) -> hr={:#x}\n", hr as u32));
+    rlog!("[com] CoCreateInstance(clsid {c:?}, iid {i:?}) -> {:#x}", hr as u32);
     hr
 }
 

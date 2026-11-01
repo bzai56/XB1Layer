@@ -1205,6 +1205,11 @@ unsafe fn create_sanitized(
         }
         d[misc_index] &= misc_keep;
     }
+    // Textures: DYNAMIC usage needs CPU write access on the desktop (the console does not ask for it).
+    // 2D and 3D descriptions: usage at dword 7, CPU access flags at dword 9.
+    if (slot == 5 || slot == 6) && dwords >= 10 && d[7] == 2 && d[9] == 0 {
+        d[9] = 0x10000; // D3D11_CPU_ACCESS_WRITE
+    }
     let f: unsafe extern "system" fn(*mut c_void, *const u32, *const c_void, *mut *mut c_void) -> HRESULT =
         unsafe { std::mem::transmute(*((*(p.real as *const *const usize)).add(slot))) };
     let hr = unsafe { f(p.real, d.as_ptr(), init, out) };
@@ -1645,6 +1650,29 @@ fn vtable(kind: Kind) -> *const usize {
     match kind {
         Kind::Device => DEVICE.get_or_init(|| build_vtable(Kind::Device)).as_ptr(),
         Kind::Context => CONTEXT.get_or_init(|| build_vtable(Kind::Context)).as_ptr(),
+    }
+}
+
+/// If `device` is one of the layer's proxy devices, returns the real device behind it.
+pub unsafe fn unwrap_device(device: *mut c_void) -> *mut c_void {
+    if device.is_null() {
+        return device;
+    }
+    let vt = unsafe { *(device as *const *const usize) };
+    if vt == vtable(Kind::Device) {
+        return unsafe { (*(device as *const Proxy)).real };
+    }
+    device
+}
+
+/// Replaces the device and context a plain `D3D11CreateDevice` returned with the layer's proxies, so
+/// console-only interfaces and extension slots work (same as `D3D11XCreateDeviceX`).
+pub unsafe fn wrap_created_device(device: *mut *mut c_void, context: *mut *mut c_void) {
+    if !device.is_null() && !unsafe { *device }.is_null() {
+        unsafe { *device = wrap(*device, Kind::Device) };
+    }
+    if !context.is_null() && !unsafe { *context }.is_null() {
+        unsafe { *context = wrap(*context, Kind::Context) };
     }
 }
 
