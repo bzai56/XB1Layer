@@ -1325,8 +1325,8 @@ pub fn try_activation_factory(class: &str, iid: &GUID, out: *mut *mut c_void) ->
     //    generic stand-in.
     // 9FF3799E: Forza tolerates E_NOINTERFACE (a generic stand-in made it jump to a bogus address),
     // Sonic Mania throws InvalidCastException without it. A null object (every method succeeds and
-    // writes nothing) is used when XB1_COREAPP_9FF=1; the loader sets it for titles that need it.
-    if hr == E_NOINTERFACE && *iid == GUID::from_u128(0x9FF3799E_6E83_468C_A5B0_501CE6BB0FA1) && std::env::var_os("XB1_COREAPP_9FF").is_some() {
+    // writes nothing) is the default (XB1_NO_COREAPP_9FF=1 restores E_NOINTERFACE); Forza behaves the same either way.
+    if hr == E_NOINTERFACE && *iid == GUID::from_u128(0x9FF3799E_6E83_468C_A5B0_501CE6BB0FA1) && std::env::var_os("XB1_NO_COREAPP_9FF").is_none() {
         unsafe { *out = crate::null_object() as *mut c_void };
         wlog!("[winrt] CoreApplication extension 9FF3799E -> null object");
         hr = HRESULT(0);
