@@ -163,6 +163,29 @@ So the proxy now forwards embedded slots 0 to 23 to the real desktop context (wi
 
 **Context `+0xA08(this, 1)`** is called once per context (the immediate context and one deferred context). Meaning not known.
 
+## Device creation methods, decoded and implemented
+Reading the call sites in the title's code (the arguments in registers, what it does with the result) pinned down the device extension slots:
+
+| Slot | Signature | Implemented as |
+|------|-----------|----------------|
+| 59 | `(device, const {u32 kind, u32 size}* desc, Object** out)`, kind 1 and 2, size `0x10000` each. The title later calls vtable slot 2 (`Release`) on the old value of the output field, so the result is a normal COM object. | A logging stand-in COM object; real type unknown |
+| 64 | `(device, desc*, tileMode, pitch, placementMemory*, Texture** out)`, the shape of the console SDK's `CreatePlacementTexture2D` | Ordinary desktop `CreateTexture2D` from the same description |
+| 65 | the same shape; description is 16x16x16 | Ordinary desktop `CreateTexture3D` |
+
+The descriptions begin with the desktop `D3D11_TEXTURE2D_DESC` / `D3D11_TEXTURE3D_DESC` layout: for example 960x540, 10 mips, format 99 (BC7), shader-resource bind; a 1920x1080 MSAA depth-stencil; 16x16x16 RGBA8. Console-only fields follow the desktop ones and are not copied. Tile mode (the `0xd`/`0xe` values) and the placement memory pointer have no desktop equivalent and are ignored; the texture is just allocated by the driver. Console-only bits in `MiscFlags` (seen: `0x400`, `0x40000`) make desktop creation fail with `E_INVALIDARG`, so only the desktop-valid bits are kept. With that, all 17 texture creations in a run succeed. The title also calls `GetType`, `GetDesc` and `GetDevice` (resource vtable slots 7, 10, 3) on the textures, so they are used as normal textures.
+
+## Context table: the shift is exact from index 34
+More logged calls fixed the mapping of the embedded context table:
+- `+0x4f0` (console index 34) takes a state object, NULL and `0xFFFFFFFF`: `OMSetBlendState(state, factor, sampleMask)`, desktop slot **35**.
+- `+0x550` (46) takes two real resources of the same type: `CopyResource`, desktop slot **47**.
+- `+0x568` (49) takes a render-target view and a pointer to zeros: `ClearRenderTargetView`, desktop slot **50**.
+- Indexes 59 and 63 are the hull/domain `SetShader` unbinds, desktop 60 and 64.
+
+So from console index 34 on, the console table is exactly one slot behind the desktop one, while indexes 11, 14, 15 and 23 match the desktop numbers. The method the console lacks is therefore one of desktop slots 24 to 34 (candidates: `IASetPrimitiveTopology`, `Begin`, `End`, `GetData`, `SetPredication`, `GSSetShaderResources`, ...); which one is not known. The proxy now forwards console indexes 0 to 23 as-is and 34 to 113 to desktop index + 1 (only indexes up to 63 have direct evidence; the rest is extrapolation, for example 109 would be `ClearState`). Indexes 24 to 33 stay logging stubs. With this, essentially all the context calls the title makes reach the real context; the remaining stub hits are `+0x4e0` (index 32) and `+0xA08`.
+
+## What is probably next: shaders
+Device slots **62** and **73** are the remaining unimplemented calls. Slot 62 is called 7 times with `(device, {size 0x490...}* , address, out*)`, where the address steps by 0x700 (`0x80dba0100`, `0x80dba0800`, `0x80dba0f00`, ...), which looks like creating shader objects from code blobs laid out in memory. If these are shaders, they are compiled for the console's GPU and cannot run on desktop hardware as they are. The layer would need to translate them (to DXBC or SPIR-V), which is a large component of its own. This is a reading of the argument pattern, not something checked against the data.
+
 ## Two bugs found along the way (mine, not the title's)
 - The console CoreWindow stand-in treated vtable slot 3 as `IInspectable::GetIids` and wrote through its arguments. The title calls slot 3 with non-pointers, a misaligned write panicked in the debug build, and the abort showed up as exit code `0xC0000409` (identical to a real fast-fail). The console window now has its own vtable where slots 3 to 5 are logging slots. Some earlier "fast-fail" endings may have been this.
 - A tool for real fast-fails: `--patch-fastfail` replaces the compiler's `mov ecx, code; int 0x29` sequences with a breakpoint, so the crash logger reports the site and the code. Only one such site exists in the image, and it was not reached in the runs checked.

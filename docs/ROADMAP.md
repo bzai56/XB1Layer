@@ -17,7 +17,10 @@
 3j4. ~~**Static TLS owned by `ntdll`**~~ Done: a toolchain-built helper DLL, patched so the loader's block starts at the title's template. The hand-built vector remains as `--legacy-tls`.
 3j5. ~~**Extended D3D11 device and context**~~ First version done: proxy objects forwarding the standard slots, with logging stubs for console-only vtable slots and for the function pointers embedded in the context object. The title's real use of these is not understood yet.
 3j6. ~~**Decode the context's embedded functions**~~ Partly done: the embedded region is a copy of the desktop context method table at `+0x3E0`; slots 0 to 23 and two shader slots now forward to the real context. Remaining: the rest of the table, and `+0xA08`.
-3j7. **Device extension slots 59, 64, 65**: creation functions (two objects of kinds 1 and 2; a 1920x1080 object; a 16x16 one). They currently return 0, so the title faults at `title+0x17b75fb` using a missing object. Need to hand back real objects.
+3j7. ~~**Device extension slots 59, 64, 65**~~ Done: 64 and 65 create real desktop textures (17 per run); 59 returns a logging stand-in. The context table mapping is exact from index 34 on.
+3j8. **Device slots 62 and 73** (probably shader creation from code blobs in memory, which would need a translator for the console GPU's shader format), and context `+0x4e0`, `+0xA08`.
+3j9. **NULL read at `title+0xe6319c`** (`[rdi+0x50]`, `rdi=0`) on a non-graphics thread.
+3j10. **Which desktop context slot (24 to 34) the console table lacks.**
 3j3. **Decode the two `CoreApplication` console extension interfaces** (`42A6A529`, `9FF3799E`).
 3k. **Console `ICoreWindow` layout**: pin down the member list, then raise window events (activation, size, visibility, input).
 4. **`kernelx` shim**: real implementations of the most-called functions, driven by stub-hit logs.

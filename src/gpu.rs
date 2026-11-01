@@ -87,10 +87,16 @@ const EMBED_TABLE: usize = 0x3E0;
 /// Highest desktop slot forwarded through the embedded table (`GSSetShader`).
 const EMBED_FORWARD_MAX: usize = 23;
 
-/// Observed calls at `+0x5B8` and `+0x5D8` (same NULL-argument reset sequence) sit one slot
-/// before the desktop `HSSetShader` (60) and `DSSetShader` (64), so the console table appears
-/// to be missing one method between slots 24 and 59. Only these two are mapped.
-const EMBED_SHIFTED: [(usize, usize); 2] = [(0x5B8, 60), (0x5D8, 64)];
+/// The console table is one slot behind the desktop one from index 34 on, so it lacks one method
+/// somewhere between desktop slots 24 and 34. Evidence (logged calls, by console index):
+/// 34 = `OMSetBlendState` (state, NULL, 0xFFFFFFFF), 46 = `CopyResource` (two resources),
+/// 49 = `ClearRenderTargetView` (view, pointer to zeros), 59 and 63 = the hull and domain
+/// `SetShader` calls in the NULL-argument reset sequence. Indexes 24 to 33 are not mapped
+/// because it is not known which of them is the missing method.
+const EMBED_SHIFTED_FROM: usize = 34;
+/// Last console index forwarded (desktop `FinishCommandList` is 114, so console 113).
+/// Only indexes up to 63 have direct evidence; the rest is extrapolated.
+const EMBED_SHIFTED_TO: usize = 113;
 
 /// `(embedded index, entry)` pairs that forward to the real context. Built once.
 fn forwarded_entries() -> &'static Vec<(usize, usize)> {
@@ -110,8 +116,9 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
             };
             v.push((index_of(EMBED_TABLE + slot * 8), entry));
         }
-        for (i, (offset, desktop_slot)) in EMBED_SHIFTED.iter().enumerate() {
-            v.push((index_of(*offset), forward_thunk(unsafe { thunks.add((32 + i) * 16) }, *desktop_slot)));
+        for console_slot in EMBED_SHIFTED_FROM..=EMBED_SHIFTED_TO {
+            let thunk = forward_thunk(unsafe { thunks.add((64 + console_slot - EMBED_SHIFTED_FROM) * 16) }, console_slot + 1);
+            v.push((index_of(EMBED_TABLE + console_slot * 8), thunk));
         }
         v
     });
@@ -470,6 +477,153 @@ unsafe extern "system" fn context_get_device(this: *mut c_void, out: *mut *mut c
 }
 
 // ---------------------------------------------------------------------------------------
+// Device creation methods (console extension slots)
+// ---------------------------------------------------------------------------------------
+
+/// Stand-in for objects whose type is not known: a COM-shaped object whose methods beyond
+/// `QueryInterface`/`AddRef`/`Release` are argument-logging stubs that return 0.
+#[repr(C)]
+struct StandIn {
+    vtbl: *const usize,
+    refs: AtomicU32,
+}
+
+const STAND_IN_SLOTS: usize = 128;
+
+unsafe extern "system" fn stand_in_qi(this: *mut c_void, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    glog!("[gpu] stand-in object: QueryInterface({:?}) -> self", unsafe { *iid });
+    unsafe {
+        (*(this as *const StandIn)).refs.fetch_add(1, Ordering::AcqRel);
+        *out = this;
+    }
+    HRESULT(0)
+}
+
+unsafe extern "system" fn stand_in_add_ref(this: *mut c_void) -> u32 {
+    unsafe { (*(this as *const StandIn)).refs.fetch_add(1, Ordering::AcqRel) + 1 }
+}
+
+unsafe extern "system" fn stand_in_release(this: *mut c_void) -> u32 {
+    let left = unsafe { (*(this as *const StandIn)).refs.fetch_sub(1, Ordering::AcqRel) - 1 };
+    if left == 0 {
+        drop(unsafe { Box::from_raw(this as *mut StandIn) });
+    }
+    left
+}
+
+fn stand_in_vtable() -> *const usize {
+    static VTBL: OnceLock<Vec<usize>> = OnceLock::new();
+    VTBL.get_or_init(|| {
+        let mut arena = ArgArena::new();
+        let mut v = vec![0usize; STAND_IN_SLOTS];
+        v[0] = stand_in_qi as usize;
+        v[1] = stand_in_add_ref as usize;
+        v[2] = stand_in_release as usize;
+        for i in 3..STAND_IN_SLOTS {
+            v[i] = arena.make(format!("[gpu] device-created object, vtable slot {i}"), ret_zero as usize as u64);
+        }
+        std::mem::forget(arena);
+        v
+    })
+    .as_ptr()
+}
+
+fn new_stand_in() -> *mut c_void {
+    Box::into_raw(Box::new(StandIn { vtbl: stand_in_vtable(), refs: AtomicU32::new(1) })) as *mut c_void
+}
+
+fn hex_dump(p: *const u8, n: usize) -> String {
+    let mut s = String::new();
+    for i in 0..n {
+        s.push_str(&format!("{:02x}", unsafe { *p.add(i) }));
+        if i % 4 == 3 {
+            s.push(' ');
+        }
+    }
+    s
+}
+
+/// `ID3D11Device::CreateTexture2D` / `CreateTexture3D` of the real device, by vtable slot.
+unsafe fn real_create_texture(real: *mut c_void, slot: usize, desc: *const u8, out: *mut *mut c_void) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, *const u8, *const c_void, *mut *mut c_void) -> HRESULT =
+        unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(slot))) };
+    unsafe { f(real, desc, ptr::null(), out) }
+}
+
+/// Device extension slot 59: `(device, const {u32 kind, u32 size}* desc, Object** out)`.
+/// Called with kind 1 and 2, size 0x10000 each. What these objects are is not known, so a
+/// stand-in COM object is returned and its use is logged.
+unsafe extern "system" fn device_ext_59(_this: *mut c_void, desc: *const u32, out: *mut *mut c_void) -> HRESULT {
+    let (kind, size) = unsafe { (*desc, *desc.add(1)) };
+    glog!("[gpu] device slot 59: kind {kind}, size {size:#x} -> stand-in object");
+    if !out.is_null() {
+        unsafe { *out = new_stand_in() };
+    }
+    HRESULT(0)
+}
+
+/// Device extension slots 64 and 65. Six arguments, the shape of the console SDK's
+/// `CreatePlacementTexture2D(desc, tileModeIndex, pitch, placementMemory, out)`:
+/// `(device, desc*, tile mode, pitch, memory*, Texture** out)`. The placement memory and tile
+/// mode have no desktop equivalent, so an ordinary texture is created from the description.
+/// `desktop_create_slot` is the real device's `CreateTexture2D` (5) or `CreateTexture3D` (6).
+unsafe fn create_placement_texture(
+    which: u32,
+    this: *mut c_void,
+    desc: *const u8,
+    tile_mode: u32,
+    pitch: u32,
+    memory: *mut c_void,
+    out: *mut *mut c_void,
+    desktop_create_slot: usize,
+) -> HRESULT {
+    let p = unsafe { &*(this as *const Proxy) };
+    glog!(
+        "[gpu] device slot {which}: tile mode {tile_mode:#x}, pitch {pitch}, memory {memory:p}, desc = {}",
+        hex_dump(desc, 48)
+    );
+    // The description starts with the desktop layout (verified for sizes, formats and bind
+    // flags in the dumps) followed by console-only fields that are not copied. Console-only
+    // bits in MiscFlags (seen: 0x400 on a depth texture) make desktop creation fail with
+    // E_INVALIDARG, so only the desktop-valid ones are kept.
+    let mut desktop = [0u32; 11];
+    let (copy_dwords, misc_index, misc_keep) = if desktop_create_slot == 5 {
+        (11, 10, 0x1 | 0x4) // Texture2D: GENERATE_MIPS | TEXTURECUBE
+    } else {
+        (9, 8, 0x1) // Texture3D: GENERATE_MIPS
+    };
+    unsafe { ptr::copy_nonoverlapping(desc as *const u32, desktop.as_mut_ptr(), copy_dwords) };
+    if desktop[misc_index] & !misc_keep != 0 {
+        glog!("[gpu] device slot {which}: dropping console-only MiscFlags bits {:#x}", desktop[misc_index] & !misc_keep);
+        desktop[misc_index] &= misc_keep;
+    }
+    let mut texture: *mut c_void = ptr::null_mut();
+    let hr = unsafe { real_create_texture(p.real, desktop_create_slot, desktop.as_ptr() as *const u8, &mut texture) };
+    if hr.0 >= 0 && !texture.is_null() {
+        glog!("[gpu] device slot {which}: created a desktop texture {texture:p}");
+        if !out.is_null() {
+            unsafe { *out = texture };
+        }
+        return HRESULT(0);
+    }
+    glog!("[gpu] device slot {which}: desktop texture creation failed ({:#x}) -> stand-in object", hr.0 as u32);
+    if !out.is_null() {
+        unsafe { *out = new_stand_in() };
+    }
+    HRESULT(0)
+}
+
+unsafe extern "system" fn device_ext_64(this: *mut c_void, desc: *const u8, tile_mode: u32, pitch: u32, memory: *mut c_void, out: *mut *mut c_void) -> HRESULT {
+    unsafe { create_placement_texture(64, this, desc, tile_mode, pitch, memory, out, 5) }
+}
+
+unsafe extern "system" fn device_ext_65(this: *mut c_void, desc: *const u8, tile_mode: u32, pitch: u32, memory: *mut c_void, out: *mut *mut c_void) -> HRESULT {
+    // The description observed for slot 65 starts {16, 16, ...}: it may be a 3D texture
+    // (width, height, depth) or a small 2D one; treated as 3D until the dump says otherwise.
+    unsafe { create_placement_texture(65, this, desc, tile_mode, pitch, memory, out, 6) }
+}
+
+// ---------------------------------------------------------------------------------------
 // vtable construction
 // ---------------------------------------------------------------------------------------
 
@@ -517,6 +671,12 @@ fn build_vtable(kind: Kind) -> Vec<usize> {
     }
     for a in arenas {
         std::mem::forget(a);
+    }
+    if kind == Kind::Device {
+        // Creation methods decoded from the title's call sites.
+        v[59] = device_ext_59 as usize;
+        v[64] = device_ext_64 as usize;
+        v[65] = device_ext_65 as usize;
     }
     v
 }
