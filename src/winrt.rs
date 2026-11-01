@@ -578,7 +578,9 @@ impl IActivatedEventArgs_Impl for LaunchArgs_Impl {
 
 impl ILaunchActivatedEventArgs_Impl for LaunchArgs_Impl {
     fn Arguments(&self) -> Result<HSTRING> {
-        Ok(HSTRING::new())
+        // XB1_LAUNCH_ARGS: experiment with what the title is launched with (it parses "restart" and
+        // "ms-xbl-%X://" tokens from its activation).
+        Ok(std::env::var("XB1_LAUNCH_ARGS").map(|v| HSTRING::from(v.as_str())).unwrap_or_default())
     }
     fn TileId(&self) -> Result<HSTRING> {
         Ok(HSTRING::new())
@@ -755,7 +757,7 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
     // `XboxLiveConfiguration` slot 8 is read as a string by the title (wstring constructor at
     // 0x16f2420); taken to be the service configuration id, with a placeholder value.
     if o.class == "Windows.Xbox.Services.XboxLiveConfiguration" && N >= 6 && (arg1 as usize) % 8 == 0 && is_writable(arg1) {
-        unsafe { *(arg1 as *mut *mut c_void) = std::mem::transmute::<HSTRING, *mut c_void>(HSTRING::from("00000000-0000-0000-0000-000000000000")) };
+        unsafe { *(arg1 as *mut *mut c_void) = std::mem::transmute::<HSTRING, *mut c_void>(HSTRING::from("1d220100-a389-45d9-ab7a-fd1a3bc8d4d5")) };
         wlog!("[winrt] {} slot {N} -> placeholder HSTRING", o.class);
         return HRESULT(0);
     }

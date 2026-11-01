@@ -305,6 +305,9 @@ New diagnostics: `XB1_PEEK="r13+0x24de:1;r15+0x230:2"` prints memory at register
 
 New: `.slt` opens log their call chain (with `XB1_FILES=1`).
 
+## Launch arguments: not the cause
+Hypothesis tested and **refuted**: that the `Open(true)` branch needs non-empty activation arguments. `XB1_LAUNCH_ARGS` sets the `Arguments` the shell reports; with an empty value, `restart`, `ms-xbl-3BC8D4D5://` (the title ID from `AppxManifest.xml`, `3BC8D4D5`) and `ms-xbl-3BC8D4D5://restart` the run is identical and crashes at the same site. Forcing both gate flags by hand at the check (`XB1_POKE="r13+0x3224=1;r15+0x230=1"`) does reach the launch-argument handler (`0x1431a80`) but still never reaches the `Open(true)` call (`0x1432191`), because that call also depends on a changed-list result computed inside the handler (`r13b`). So the database path is gated by more state than a single flag, and I have not found what the real console run provides. The service configuration ID reported by `XboxLiveConfiguration` is now the real one from the manifest (`1d220100-a389-45d9-ab7a-fd1a3bc8d4d5`) instead of a zero placeholder.
+
 ## Tools added
 `--watch-sites=0x...,0x...` plants one-shot breakpoints at title RVAs (report registers, text pointed at by the argument registers, and the title's call chain, then continue); `--watch-repeat` keeps them armed (re-arming by single-step) and prints one compact line per hit for the title's logger; `--patch-fastfail` was added earlier. The device's standard creation methods now log failures with a dump of the description and, for views, the resource's own type and description.
 
