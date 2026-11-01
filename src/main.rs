@@ -1530,7 +1530,18 @@ extern "system" fn xb_load_library_ex_w(name: *const u16, file: *mut c_void, fla
 extern "system" fn xb_create_file2(name: *const u16, access: u32, share: u32, disp: u32, params: *mut c_void) -> *mut c_void {
     let h = unsafe { CreateFile2(name, access, share, disp, params) };
     let err = if h as isize == -1 { unsafe { GetLastError() } } else { 0 };
-    ring_write(format_args!("  CreateFile2({:?}, access={access:#x}, disp={disp}) -> {h:p} err={err}\n", wide_to_string(name)));
+    let shown = wide_to_string(name);
+    ring_write(format_args!("  CreateFile2({:?}, access={access:#x}, disp={disp}) -> {h:p} err={err}\n", shown));
+    if shown.to_ascii_lowercase().contains(".slt") {
+        // Who opens the game database: the call chain.
+        let mut frames = [ptr::null_mut::<c_void>(); 40];
+        let n = unsafe { RtlCaptureStackBackTrace(0, 40, frames.as_mut_ptr(), ptr::null_mut()) } as usize;
+        for f in frames[..n].iter().map(|f| *f as usize).take(14) {
+            let mut text = RawBuf::new();
+            describe(f, &mut text);
+            rlog!("  .slt opened from {}", text.as_str());
+        }
+    }
     h
 }
 

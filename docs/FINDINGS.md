@@ -296,6 +296,15 @@ What was established (from the title's code and watch-site runs; names are mine)
 
 New diagnostics: `XB1_PEEK="r13+0x24de:1;r15+0x230:2"` prints memory at register+offset on each watch-site hit, `XB1_POKE="r13+0x3224=1"` writes one byte there (experiments only), and the shell logs the title's own `IFrameworkView` and `Activated` handler addresses.
 
+## Where `IsCarInstalled` is registered
+- `IsCarInstalled` and `IsCarInstalledAndPurchased` are registered by `0x2be900`, called from the same `CForza` method that opens the database (`0x142e2c0`, after its `Open` branch) with the connection object. It does run before the query (watch site), and the connection object it receives is non-NULL and is the same one the later query uses. So registration is not simply skipped.
+- The database file is read by a generic file-open routine (`0x18dd2c0`, a `CFile`-style class) earlier in start-up, before `Open(false)`; the call chain beyond that frame is not recoverable with the current unwinder. `gamedbRC.slt` itself is valid: Python's `sqlite3` opens it and finds `Data_Car` among 276 tables and views.
+- `Prepare` (connection vtable slot 16, `0x16fd020`) only allocates a statement wrapper (0x60 bytes) around the SQL text, so the NULL read at `title+0xd93e57` is not sqlite refusing the statement. The NULL is a pointer at offset `0x88` of a longer-lived object that `0x159c820` hands back; I did not establish what sets it.
+- The `Open(true)` branch (the one that loads and registers) is only reached from the launch-argument handler when its two checks pass: the `[object+0x3224]` flag, and `[this+0x230]`, which that same function sets from whether it parsed a non-empty list (`r12`). The list looks like the tokens of the activation arguments (`restart`, `ms-xbl-%X://`); the shell passes empty `Arguments`. A first launch from the console dashboard probably carries something there. Untested: giving `LaunchArgs.Arguments` a plausible value.
+- Nothing in the code writes `[object+0x3224]` except constructors and a virtual setter (`CPresentation` vtable slot 119) that is never called before the crash; it may be set by a window or presentation event the shell does not raise (visibility, activation, size).
+
+New: `.slt` opens log their call chain (with `XB1_FILES=1`).
+
 ## Tools added
 `--watch-sites=0x...,0x...` plants one-shot breakpoints at title RVAs (report registers, text pointed at by the argument registers, and the title's call chain, then continue); `--watch-repeat` keeps them armed (re-arming by single-step) and prints one compact line per hit for the title's logger; `--patch-fastfail` was added earlier. The device's standard creation methods now log failures with a dump of the description and, for views, the resource's own type and description.
 
