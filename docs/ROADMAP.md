@@ -4,9 +4,10 @@ The goal is a layer that runs many Xbox One titles on Windows x64 without graphi
 
 ## Next up (in order)
 
-1. **Remove the startup gaps.** The test title now stops on a different Xbox stand-in gap from run to run, before its first present. Each gap is a console WinRT method whose shape was guessed wrong; fix them from the call sites until the title reaches its first present.
+1. **Get the title to render.** It is stuck on its game database (see FINDINGS: the `Open(true)` gate). Until it passes that there are no draw packets to decode.
+2. **Remove the startup gaps.** The test title now stops on a different Xbox stand-in gap from run to run, before its first present. Each gap is a console WinRT method whose shape was guessed wrong; fix them from the call sites until the title reaches its first present.
 2. **Swap chain and window.** `DXGIXPresentArray` and `DXGIXSetVLineNotification` are logging stubs. Create a native window, a desktop swap chain, and present the title's display planes.
-3. **Decode the GPU command packets.** The title writes packets (header `((n+0x35A)<<5)|0x70000`) into a 4 MB buffer owned by each context; today they are logged and discarded. Decode draws, state, binding, clears and copies, and turn them into desktop D3D11 calls. This is the core of rendering.
+3. **Decode the GPU command packets.** The stream is AMD PM4 (see FINDINGS). So far it contains only two repeating idle-loop packet kinds and no draws, because the title is stuck before rendering; decode draws, state, binding, clears and copies once it gets that far, and turn them into desktop D3D11 calls. This is the core of rendering.
 4. **Textures.** Decode the console tile modes and de-tile placed textures (placed buffers are already mirrored).
 5. **Identify the remaining context-table indices** (24 to 33, 64 and up). Only evidenced indices forward to the driver; forwarding guesses corrupted it.
 

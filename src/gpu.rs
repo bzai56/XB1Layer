@@ -96,6 +96,30 @@ unsafe extern "system" fn context_grow_command_buffer(this: *mut c_void) -> usiz
     if n < 4 {
         glog!("[gpu] command buffer flush #{n}: {used} bytes at {:#x}; first bytes: {}", p.cmd_base, safe_dump(p.cmd_base as u64, 96));
     }
+    if n == 0 && used >= 56 {
+        // The second packet carries a 64-bit address; say what it is.
+        let d = p.cmd_base as *const u32;
+        let addr = unsafe { (*d.add(10) as u64) | ((*d.add(11) as u64) << 32) };
+        let mut module: *mut c_void = ptr::null_mut();
+        let mut name = String::from("(no module)");
+        unsafe {
+            if crate::GetModuleHandleExA(0x6, addr as *const i8, &mut module) != 0 {
+                let mut buf = [0u8; 260];
+                let len = crate::GetModuleFileNameA(module, buf.as_mut_ptr(), 260) as usize;
+                name = format!("{}+{:#x}", String::from_utf8_lossy(&buf[..len]).rsplit('\\').next().unwrap_or(""), addr as usize - module as usize);
+            }
+        }
+        glog!("[gpu] packet address {addr:#x}: {name}");
+    }
+    // XB1_DUMP_CMD=<dir> writes the first few flushed buffers there for offline decoding.
+    if n < 3 {
+        if let Some(dir) = std::env::var_os("XB1_DUMP_CMD") {
+            let bytes = unsafe { std::slice::from_raw_parts(p.cmd_base as *const u8, used) };
+            let path = std::path::Path::new(&dir).join(format!("cmd_flush_{n}.bin"));
+            let _ = std::fs::write(&path, bytes);
+            glog!("[gpu] wrote {} bytes to {}", used, path.display());
+        }
+    }
     p.embedded[(CMD_CURSOR - EMBED_BASE) / 8] = p.cmd_base;
     p.cmd_base
 }
