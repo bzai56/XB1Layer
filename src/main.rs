@@ -37,6 +37,15 @@ unsafe extern "system" {
     fn TerminateProcess(process: *mut c_void, code: u32) -> i32;
     fn ExitProcess(code: u32) -> !;
     fn VirtualProtect(addr: *mut c_void, size: usize, new: u32, old: *mut u32) -> i32;
+    fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> *mut c_void;
+    fn Thread32First(snapshot: *mut c_void, entry: *mut u32) -> i32;
+    fn Thread32Next(snapshot: *mut c_void, entry: *mut u32) -> i32;
+    fn OpenThread(access: u32, inherit: i32, tid: u32) -> *mut c_void;
+    fn SuspendThread(thread: *mut c_void) -> u32;
+    fn ResumeThread(thread: *mut c_void) -> u32;
+    fn SetThreadContext(thread: *mut c_void, ctx: *const c_void) -> i32;
+    fn CloseHandle(h: *mut c_void) -> i32;
+    fn GetCurrentProcessId() -> u32;
     fn DefineDosDeviceW(flags: u32, name: *const u16, target: *const u16) -> i32;
     fn QueryDosDeviceW(name: *const u16, target: *mut u16, max: u32) -> u32;
     fn GetModuleHandleA(name: *const i8) -> *mut c_void;
@@ -50,9 +59,6 @@ unsafe extern "system" {
     fn GetStdHandle(which: u32) -> *mut c_void;
     fn WriteFile(h: *mut c_void, buf: *const u8, n: u32, written: *mut u32, overlapped: *mut c_void) -> i32;
     fn GetCurrentThreadId() -> u32;
-    fn OpenThread(access: u32, inherit: i32, tid: u32) -> *mut c_void;
-    fn SuspendThread(thread: *mut c_void) -> u32;
-    fn ResumeThread(thread: *mut c_void) -> u32;
     fn GetCurrentProcess() -> *mut c_void;
     fn ReadProcessMemory(process: *mut c_void, addr: *const c_void, buf: *mut c_void, size: usize, read: *mut usize) -> i32;
     fn GetThreadContext(thread: *mut c_void, ctx: *mut c_void) -> i32;
@@ -256,6 +262,24 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
         let rec = *info;
         let code = *(rec as *const u32);
         if code == 0x8000_0004 {
+            // A hardware write breakpoint (XB1_HWBP) reports through DR6 bit 0.
+            let ctx0 = *info.add(1);
+            let dr6 = *(ctx0.add(0x68) as *const u64);
+            if dr6 & 1 != 0 {
+                *(ctx0.add(0x68) as *mut u64) = 0;
+                let (base, size) = (IMG_BASE.load(Ordering::Relaxed), IMG_SIZE.load(Ordering::Relaxed));
+                let rip = *(ctx0.add(0xF8) as *const usize);
+                let new = *(*(ctx0.add(0x48) as *const usize) as *const u64);
+                let mut at = RawBuf::new();
+                describe(rip, &mut at);
+                rlog!("[hwbp] write to the watched field, now {new:#x}, next instruction at {}", at.as_str());
+                let mut frames = [ptr::null_mut::<c_void>(); 24];
+                let n = RtlCaptureStackBackTrace(0, 24, frames.as_mut_ptr(), ptr::null_mut()) as usize;
+                for f in frames[..n].iter().map(|f| *f as usize).filter(|f| *f >= base && *f < base + size).take(8) {
+                    rlog!("  caller title+{:#x}", f - base);
+                }
+                return -1;
+            }
             // Single-step after a repeating watchpoint: put the breakpoints back.
             for (i, pending) in WATCH_PENDING.iter().enumerate() {
                 if pending.swap(false, Ordering::Relaxed) {
@@ -322,9 +346,23 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                                 "r8" => 0xB8, "r9" => 0xC0, "r10" => 0xC8, "r11" => 0xD0, "r12" => 0xD8, "r13" => 0xE0,
                                 "r14" => 0xE8, "r15" => 0xF0, _ => continue,
                             };
+                            // "reg+off>off2": read the qword at reg+off first, then use it + off2.
+                            let (off, off2) = match off.split_once('>') {
+                                Some((a, b)) => (a, Some(b)),
+                                None => (off, None),
+                            };
                             let off = usize::from_str_radix(off.trim_start_matches("0x"), 16).unwrap_or(0);
                             let len = len.parse::<usize>().unwrap_or(8).min(32);
-                            let p = (reg(slot) as usize).wrapping_add(off);
+                            let mut p = (reg(slot) as usize).wrapping_add(off);
+                            if let Some(off2) = off2 {
+                                let mut q = 0usize;
+                                let mut got0 = 0usize;
+                                if ReadProcessMemory(GetCurrentProcess(), p as *const c_void, &mut q as *mut usize as *mut c_void, 8, &mut got0) == 0 {
+                                    rlog!("  peek {item}: first pointer unreadable at {p:#x}");
+                                    continue;
+                                }
+                                p = q.wrapping_add(usize::from_str_radix(off2.trim_start_matches("0x"), 16).unwrap_or(0));
+                            }
                             let mut buf = [0u8; 32];
                             let mut got = 0usize;
                             if ReadProcessMemory(GetCurrentProcess(), p as *const c_void, buf.as_mut_ptr() as *mut c_void, len, &mut got) != 0 {
@@ -337,6 +375,21 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                             } else {
                                 rlog!("  peek {item} unreadable at {p:#x}");
                             }
+                        }
+                    }
+                    // XB1_HWBP="rbx+0x88": arm hardware write breakpoint 0 on that field of this thread.
+                    if let Some(spec) = HWBP_SPEC.get() {
+                        if let Some((rname, off)) = spec.split_once('+') {
+                            let slot = match rname {
+                                "rax" => 0x78, "rcx" => 0x80, "rdx" => 0x88, "rbx" => 0x90, "rsi" => 0xA8, "rdi" => 0xB0,
+                                "r8" => 0xB8, "r9" => 0xC0, "r12" => 0xD8, "r13" => 0xE0, "r14" => 0xE8, "r15" => 0xF0, _ => 0x80,
+                            };
+                            let off = usize::from_str_radix(off.trim_start_matches("0x"), 16).unwrap_or(0);
+                            let target = (reg(slot) as usize).wrapping_add(off);
+                            *(ctx.add(0x48) as *mut u64) = target as u64; // Dr0
+                            *(ctx.add(0x70) as *mut u64) = 1 | (1 << 16) | (3 << 18); // L0, write, 8 bytes
+                            arm_hwbp_all_threads(target);
+                            rlog!("  hardware write breakpoint armed on {target:#x} (all threads)");
                         }
                     }
                     // XB1_POKE="r13+0x3224=1": experiment only, writes one byte at register+offset.
@@ -483,7 +536,12 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                     rlog!("  array region base={:#x} size={:#x} alloc_base={:#x}", q[0], q[3], q[1]);
                 }
                 let mut shown = 0;
+                // Only entries inside the array's own memory region (it can end before 160 slots).
+                let region_end = if q[3] != 0 { q[0] as usize + q[3] as usize } else { arr + 8 };
                 for i in 0..160 {
+                    if arr + i * 8 + 8 > region_end {
+                        break;
+                    }
                     let v = *((arr + i * 8) as *const usize);
                     if v != 0 && shown < 14 {
                         rlog!("    TLS[{i}] = {v:#x}");
@@ -715,6 +773,10 @@ extern "system" fn thread_trampoline(p: *mut c_void) -> u32 {
         rlog!("[thread] trampoline started with routine {routine:#x}, param {param:#x}, box {p:p}");
     }
     ensure_tls_on_current_thread();
+    let hw = HWBP_ADDR.load(Ordering::Relaxed);
+    if hw != 0 {
+        unsafe { arm_hwbp_on(GetCurrentThread(), hw) };
+    }
     let f: extern "system" fn(*mut c_void) -> u32 = unsafe { std::mem::transmute(routine) };
     let code = f(param as *mut c_void);
     let base = IMG_BASE.load(Ordering::Relaxed);
@@ -751,6 +813,9 @@ unsafe fn bootstrap(base: *mut u8, size: usize, tls: (u32, u32), exc: (u32, u32)
     IMG_BASE.store(base as usize, Ordering::Relaxed);
     IMG_SIZE.store(size, Ordering::Relaxed);
     AddVectoredExceptionHandler(1, crash_logger);
+    if let Ok(spec) = std::env::var("XB1_HWBP") {
+        let _ = HWBP_SPEC.set(spec);
+    }
     if let Ok(spec) = std::env::var("XB1_POKE") {
         let _ = POKE_SPEC.set(spec);
     }
@@ -1041,6 +1106,7 @@ extern "system" fn xb_get_process_heap() -> *mut c_void {
 }
 
 /// The folder `G:` was mapped to (so the mapping can be removed again), if this process made one.
+static HWBP_SPEC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static POKE_SPEC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static PEEK_SPEC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static FILES_TO_STDERR: AtomicBool = AtomicBool::new(false);
@@ -1082,6 +1148,116 @@ fn unmap_content_drive() {
         // DDD_REMOVE_DEFINITION (0x2) with no target removes the most recent mapping of the name.
         unsafe { DefineDosDeviceW(0x2, name.as_ptr(), ptr::null()) };
     }
+}
+
+/// Address of the field the hardware write breakpoint watches (XB1_HWBP), 0 when off.
+static HWBP_ADDR: AtomicUsize = AtomicUsize::new(0);
+
+/// Sets debug register 0 (write, 8 bytes) on a thread (a 16-byte aligned CONTEXT buffer is built
+/// with only the debug registers).
+unsafe fn arm_hwbp_on(thread: *mut c_void, addr: usize) {
+    #[repr(C, align(16))]
+    struct Ctx([u8; 1232]);
+    let mut c = Ctx([0u8; 1232]);
+    *(c.0.as_mut_ptr().add(0x30) as *mut u32) = 0x0010_0010; // CONTEXT_AMD64 | CONTEXT_DEBUG_REGISTERS
+    *(c.0.as_mut_ptr().add(0x48) as *mut u64) = addr as u64;
+    *(c.0.as_mut_ptr().add(0x70) as *mut u64) = 1 | (1 << 16) | (3 << 18);
+    SetThreadContext(thread, c.0.as_ptr() as *const c_void);
+}
+
+/// Arms the hardware write breakpoint on every thread of this process except the caller.
+unsafe fn arm_hwbp_all_threads(addr: usize) {
+    HWBP_ADDR.store(addr, Ordering::Relaxed);
+    let snap = CreateToolhelp32Snapshot(0x4, 0);
+    if snap as isize == -1 {
+        return;
+    }
+    let mut entry = [0u32; 7]; // THREADENTRY32: size, usage, tid, owner pid, base priority, delta, flags
+    entry[0] = 28;
+    let me = GetCurrentThreadId();
+    let pid = GetCurrentProcessId();
+    let mut ok = Thread32First(snap, entry.as_mut_ptr());
+    while ok != 0 {
+        if entry[3] == pid && entry[2] != me {
+            // THREAD_SUSPEND_RESUME | THREAD_SET_CONTEXT | THREAD_GET_CONTEXT
+            let h = OpenThread(0x2 | 0x10 | 0x8, 0, entry[2]);
+            if !h.is_null() {
+                SuspendThread(h);
+                arm_hwbp_on(h, addr);
+                ResumeThread(h);
+                CloseHandle(h);
+            }
+        }
+        ok = Thread32Next(snap, entry.as_mut_ptr());
+    }
+    CloseHandle(snap);
+}
+
+// ---------------------------------------------------------------------------------------
+// Per-title compatibility patches
+// ---------------------------------------------------------------------------------------
+
+extern "system" fn stub_qi(_this: *mut c_void, _iid: *const c_void, out: *mut *mut c_void) -> i32 {
+    if !out.is_null() {
+        unsafe { *out = ptr::null_mut() };
+    }
+    0x8000_4002u32 as i32 // E_NOINTERFACE
+}
+extern "system" fn stub_ref(_this: *mut c_void) -> u32 {
+    1
+}
+extern "system" fn stub_ok(_this: *mut c_void) -> usize {
+    0
+}
+/// Slot 39, `Open(out**, name, flags, flag)` (title call site 0xd93e75): the caller does not
+/// initialise `out`, so it is set to NULL ("not found").
+extern "system" fn stub_open(_this: *mut c_void, out: *mut *mut c_void) -> usize {
+    if !out.is_null() {
+        unsafe { *out = ptr::null_mut() };
+    }
+    0
+}
+
+/// A COM-shaped object whose methods all succeed and write nothing (out-pointers stay as the
+/// caller initialised them, normally NULL), for objects the title expects but nothing provides.
+fn null_object() -> usize {
+    static OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *OBJ.get_or_init(|| {
+        let mut v = vec![stub_ok as usize; 96];
+        v[0] = stub_qi as usize;
+        v[1] = stub_ref as usize;
+        v[2] = stub_ref as usize;
+        v[39] = stub_open as usize;
+        let vtbl = Vec::leak(v).as_ptr() as usize;
+        Box::into_raw(Box::new([vtbl, 0usize])) as usize
+    })
+}
+
+/// The test title's `CFileSys` (RTTI `.?AVCFileSys@@`) keeps an object at `+0x88` that the
+/// layer cannot provide (nothing in the run ever writes it, and the callers use it to open
+/// `...\Manifest.xml`); its constructor stores 0 there. The two zeroing stores at
+/// `title+0x158c84d` (`mov [rbx+0x88], rax` / `mov [rbx+0x98], rax`) are replaced by a jump to a
+/// thunk that stores a null object at `+0x88` instead, so callers take their "nothing found"
+/// paths rather than dereferencing NULL. Applied only if the original bytes match.
+unsafe fn patch_filesys_storage(base: *mut u8, size: usize) {
+    const SITE: usize = 0x158c84d;
+    const ORIGINAL: [u8; 14] = [0x48, 0x89, 0x83, 0x88, 0, 0, 0, 0x48, 0x89, 0x83, 0x98, 0, 0, 0];
+    if SITE + 14 > size || std::slice::from_raw_parts(base.add(SITE), 14) != ORIGINAL {
+        return;
+    }
+    let thunk = VirtualAlloc(ptr::null_mut(), 64, MEM_COMMIT_RESERVE, PAGE_RWX) as *mut u8;
+    let mut code: Vec<u8> = vec![0x48, 0xB8]; // mov rax, null_object
+    code.extend_from_slice(&(null_object() as u64).to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x89, 0x83, 0x88, 0, 0, 0]); // mov [rbx+0x88], rax
+    code.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    code.extend_from_slice(&[0x48, 0x89, 0x83, 0x98, 0, 0, 0]); // mov [rbx+0x98], rax
+    code.extend_from_slice(&[0xFF, 0x25, 0, 0, 0, 0]); // jmp [rip+0]
+    code.extend_from_slice(&((base as u64) + (SITE as u64) + 14).to_le_bytes());
+    ptr::copy_nonoverlapping(code.as_ptr(), thunk, code.len());
+    let mut jump: Vec<u8> = vec![0xFF, 0x25, 0, 0, 0, 0];
+    jump.extend_from_slice(&(thunk as u64).to_le_bytes());
+    ptr::copy_nonoverlapping(jump.as_ptr(), base.add(SITE), 14);
+    println!("compat: CFileSys storage object stubbed (title+{SITE:#x})");
 }
 
 /// Logs who ends the process, then does it.
@@ -1298,6 +1474,94 @@ extern "system" fn cell_zeroed_table() -> *mut c_void {
     *BUF.get_or_init(|| Vec::leak(vec![0u8; 1 << 16]).as_ptr() as usize) as *mut c_void
 }
 
+// ---------------------------------------------------------------------------------------
+// AcpHal.dll: the console audio processor's HAL (the audio engine's memory and contexts)
+// ---------------------------------------------------------------------------------------
+//
+// Signatures are from memory of the XDK headers and from the call sites, not verified, so every
+// call logs its raw arguments. `ApuAlloc(void** va, UINT32* physical, size, alignment, flags)` is
+// treated as an allocator of zeroed memory; the rest succeed.
+
+static APU_CALLS: AtomicU32 = AtomicU32::new(0);
+
+fn apu_log(name: &str, a: [usize; 5]) {
+    if APU_CALLS.fetch_add(1, Ordering::Relaxed) < 40 {
+        rlog!("[acp] {name}({:#x}, {:#x}, {:#x}, {:#x}, {:#x})", a[0], a[1], a[2], a[3], a[4]);
+    }
+}
+
+/// A HAL object whose methods all succeed (slot 0 is called by the title as an ordinary method,
+/// `(this, 0x400, 0x400)`, so it cannot be a `QueryInterface`).
+fn acp_object() -> usize {
+    static OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *OBJ.get_or_init(|| {
+        let vtbl = Vec::leak(vec![stub_ok as usize; 96]).as_ptr() as usize;
+        Box::into_raw(Box::new([vtbl, 0usize])) as usize
+    })
+}
+
+/// `AcpHalCreate(IAcpHal** out, ...)`: the object comes back through the first argument (title
+/// call site 0x23f6b58, which then calls slot 0 on it).
+extern "system" fn acp_create(out: *mut usize, a2: usize, a3: usize, a4: usize, a5: usize) -> i32 {
+    apu_log("AcpHalCreate", [out as usize, a2, a3, a4, a5]);
+    if !out.is_null() && (out as usize) % 8 == 0 {
+        unsafe { *out = acp_object() };
+    }
+    0
+}
+extern "system" fn apu_create_heap(a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> i32 {
+    apu_log("ApuCreateHeap", [a1, a2, a3, a4, a5]);
+    0
+}
+extern "system" fn apu_alloc(out: *mut usize, physical: *mut u32, size: usize, align: usize, flags: usize) -> i32 {
+    apu_log("ApuAlloc", [out as usize, physical as usize, size, align, flags]);
+    let size = (size.max(1) + 0xFFFF) & !0xFFFF;
+    let mem = unsafe { VirtualAlloc(ptr::null_mut(), size, MEM_COMMIT_RESERVE, 0x04) } as usize;
+    if mem == 0 {
+        return 0x8007000E_u32 as i32; // E_OUTOFMEMORY
+    }
+    if !out.is_null() {
+        unsafe { *out = mem };
+    }
+    if !physical.is_null() {
+        unsafe { *physical = mem as u32 };
+    }
+    0
+}
+extern "system" fn apu_free(a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> i32 {
+    apu_log("ApuFree", [a1, a2, a3, a4, a5]);
+    0
+}
+extern "system" fn apu_is_va_valid(a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> i32 {
+    apu_log("ApuIsVirtualAddressValid", [a1, a2, a3, a4, a5]);
+    1
+}
+extern "system" fn apu_map_va(va: usize, a2: usize, physical: *mut u32, a4: usize, a5: usize) -> i32 {
+    apu_log("ApuMapVirtualAddress", [va, a2, physical as usize, a4, a5]);
+    if !physical.is_null() && (physical as usize) % 4 == 0 {
+        unsafe { *physical = va as u32 };
+    }
+    0
+}
+/// `AcpHalAllocateShapeContexts(config, 12, 0x50, 0x60, ...)`: `config` is the title's stack
+/// structure (`{0x200, .., 0x400 at +0xc, 0x200 at +0x10, ..}`); the call fills pointer fields at
+/// `+0x18` (the title then zeroes count*32 bytes there), `+0x30` (count*16) and `+0x38` (count*64). Each gets a
+/// zeroed block. Inferred from the call site at title+0x23f6ad1; other fields are unknown.
+extern "system" fn acp_allocate_shape_contexts(config: *mut u8, a2: usize, a3: usize, a4: usize, a5: usize) -> i32 {
+    apu_log("AcpHalAllocateShapeContexts", [config as usize, a2, a3, a4, a5]);
+    if !config.is_null() {
+        for off in [0x18usize, 0x30, 0x38] {
+            let block = unsafe { VirtualAlloc(ptr::null_mut(), 1 << 20, MEM_COMMIT_RESERVE, 0x04) } as usize;
+            unsafe { ptr::write_unaligned(config.add(off) as *mut usize, block) };
+        }
+    }
+    0
+}
+extern "system" fn acp_release_shape_contexts(a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> i32 {
+    apu_log("AcpHalReleaseShapeContexts", [a1, a2, a3, a4, a5]);
+    0
+}
+
 /// Imports we implement ourselves instead of forwarding to Windows.
 fn override_for(dll: &str, func: &str) -> Option<usize> {
     if dll.eq_ignore_ascii_case("vccorlib140.dll") && func.starts_with("?GetActivationFactoryByPCWSTR") {
@@ -1311,6 +1575,19 @@ fn override_for(dll: &str, func: &str) -> Option<usize> {
     }
     if dll.eq_ignore_ascii_case("d3d11_x.dll") && func == "DXGIXSetVLineNotification" {
         return Some(gpu::set_vline_notification as usize);
+    }
+    if dll.eq_ignore_ascii_case("AcpHal.dll") {
+        match func {
+            "AcpHalCreate" => return Some(acp_create as usize),
+            "ApuCreateHeap" => return Some(apu_create_heap as usize),
+            "ApuAlloc" => return Some(apu_alloc as usize),
+            "ApuFree" => return Some(apu_free as usize),
+            "ApuIsVirtualAddressValid" => return Some(apu_is_va_valid as usize),
+            "ApuMapVirtualAddress" => return Some(apu_map_va as usize),
+            "AcpHalAllocateShapeContexts" => return Some(acp_allocate_shape_contexts as usize),
+            "AcpHalReleaseShapeContexts" => return Some(acp_release_shape_contexts as usize),
+            _ => {}
+        }
     }
     if func == "CoCreateInstance" {
         return Some(xb_co_create_instance as usize);
@@ -1475,6 +1752,7 @@ extern "system" fn xb_get_activation_factory(name: *const u16, guid: *const u8, 
         "  GetActivationFactoryByPCWSTR({:?}, iid={:02x?}) -> hr={:#x}\n",
         wide_to_string(name), g, hr as u32
     ));
+    rlog!("[winrt] real activation factory for {} -> hr={:#x}", wide_to_string(name), hr as u32);
     hr
 }
 
@@ -1999,6 +2277,22 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool, dump_iat: bool) -> Res
             unsafe { plant_watch_sites(base, &list) };
             println!("planted {} one-shot watchpoints", list.len());
         }
+        if std::env::var_os("XB1_NO_COMPAT").is_none() {
+            unsafe { patch_filesys_storage(base, size_of_image) };
+        }
+        // XB1_PATCH="0x142cf6d=b201;0x...=..." (or --patch=...): write bytes into the mapped title
+        // before it runs. For experiments and per-title compatibility fixes.
+        if let Some(spec) = std::env::var_os("XB1_PATCH") {
+            for item in spec.to_string_lossy().split(';') {
+                let Some((rva, hex)) = item.split_once('=') else { continue };
+                let Ok(rva) = usize::from_str_radix(rva.trim().trim_start_matches("0x"), 16) else { continue };
+                let bytes: Vec<u8> = (0..hex.len() / 2).filter_map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()).collect();
+                if rva + bytes.len() <= size_of_image {
+                    unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(rva), bytes.len()) };
+                    println!("patched {} byte(s) at title+{rva:#x}", bytes.len());
+                }
+            }
+        }
         if PATCH_FASTFAIL.load(Ordering::Relaxed) {
             let n = unsafe { patch_fastfail_sites(base, size_of_image) };
             println!("patched {n} fast-fail sites with breakpoints (--patch-fastfail)");
@@ -2009,6 +2303,9 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool, dump_iat: bool) -> Res
                 TITLE_TID.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
                 unsafe { bootstrap(base_addr as *mut u8, size_of_image, tls_dir, exc_dir)? };
                 unsafe { init_guest_dlls() };
+        if std::env::var_os("XB1_VTABLES").is_some() {
+            gpu::log_vtable_identities();
+        }
                 println!("jumping to entry point {entry_addr:#x}");
                 let f: extern "system" fn() -> u32 = unsafe { std::mem::transmute(entry_addr) };
                 Ok(f())

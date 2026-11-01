@@ -220,6 +220,8 @@ fn new_proxy(real: *mut c_void, kind: Kind) -> *mut Proxy {
             for (index, entry) in forwarded_entries() {
                 (*p).embedded[*index] = *entry;
             }
+            // Embedded function +0x6a0 (title call site 0x1e3a06c): two objects through out-pointers.
+            (*p).embedded[(0x6A0 - EMBED_BASE) / 8] = context_ext_212 as usize;
             // A command buffer for the packets the title writes into the context, and the
             // function it calls when the buffer is full.
             let buffer = VirtualAlloc(ptr::null_mut(), CMD_BUFFER_BYTES, 0x3000, 0x04) as usize;
@@ -602,7 +604,7 @@ struct StandIn {
     refs: AtomicU32,
 }
 
-const STAND_IN_SLOTS: usize = 128;
+const STAND_IN_SLOTS: usize = 300;
 
 unsafe extern "system" fn stand_in_qi(this: *mut c_void, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
     glog!("[gpu] stand-in object: QueryInterface({:?}) -> self", unsafe { *iid });
@@ -628,18 +630,26 @@ unsafe extern "system" fn stand_in_release(this: *mut c_void) -> u32 {
 fn stand_in_vtable() -> *const usize {
     static VTBL: OnceLock<Vec<usize>> = OnceLock::new();
     VTBL.get_or_init(|| {
-        let mut arena = ArgArena::new();
+        let mut arenas = vec![ArgArena::new(), ArgArena::new()];
         let mut v = vec![0usize; STAND_IN_SLOTS];
         v[0] = stand_in_qi as usize;
         v[1] = stand_in_add_ref as usize;
         v[2] = stand_in_release as usize;
         for i in 3..STAND_IN_SLOTS {
-            v[i] = arena.make(format!("[gpu] device-created object, vtable slot {i}"), ret_zero as usize as u64);
+            let a = if arenas[0].used + ARG_SLOT <= ARG_ARENA_BYTES { 0 } else { 1 };
+            v[i] = arenas[a].make(format!("[gpu] device-created object, vtable slot {i}"), ret_zero as usize as u64);
         }
-        std::mem::forget(arena);
+        for a in arenas {
+            std::mem::forget(a);
+        }
         v
     })
     .as_ptr()
+}
+
+/// Names the vtables the layer hands out (for identifying an unknown object by its vtable).
+pub fn log_vtable_identities() {
+    glog!("[gpu] vtables: stand-in {:p}, device {:p}, context {:p}", stand_in_vtable(), vtable(Kind::Device), vtable(Kind::Context));
 }
 
 fn new_stand_in() -> *mut c_void {
@@ -662,6 +672,200 @@ unsafe fn real_create_texture(real: *mut c_void, slot: usize, desc: *const u8, o
     let f: unsafe extern "system" fn(*mut c_void, *const u8, *const c_void, *mut *mut c_void) -> HRESULT =
         unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(slot))) };
     unsafe { f(real, desc, ptr::null(), out) }
+}
+
+// ---------------------------------------------------------------------------------------
+// Display chain (embedded context function +0x6a0)
+// ---------------------------------------------------------------------------------------
+//
+// `call [ctx+0x6a0]` at title+0x1e3a06c is `(context, 1, Object** chain, Object** other)`. The title
+// then calls slot 9 of `chain` with an out-pointer, gets a texture, and calls slot 13 of that
+// texture for its size: so `chain` is the display swap chain (slot 9 = the back buffer, found from
+// the call chain, not documented) and the texture is the back buffer. Slot meanings other than 9
+// are unknown and log.
+
+#[repr(C)]
+struct DisplayChain {
+    vtbl: *const usize,
+    refs: AtomicU32,
+    back_buffer: usize,
+}
+
+/// Display size and format used until the real window exists.
+const DISPLAY_WIDTH: u32 = 1920;
+const DISPLAY_HEIGHT: u32 = 1080;
+
+unsafe extern "system" fn chain_qi(this: *mut c_void, _iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    unsafe {
+        (*(this as *const DisplayChain)).refs.fetch_add(1, Ordering::AcqRel);
+        *out = this;
+    }
+    HRESULT(0)
+}
+unsafe extern "system" fn chain_add_ref(this: *mut c_void) -> u32 {
+    unsafe { (*(this as *const DisplayChain)).refs.fetch_add(1, Ordering::AcqRel) + 1 }
+}
+unsafe extern "system" fn chain_release(this: *mut c_void) -> u32 {
+    unsafe { (*(this as *const DisplayChain)).refs.fetch_sub(1, Ordering::AcqRel) - 1 }
+}
+/// Slot 9: `(chain, Texture** out)` returns the back buffer (the object is shared, so no AddRef
+/// on a count the title never balances: it is kept alive by the chain).
+unsafe extern "system" fn chain_get_back_buffer(this: *mut c_void, out: *mut *mut c_void) -> HRESULT {
+    let chain = unsafe { &*(this as *const DisplayChain) };
+    glog!("[gpu] display chain slot 9 -> back buffer {:#x}", chain.back_buffer);
+    if !out.is_null() {
+        unsafe { *out = chain.back_buffer as *mut c_void };
+    }
+    HRESULT(0)
+}
+
+fn chain_vtable() -> *const usize {
+    static VTBL: OnceLock<Vec<usize>> = OnceLock::new();
+    VTBL.get_or_init(|| {
+        let mut arena = ArgArena::new();
+        let mut v = vec![0usize; 64];
+        v[0] = chain_qi as usize;
+        v[1] = chain_add_ref as usize;
+        v[2] = chain_release as usize;
+        for i in 3..64 {
+            v[i] = arena.make(format!("[gpu] display chain slot {i}"), ret_zero as usize as u64);
+        }
+        v[9] = chain_get_back_buffer as usize;
+        std::mem::forget(arena);
+        v
+    })
+    .as_ptr()
+}
+
+/// Creates the display back buffer on the desktop device behind `context_proxy`, as a
+/// render-target-capable 2D texture with the console-style extended vtable.
+fn create_back_buffer(context_proxy: *mut c_void) -> usize {
+    let p = unsafe { &*(context_proxy as *const Proxy) };
+    // ID3D11DeviceContext::GetDevice is slot 3.
+    let get_device: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = unsafe { std::mem::transmute(*((*(p.real as *const *const usize)).add(3))) };
+    let mut device: *mut c_void = ptr::null_mut();
+    unsafe { get_device(p.real, &mut device) };
+    if device.is_null() {
+        return 0;
+    }
+    // D3D11_TEXTURE2D_DESC: width, height, mips, array, format, {samples, quality}, usage, bind, cpu, misc.
+    let desc: [u32; 11] = [
+        DISPLAY_WIDTH, DISPLAY_HEIGHT, 1, 1, 28 /* R8G8B8A8_UNORM */, 1, 0, 0 /* DEFAULT */, 0x28 /* RENDER_TARGET | SHADER_RESOURCE (0x20|0x8) */, 0, 0,
+    ];
+    let create: unsafe extern "system" fn(*mut c_void, *const u32, *const c_void, *mut *mut c_void) -> HRESULT =
+        unsafe { std::mem::transmute(*((*(device as *const *const usize)).add(5))) };
+    let mut tex: *mut c_void = ptr::null_mut();
+    let hr = unsafe { create(device, desc.as_ptr(), ptr::null(), &mut tex) };
+    glog!("[gpu] display back buffer {DISPLAY_WIDTH}x{DISPLAY_HEIGHT}: {:#x} -> {:p}", hr.0 as u32, tex);
+    if hr.0 >= 0 && !tex.is_null() {
+        extend_resource(tex, true);
+        return tex as usize;
+    }
+    0
+}
+
+/// Embedded context function `+0x6a0` (`call [ctx+0x6a0]` at title+0x1e3a06c):
+/// `(context, 1, Object** chain, Object** other)`. `chain` is the display chain; `other` is a
+/// stand-in (unknown).
+unsafe extern "system" fn context_ext_212(this: *mut c_void, count: usize, a: *mut *mut c_void, b: *mut *mut c_void) -> HRESULT {
+    glog!("[gpu] context +0x6a0: count {count} -> display chain and a stand-in");
+    if !a.is_null() && (a as usize) % 8 == 0 {
+        let back_buffer = create_back_buffer(this);
+        let chain = Box::new(DisplayChain { vtbl: chain_vtable(), refs: AtomicU32::new(1), back_buffer });
+        unsafe { *a = Box::into_raw(chain) as *mut c_void };
+    }
+    if !b.is_null() && (b as usize) % 8 == 0 {
+        unsafe { *b = new_stand_in() };
+    }
+    HRESULT(0)
+}
+
+// ---------------------------------------------------------------------------------------
+// Shaders, states, input layouts and queries: extended vtables
+// ---------------------------------------------------------------------------------------
+//
+// The title calls console-only methods on these too. The wrapped creators call the real method and
+// give the result an extended vtable: its real slots, then logging stubs. The number of real slots
+// differs per type (ID3D11DeviceChild has 7; states and queries add a few).
+
+static EXTENDED_OBJECT_VTABLES: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+fn extend_object(obj: *mut c_void, real_slots: usize) {
+    if obj.is_null() {
+        return;
+    }
+    let orig = unsafe { *(obj as *const usize) };
+    let mut map = EXTENDED_OBJECT_VTABLES.lock().unwrap();
+    let ext = if let Some((_, e)) = map.iter().find(|(k, _)| *k == orig) {
+        *e
+    } else {
+        let mut arena = ArgArena::new();
+        let mut v = vec![0usize; 96];
+        for i in 0..real_slots {
+            v[i] = unsafe { *((orig as *const usize).add(i)) };
+        }
+        for i in real_slots..96 {
+            v[i] = arena.make(format!("[gpu] created-object extension slot {i} (real slots: {real_slots})"), ret_zero as usize as u64);
+        }
+        std::mem::forget(arena);
+        let leaked: &'static [usize] = Vec::leak(v);
+        map.push((orig, leaked.as_ptr() as usize));
+        leaked.as_ptr() as usize
+    };
+    unsafe { *(obj as *mut usize) = ext };
+}
+
+/// Device slot -> (index of the out-pointer among the arguments after `this`, real vtable slots of
+/// the created object).
+const EXTENDED_CREATORS: [(usize, usize, usize); 14] = [
+    (11, 5, 7),  // CreateInputLayout(descs, n, bytecode, len, out)
+    (12, 4, 7),  // CreateVertexShader(bytecode, len, linkage, out)
+    (13, 4, 7),  // CreateGeometryShader
+    (15, 4, 7),  // CreatePixelShader
+    (16, 4, 7),  // CreateHullShader
+    (17, 4, 7),  // CreateDomainShader
+    (18, 4, 7),  // CreateComputeShader
+    (20, 2, 8),  // CreateBlendState(desc, out)
+    (21, 2, 8),  // CreateDepthStencilState
+    (22, 2, 8),  // CreateRasterizerState
+    (23, 2, 8),  // CreateSamplerState
+    (24, 2, 9),  // CreateQuery
+    (25, 2, 9),  // CreatePredicate
+    (26, 2, 9),  // CreateCounter
+];
+
+/// Wrapper for the creators above: `(device, a1..a5)`; the real method ignores the arguments it
+/// does not use.
+unsafe extern "system" fn device_create_extended<const SLOT: usize>(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> HRESULT {
+    let p = unsafe { &*(this as *const Proxy) };
+    let f: unsafe extern "system" fn(*mut c_void, usize, usize, usize, usize, usize) -> HRESULT =
+        unsafe { std::mem::transmute(*((*(p.real as *const *const usize)).add(SLOT))) };
+    let hr = unsafe { f(p.real, a1, a2, a3, a4, a5) };
+    if hr.0 >= 0 {
+        if let Some((_, out_index, real_slots)) = EXTENDED_CREATORS.iter().find(|(s, _, _)| *s == SLOT) {
+            let args = [a1, a2, a3, a4, a5];
+            let out = args[out_index - 1] as *mut *mut c_void;
+            if !out.is_null() && (out as usize) % 8 == 0 {
+                extend_object(unsafe { *out }, *real_slots);
+            }
+        }
+    }
+    hr
+}
+
+/// Device extension slot 67: `(device, desc*, Object** out)` (title call site 0x1a97c3a), the same
+/// shape as slot 73: a description in, an object out, stored by the title in a member. Its meaning
+/// is unknown, so a stand-in object is returned and the description is logged.
+unsafe extern "system" fn device_ext_67(_this: *mut c_void, desc: *const u32, out: *mut *mut c_void) -> HRESULT {
+    static COUNT: AtomicU32 = AtomicU32::new(0);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 6 {
+        glog!("[gpu] device slot 67: desc = {} -> stand-in object", safe_dump(desc as u64, 48));
+    }
+    if !out.is_null() && (out as usize) % 8 == 0 {
+        unsafe { *out = new_stand_in() };
+    }
+    HRESULT(0)
 }
 
 /// Device extension slot 59: `(device, const {u32 kind, u32 size}* desc, Object** out)`.
@@ -1017,6 +1221,16 @@ unsafe fn create_view(this: *mut c_void, slot: usize, name: &str, resource: *mut
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, *mut *mut c_void) -> HRESULT =
         unsafe { std::mem::transmute(*((*(p.real as *const *const usize)).add(slot))) };
     let hr = unsafe { f(p.real, resource, desc, out) };
+    if hr.0 >= 0 && !out.is_null() {
+        // Once per kind: the vtable of the created view, to identify unknown objects by vtable.
+        static SEEN: [AtomicU32; 16] = [const { AtomicU32::new(0) }; 16];
+        if SEEN[slot & 15].fetch_add(1, Ordering::Relaxed) == 0 {
+            let obj = unsafe { *out };
+            if !obj.is_null() {
+                glog!("[gpu] {name} created: object {obj:p}, vtable {:#x}", unsafe { *(obj as *const usize) });
+            }
+        }
+    }
     if hr.0 == 0x80070057u32 as i32 && !desc.is_null() && !resource.is_null() {
         let retry = unsafe { f(p.real, resource, ptr::null(), out) };
         let n = FALLBACKS.fetch_add(1, Ordering::Relaxed);
@@ -1327,12 +1541,28 @@ fn build_vtable(kind: Kind) -> Vec<usize> {
         v[8] = device_create_uav as usize;
         v[9] = device_create_rtv as usize;
         v[10] = device_create_dsv as usize;
+        // Shaders, states, input layouts and queries get extended vtables.
+        v[11] = device_create_extended::<11> as usize;
+        v[12] = device_create_extended::<12> as usize;
+        v[13] = device_create_extended::<13> as usize;
+        v[15] = device_create_extended::<15> as usize;
+        v[16] = device_create_extended::<16> as usize;
+        v[17] = device_create_extended::<17> as usize;
+        v[18] = device_create_extended::<18> as usize;
+        v[20] = device_create_extended::<20> as usize;
+        v[21] = device_create_extended::<21> as usize;
+        v[22] = device_create_extended::<22> as usize;
+        v[23] = device_create_extended::<23> as usize;
+        v[24] = device_create_extended::<24> as usize;
+        v[25] = device_create_extended::<25> as usize;
+        v[26] = device_create_extended::<26> as usize;
         // Creation methods decoded from the title's call sites.
         v[59] = device_ext_59 as usize;
         v[64] = device_ext_64 as usize;
         v[65] = device_ext_65 as usize;
         v[62] = device_ext_62 as usize;
         v[73] = device_ext_73 as usize;
+        v[67] = device_ext_67 as usize;
     }
     v
 }

@@ -18,7 +18,7 @@ An experimental compatibility layer for running Xbox One (GDK/XDK "Durango") x64
 - The title writes GPU command packets into a 4 MB buffer each context owns; they are logged and discarded. Decoding them is the main missing piece. `DXGIXPresentArray` and `DXGIXSetVLineNotification` are logging stubs, so there is no swap chain.
 - A WinRT shell layer (`src/winrt.rs`): our own `CoreApplication`, view, window and dispatcher run the title's lifecycle. Console-only `Windows.Xbox.*` and `Microsoft.Xbox.*` classes are served by logging stand-ins whose method shapes are guessed from call sites, with specific handling for the user list (one user), the controller list (empty), strings and event subscriptions.
 - The title's own console DLLs next to it (the telemetry library) are mapped by the layer's loader, and `G:` is mapped to the title folder for the session so the title can read its game data (hundreds of zips load).
-- **Where it stops:** a run now fails when the title queries its game database before it has been opened (`title+0xd93e57`), before its first present. See [Findings](docs/FINDINGS.md).
+- **Where it stops:** the title now boots into its main loop and stays there without crashing (a per-title compatibility hook supplies an object its file system needs, the console audio HAL is implemented, and a display chain with a 1920x1080 back buffer exists), but it does not draw or present yet. See [Findings](docs/FINDINGS.md).
 - `XMem*` console memory API
 - `D3D11XCreateDeviceX` backed by a real desktop D3D11 device (`xb1layer --test-d3d` to check it), and a proxy for the console audio extension of the MMDevice enumerator
 - `--ring=<path>` crash-proof trace and `tools\read-ring.ps1` to read it

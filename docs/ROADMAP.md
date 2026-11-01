@@ -4,7 +4,7 @@ The goal is a layer that runs many Xbox One titles on Windows x64 without graphi
 
 ## Next up (in order)
 
-1. **Get the title to render.** It is stuck on its game database (see FINDINGS: the `Open(true)` gate). Until it passes that there are no draw packets to decode.
+1. **Get the title to render.** It boots into its main loop and stays there but never draws or presents. Find what its loading screens wait on (the `CPresentation` readiness flag, window events the shell never raises, the database gate in FINDINGS). Until it renders there are no draw packets to decode.
 2. **Remove the startup gaps.** The test title now stops on a different Xbox stand-in gap from run to run, before its first present. Each gap is a console WinRT method whose shape was guessed wrong; fix them from the call sites until the title reaches its first present.
 3. **Swap chain and window.** `DXGIXPresentArray` and `DXGIXSetVLineNotification` are logging stubs. Create a native window, a desktop swap chain, and present the title's display planes.
 4. **Decode the GPU command packets.** The stream is AMD PM4 (see FINDINGS). So far it contains only two repeating idle-loop packet kinds and no draws, because the title is stuck before rendering; decode draws, state, binding, clears and copies once it gets that far, and turn them into desktop D3D11 calls. This is the core of rendering.
