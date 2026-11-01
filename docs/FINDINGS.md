@@ -267,6 +267,17 @@ The title's startup keeps hitting methods whose shape my generic stand-in guesse
 
 `DXGIXSetVLineNotification(0, 0, 0x2d4, 0)` is logged: the third argument looks like a scanline number. `DXGIXPresentArray` is now implemented as a logging stub (assumed shape `(SyncInterval, Threshold, Flags, NumPlanes, ppPlanes, pParameters)`) but has not been reached yet, so there is **no swap chain**: nothing is shown. The title still stops in the shell layer before its first present, with different faults in different runs.
 
+## Startup gaps removed, round 2
+Each of these was a stand-in or stub that gave the title NULL or a wrong-shaped value; the run now gets noticeably further (it passes the Xbox Live, package, DLC, speech and networking setup) before the next fault.
+- **The telemetry library** (`commonEventLoggingLibrary_Release.dll`, absent, so all seven imports were stubs returning 0). `CellGlobalAllocator::Get()` now returns an allocator object (slot 0 allocates from the guest heap, slot 1 frees; the rest is assumed); `CreateCellInternal` and `CellGlobalAssertHandle::Get` return a null object whose every method returns itself (the title uses `ICell` slot 3's result as another object and calls through it); the three `get_Global*` tables return zeroed memory.
+- **`Store.Product` slot 11**: the out-pointer is the fifth argument after `this` (I had counted the sixth).
+- **`DownloadableContentPackageManager` slot 6** `(filter, IVectorView** out)`: an empty package list through the second argument.
+- **`SpeechRecognizerFactory` slot 6** `(locale, Recognizer** out)`; its objects return strings and objects through the shapes found at the call sites (slot 8 string, a third-argument out on a later slot).
+- **`Package.Current` -> slot 7 -> slot 7** is read as a string. I first took it for an `IPackageId`, which was wrong: an integer there crashed `combase`. It now returns the title folder as a path (assumed to be the installed location).
+- **A general rule for string arguments**: when the first argument is a fast-pass `HSTRING_HEADER` (flags 1, small length, readable data), the call is `(name, Object** out)`, so the object goes to the second argument. This fixed `SecureDeviceAssociationTemplate`, whose header my stand-in had overwritten.
+
+Still open: the run now faults at `title+0xd93e57`, a NULL `rdi` read inside the title's own code on the main-loop path (not a stand-in call). Not analysed yet.
+
 ## Tools added
 `--watch-sites=0x...,0x...` plants one-shot breakpoints at title RVAs (report registers, text pointed at by the argument registers, and the title's call chain, then continue); `--watch-repeat` keeps them armed (re-arming by single-step) and prints one compact line per hit for the title's logger; `--patch-fastfail` was added earlier. The device's standard creation methods now log failures with a dump of the description and, for views, the resource's own type and description.
 

@@ -671,18 +671,28 @@ fn is_readable_ptr(p: *mut c_void) -> bool {
     state == 0x1000 && protect & 0xFF != 0 && protect & 0x101 == 0
 }
 
+/// True if `p` looks like a fast-pass `HSTRING_HEADER` (flags = 1 for a string reference, a small
+/// length, a readable data pointer at +16): a string argument, not an out-parameter slot.
+fn looks_like_hstring_header(p: *mut c_void) -> bool {
+    if !is_readable_ptr(p) {
+        return false;
+    }
+    let (flags, len, data) = unsafe { (*(p as *const u32), *(p as *const u32).add(1), *((p as *const usize).add(2))) };
+    flags == 1 && len > 0 && len < 4096 && is_readable_ptr((data & !7) as *mut c_void)
+}
+
 /// Any method of a stand-in object. The signature is unknown, so the first argument after
 /// `this` is treated as a possible out-parameter: if it points at writable memory, a new
 /// stand-in object is stored there and the call reports success (the common shape of a
 /// property getter or factory method). Otherwise the call fails with E_NOTIMPL.
-unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: *mut c_void, arg2: *mut c_void, _a3: usize, _a4: usize, _a5: usize, a6: *mut c_void) -> HRESULT {
+unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: *mut c_void, arg2: *mut c_void, a3: *mut c_void, _a4: usize, a5: *mut c_void, _a6: usize) -> HRESULT {
     let o = unsafe { &*(this as *const GenericObj) };
     // `Store.Product` statics slot 11 is `(user, id, flag, ptr, ptr, Product** out)`: the object comes
-    // back through the sixth argument (found from the title's call site at 0x1948e55).
-    if o.class == "Windows.Xbox.ApplicationModel.Store.Product" && N == 11 && is_writable(a6) {
+    // back through the fifth argument after `this` (stack; title call site 0x1948e55).
+    if o.class == "Windows.Xbox.ApplicationModel.Store.Product" && N == 11 && (a5 as usize) % 8 == 0 && is_writable(a5) {
         let child = create_generic("Windows.Xbox.ApplicationModel.Store.Product#slot11", &o.iid);
-        unsafe { *(a6 as *mut *mut c_void) = child };
-        wlog!("[winrt] {} slot 11 -> a stand-in object through the 6th argument", o.class);
+        unsafe { *(a5 as *mut *mut c_void) = child };
+        wlog!("[winrt] {} slot 11 -> a stand-in object through the 5th argument after this", o.class);
         return HRESULT(0);
     }
     if o.kind == 2 {
@@ -736,6 +746,44 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         wlog!("[winrt] {} slot {N} -> placeholder HSTRING", o.class);
         return HRESULT(0);
     }
+    // `DownloadableContentPackageManager` slot 6 is `(filter, IVectorView** out)` (title call site
+    // 0xcef5d4): the list of installed DLC packages, empty here.
+    if o.class.starts_with("Windows.Xbox.Management.Deployment.DownloadableContentPackageManager") && N == 6 && (arg1 as usize) < 0x10000 && (arg2 as usize) % 8 == 0 && is_writable(arg2) {
+        let list = create_vector_view("DownloadableContentPackageManager.Packages", &o.iid, 0);
+        unsafe { *(arg2 as *mut *mut c_void) = list };
+        wlog!("[winrt] {} slot 6 -> an empty package list through the second argument", o.class);
+        return HRESULT(0);
+    }
+    // `SpeechRecognizerFactory` slot 6 is `(locale id, Recognizer** out)`: a scalar first argument,
+    // the object comes back through the second.
+    if o.class == "Windows.Xbox.Speech.Recognition.SpeechRecognizerFactory" && N == 6 && (arg1 as usize) < 0x10000 && (arg2 as usize) % 8 == 0 && is_writable(arg2) {
+        unsafe { *(arg2 as *mut *mut c_void) = create_generic("SpeechRecognizer", &o.iid) };
+        wlog!("[winrt] {} slot 6 (locale {:#x}) -> a stand-in recognizer", o.class, arg1 as usize);
+        return HRESULT(0);
+    }
+    // `SpeechRecognizer` slot 15 returns an object whose slot 8 the title reads as a string
+    // (wstring constructor at 0x16f2420), probably the recognizer's language tag.
+    if o.class == "SpeechRecognizer#slot15" && N == 8 && (arg1 as usize) % 8 == 0 && is_writable(arg1) {
+        unsafe { *(arg1 as *mut *mut c_void) = std::mem::transmute::<HSTRING, *mut c_void>(HSTRING::from("en-US")) };
+        wlog!("[winrt] {} slot 8 -> HSTRING \"en-US\"", o.class);
+        return HRESULT(0);
+    }
+    // `Package.Current` -> slot 7 -> slot 7: the title reads a string here (a wrong guess that
+    // this was an IPackageId made a non-string crash `combase`). Taken to be the installed
+    // location, so it gets the title folder (the process working directory).
+    if o.class == "Windows.ApplicationModel.Package#slot6#slot7" && (6..=13).contains(&N) && (arg1 as usize) % 8 == 0 && is_writable(arg1) {
+        let path = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
+        unsafe { *(arg1 as *mut *mut c_void) = std::mem::transmute::<HSTRING, *mut c_void>(HSTRING::from(path.as_str())) };
+        wlog!("[winrt] {} slot {N} -> HSTRING (title folder)", o.class);
+        return HRESULT(0);
+    }
+    // `SpeechRecognizer.slot 9 object` slot 7 is `(x, y, z, Object** out)`: the object comes back through
+    // the third argument (title call site 0x212b209), which the generic rule never wrote.
+    if o.class == "SpeechRecognizer#slot9" && N == 7 && (a3 as usize) % 8 == 0 && is_writable(a3) {
+        unsafe { *(a3 as *mut *mut c_void) = create_generic("SpeechRecognizer#slot9#slot7", &o.iid) };
+        wlog!("[winrt] {} slot 7 -> a stand-in object through the third argument", o.class);
+        return HRESULT(0);
+    }
     // `Controller` statics slot 6 is the controller list, an IVectorView<IController> (the title
     // calls `get_Size` and `GetAt(index, &out)` on it). Empty for now: no controllers connected.
     if o.class == "Windows.Xbox.Input.Controller" && N == 6 && is_writable(arg1) {
@@ -779,6 +827,12 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
     if o.class.starts_with("Microsoft.Xbox.") && looks_like_com_object(arg1) && (arg2 as usize) % 8 == 0 && is_writable(arg2) {
         unsafe { *(arg2 as *mut *mut c_void) = create_generic(&format!("{}#slot{N}", o.class), &o.iid) };
         wlog!("[winrt] {} slot {N}: (object, out) -> a stand-in object", o.class);
+        return HRESULT(0);
+    }
+    // A string in arg1 (`GetXxx(name, Object** out)`): the object goes to the second argument.
+    if looks_like_hstring_header(arg1) && (arg2 as usize) % 8 == 0 && is_writable(arg2) {
+        unsafe { *(arg2 as *mut *mut c_void) = create_generic(&format!("{}#slot{N}", o.class), &o.iid) };
+        wlog!("[winrt] {} slot {N}: (string, out) -> a stand-in object", o.class);
         return HRESULT(0);
     }
     // A delegate in arg1 means `add_Event(handler, &token)`: leave the handler alone.

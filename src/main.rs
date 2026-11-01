@@ -42,6 +42,7 @@ unsafe extern "system" {
     fn HeapValidate(heap: *mut c_void, flags: u32, mem: *const c_void) -> i32;
     fn GetProcessHeap() -> *mut c_void;
     fn HeapAlloc(heap: *mut c_void, flags: u32, size: usize) -> *mut c_void;
+    fn HeapFree(heap: *mut c_void, flags: u32, p: *mut c_void) -> i32;
     fn HeapSize(heap: *mut c_void, flags: u32, mem: *const c_void) -> usize;
     fn VirtualQuery(addr: *const c_void, info: *mut c_void, len: usize) -> usize;
     fn GetStdHandle(which: u32) -> *mut c_void;
@@ -1131,6 +1132,64 @@ extern "system" fn xb_terminate_process(process: *mut c_void, code: u32) -> i32 
     unsafe { TerminateProcess(process, code) }
 }
 
+/// `CELL::details::CellGlobalAllocator::Get()` of the title's (missing) telemetry library: the title
+/// calls `allocator->vtbl[0](allocator, size)` on the result. Slot 0 allocates from the guest heap,
+/// slot 1 frees; the other slots are assumed and do nothing.
+#[repr(C)]
+struct CellAllocator {
+    vtbl: *const usize,
+}
+
+extern "system" fn cell_alloc(_this: *mut c_void, size: usize) -> *mut c_void {
+    unsafe { HeapAlloc(GUEST_HEAP.load(Ordering::Relaxed) as *mut c_void, 0, size.max(1)) }
+}
+
+extern "system" fn cell_free(_this: *mut c_void, p: *mut c_void) {
+    if !p.is_null() {
+        unsafe { HeapFree(GUEST_HEAP.load(Ordering::Relaxed) as *mut c_void, 0, p) };
+    }
+}
+
+extern "system" fn cell_nop(_this: *mut c_void) -> usize {
+    0
+}
+
+extern "system" fn cell_global_allocator_get() -> *mut c_void {
+    static VTBL: [usize; 8] = [0; 8];
+    static OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let _ = &VTBL;
+    *OBJ.get_or_init(|| {
+        let mut v = vec![cell_nop as usize; 8];
+        v[0] = cell_alloc as usize;
+        v[1] = cell_free as usize;
+        let vtbl = Vec::leak(v).as_ptr();
+        Box::into_raw(Box::new(CellAllocator { vtbl })) as usize
+    }) as *mut c_void
+}
+
+/// `CELL::CellGlobal::CreateCellInternal()`: an `ICell` the title logs through (the real interface
+/// is unknown).
+extern "system" fn cell_return_self(this: *mut c_void) -> *mut c_void {
+    this
+}
+
+extern "system" fn cell_create_cell_internal() -> *mut c_void {
+    static OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    // A null object: every method returns the object itself, because the title uses the result of
+    // `ICell` slot 3 (offset 0x18) as another object and calls through it.
+    *OBJ.get_or_init(|| {
+        let vtbl = Vec::leak(vec![cell_return_self as usize; 64]).as_ptr();
+        Box::into_raw(Box::new(CellAllocator { vtbl })) as usize
+    }) as *mut c_void
+}
+
+/// Zeroed, leaked memory for the telemetry library's `get_Global*` tables (the title reads and
+/// writes them; the real element types are unknown).
+extern "system" fn cell_zeroed_table() -> *mut c_void {
+    static BUF: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BUF.get_or_init(|| Vec::leak(vec![0u8; 1 << 16]).as_ptr() as usize) as *mut c_void
+}
+
 /// Imports we implement ourselves instead of forwarding to Windows.
 fn override_for(dll: &str, func: &str) -> Option<usize> {
     if dll.eq_ignore_ascii_case("vccorlib140.dll") && func.starts_with("?GetActivationFactoryByPCWSTR") {
@@ -1144,6 +1203,20 @@ fn override_for(dll: &str, func: &str) -> Option<usize> {
     }
     if dll.eq_ignore_ascii_case("d3d11_x.dll") && func == "DXGIXSetVLineNotification" {
         return Some(gpu::set_vline_notification as usize);
+    }
+    if dll.eq_ignore_ascii_case("commonEventLoggingLibrary_Release.dll") && func.starts_with("?Get@CellGlobalAllocator@details@CELL@") {
+        return Some(cell_global_allocator_get as usize);
+    }
+    if dll.eq_ignore_ascii_case("commonEventLoggingLibrary_Release.dll") {
+        if func.starts_with("?get_Global") {
+            return Some(cell_zeroed_table as usize);
+        }
+        if func.starts_with("?Get@CellGlobalAssertHandle") {
+            return Some(cell_create_cell_internal as usize); // a no-op object
+        }
+    }
+    if dll.eq_ignore_ascii_case("commonEventLoggingLibrary_Release.dll") && func.starts_with("?CreateCellInternal@CellGlobal@CELL@") {
+        return Some(cell_create_cell_internal as usize);
     }
     if func == "CoCreateInstance" {
         return Some(xb_co_create_instance as usize);
