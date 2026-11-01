@@ -243,6 +243,15 @@ It also reported many invalid shader-resource-view descriptions (view dimension 
 
 Open: with the debug layer on, the run ends by itself with exit code `0x87D` without going through `ExitProcess` or `TerminateProcess` (both are now logged). Without it, the NVIDIA worker thread fault still happens, so the corruption is not explained yet; the `SetShader` fix removes one known cause but is not shown to be the one.
 
+## Tracing the `0x87D` exit and the driver fault
+**`Store.Product`.** One more crash came from my stand-in: `Windows.Xbox.ApplicationModel.Store.Product` statics slot 11 has the shape `(user, id, flag, ptr, ptr, Product** out)`, so its result comes back through the **sixth argument** (a stack argument), which a three-argument stand-in cannot see. It also looked like an event add (the first argument is a COM object), so the title got NULL and dereferenced it at `title+0x1948fb9`. The generic slot now accepts six arguments and fills that out-parameter. This is the third time the "first argument is the out-parameter" guess was wrong; unknown methods are still guesses.
+
+**The `0x87D` exit (debug layer on).** Not a title exit code. The only `0x87D` literal in the title is a log-line number (`mov edx, 0x87d` before a logging call at `title+0x1e6c56e`), and a watch on it never fired. `ntdll!NtTerminateProcess` is now hooked: the call arrives straight from `RtlUserThreadStart` with status `0x87D`, right after a `0xC0000005 execute of 0x0` in a thread whose start address is the layer's thread trampoline and whose registers are all zero. So some thread jumps to NULL as it starts and the process is torn down; the status is not the title's. The trampoline logs any start routine below `0x10000` and never did, so the NULL jump is not in a routine the title passed to `CreateThread`. Not explained.
+
+**The driver fault (debug layer off).** It still happens (`nvwgf2umx.dll`) and so does a fault in the title at `title+0x1e40b69`. Both vary between runs, which fits a race or memory corruption rather than a single bad call. Not explained.
+
+**Hooking pitfalls.** An inline hook of an `ntdll` syscall stub must copy whole instructions: the stub is `mov r10, rcx; mov eax, n; test byte ptr [7FFE0308h], 1; ...`, so 12 bytes of patch need a 16-byte trampoline (an 8-byte one resumed mid-instruction and crashed with `0xC000001D`). Hooking `NtCreateThreadEx` and logging inside it hung the run, so that hook is disabled.
+
 ## Tools added
 `--watch-sites=0x...,0x...` plants one-shot breakpoints at title RVAs (report registers, text pointed at by the argument registers, and the title's call chain, then continue); `--watch-repeat` keeps them armed (re-arming by single-step) and prints one compact line per hit for the title's logger; `--patch-fastfail` was added earlier. The device's standard creation methods now log failures with a dump of the description and, for views, the resource's own type and description.
 

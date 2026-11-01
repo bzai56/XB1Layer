@@ -36,6 +36,8 @@ unsafe extern "system" {
     fn VirtualFree(addr: *mut c_void, size: usize, ty: u32) -> i32;
     fn TerminateProcess(process: *mut c_void, code: u32) -> i32;
     fn ExitProcess(code: u32) -> !;
+    fn VirtualProtect(addr: *mut c_void, size: usize, new: u32, old: *mut u32) -> i32;
+    fn GetModuleHandleA(name: *const i8) -> *mut c_void;
     fn HeapCreate(options: u32, initial: usize, max: usize) -> *mut c_void;
     fn HeapValidate(heap: *mut c_void, flags: u32, mem: *const c_void) -> i32;
     fn GetProcessHeap() -> *mut c_void;
@@ -657,9 +659,15 @@ struct ThreadStart {
 
 extern "system" fn thread_trampoline(p: *mut c_void) -> u32 {
     let ThreadStart { routine, param } = *unsafe { Box::from_raw(p as *mut ThreadStart) };
+    if routine < 0x10000 {
+        rlog!("[thread] trampoline started with routine {routine:#x}, param {param:#x}, box {p:p}");
+    }
     ensure_tls_on_current_thread();
     let f: extern "system" fn(*mut c_void) -> u32 = unsafe { std::mem::transmute(routine) };
-    f(param as *mut c_void)
+    let code = f(param as *mut c_void);
+    let base = IMG_BASE.load(Ordering::Relaxed);
+    rlog!("[thread] routine title+{:#x} param {param:#x} returned {code:#x}", routine.wrapping_sub(base));
+    code
 }
 
 /// CreateThread for the title: wraps the start routine so the new thread gets static TLS first.
@@ -671,6 +679,12 @@ extern "system" fn xb_create_thread(
     flags: u32,
     tid: *mut u32,
 ) -> *mut c_void {
+    let base = IMG_BASE.load(Ordering::Relaxed);
+    if routine >= base && routine < base + IMG_SIZE.load(Ordering::Relaxed) {
+        rlog!("[thread] CreateThread routine title+{:#x} param {param:#x} flags {flags:#x}", routine - base);
+    } else {
+        rlog!("[thread] CreateThread routine OUTSIDE the title: {routine:#x} param {param:#x}");
+    }
     let boxed = Box::into_raw(Box::new(ThreadStart { routine, param }));
     let h = unsafe { CreateThread(attrs, stack, thread_trampoline as usize, boxed as *mut c_void, flags, tid) };
     if h.is_null() {
@@ -685,6 +699,9 @@ unsafe fn bootstrap(base: *mut u8, size: usize, tls: (u32, u32), exc: (u32, u32)
     IMG_BASE.store(base as usize, Ordering::Relaxed);
     IMG_SIZE.store(size, Ordering::Relaxed);
     AddVectoredExceptionHandler(1, crash_logger);
+    hook_nt_terminate();
+    // hook_nt_create_thread() hangs the run (logging while the thread is being created); kept for reference.
+    let _ = hook_nt_create_thread as fn();
 
     if exc.0 != 0 {
         let count = exc.1 / 12;
@@ -963,10 +980,142 @@ extern "system" fn xb_get_process_heap() -> *mut c_void {
 fn log_exit_request(what: &str, code: u32) {
     let (base, size) = (IMG_BASE.load(Ordering::Relaxed), IMG_SIZE.load(Ordering::Relaxed));
     rlog!("[exit] {what}({code:#x})");
+    rlog!("{}", std::backtrace::Backtrace::force_capture());
     let mut frames = [ptr::null_mut::<c_void>(); 32];
     let n = unsafe { RtlCaptureStackBackTrace(0, 32, frames.as_mut_ptr(), ptr::null_mut()) } as usize;
-    for f in frames[..n].iter().map(|f| *f as usize).filter(|f| *f >= base && *f < base + size).take(10) {
-        rlog!("  caller title+{:#x}", f - base);
+    for f in frames[..n].iter().map(|f| *f as usize).take(16) {
+        if f >= base && f < base + size {
+            rlog!("  caller title+{:#x}", f - base);
+            continue;
+        }
+        let mut module: *mut c_void = ptr::null_mut();
+        // GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | UNCHANGED_REFCOUNT
+        if unsafe { GetModuleHandleExA(0x6, f as *const i8, &mut module) } != 0 {
+            let mut name = [0u8; 260];
+            let len = unsafe { GetModuleFileNameA(module, name.as_mut_ptr(), 260) } as usize;
+            let full = String::from_utf8_lossy(&name[..len]).into_owned();
+            rlog!("  frame {}+{:#x}", full.rsplit('\\').next().unwrap_or(""), f - module as usize);
+        } else {
+            rlog!("  frame {f:#x}");
+        }
+    }
+}
+
+extern "system" fn hooked_rtl_exit_user_process(code: u32) {
+    log_exit_request("RtlExitUserProcess", code);
+    unsafe {
+        let nt = GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr()), c"NtTerminateProcess".as_ptr());
+        let f: extern "system" fn(isize, u32) -> i32 = std::mem::transmute(nt);
+        f(-1, code);
+    }
+}
+
+/// Patches the start of `ntdll!RtlExitUserProcess` with `mov rax, hook; jmp rax` so every normal
+/// exit path (ExitProcess, the CRT's exit) is logged with the title's call chain.
+fn hook_exit_path() {
+    unsafe {
+        let target = GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr()), c"RtlExitUserProcess".as_ptr()) as *mut u8;
+        if target.is_null() {
+            return;
+        }
+        let mut old = 0u32;
+        if VirtualProtect(target as *mut c_void, 16, 0x40, &mut old) == 0 {
+            return;
+        }
+        let mut code = [0x48u8, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0];
+        code[2..10].copy_from_slice(&(hooked_rtl_exit_user_process as usize as u64).to_le_bytes());
+        ptr::copy_nonoverlapping(code.as_ptr(), target, code.len());
+    }
+}
+
+static NT_TERMINATE_TRAMPOLINE: AtomicUsize = AtomicUsize::new(0);
+
+extern "system" fn hooked_nt_terminate_process(process: isize, status: u32) -> i32 {
+    if process == -1 || process == 0 {
+        log_exit_request("NtTerminateProcess", status);
+    }
+    let f: extern "system" fn(isize, u32) -> i32 = unsafe { std::mem::transmute(NT_TERMINATE_TRAMPOLINE.load(Ordering::Relaxed)) };
+    f(process, status)
+}
+
+/// Hooks `ntdll!NtTerminateProcess` (`mov r10, rcx; mov eax, n` = 8 bytes are copied to a trampoline
+/// that continues into the original at +8).
+fn hook_nt_terminate() {
+    unsafe {
+        let target = GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr()), c"NtTerminateProcess".as_ptr()) as *mut u8;
+        if target.is_null() || *target != 0x4C || *target.add(3) != 0xB8 || *target.add(8) != 0xF6 {
+            rlog!("[exit] NtTerminateProcess has an unexpected prologue; not hooked");
+            return;
+        }
+        let tramp = VirtualAlloc(ptr::null_mut(), 64, 0x3000, 0x40) as *mut u8;
+        ptr::copy_nonoverlapping(target, tramp, 16);
+        let mut jump = [0x48u8, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0];
+        jump[2..10].copy_from_slice(&(target as u64 + 16).to_le_bytes());
+        ptr::copy_nonoverlapping(jump.as_ptr(), tramp.add(16), jump.len());
+        NT_TERMINATE_TRAMPOLINE.store(tramp as usize, Ordering::Relaxed);
+        let mut old = 0u32;
+        if VirtualProtect(target as *mut c_void, 16, 0x40, &mut old) == 0 {
+            return;
+        }
+        let mut hook = [0x48u8, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0];
+        hook[2..10].copy_from_slice(&(hooked_nt_terminate_process as usize as u64).to_le_bytes());
+        ptr::copy_nonoverlapping(hook.as_ptr(), target, hook.len());
+    }
+}
+
+static NT_CREATE_THREAD_TRAMPOLINE: AtomicUsize = AtomicUsize::new(0);
+
+/// `NtCreateThreadEx(thread*, access, attrs, process, start, arg, flags, zero_bits, stack_commit, stack_reserve, attr_list)`
+extern "system" fn hooked_nt_create_thread_ex(
+    a1: usize, a2: usize, a3: usize, a4: usize, start: usize, a6: usize, a7: usize, a8: usize, a9: usize, a10: usize, a11: usize,
+) -> i32 {
+    let (base, size) = (IMG_BASE.load(Ordering::Relaxed), IMG_SIZE.load(Ordering::Relaxed));
+    if start < base || start >= base + size {
+        let mut module: *mut c_void = ptr::null_mut();
+        let mut name = String::from("?");
+        unsafe {
+            if GetModuleHandleExA(0x6, start as *const i8, &mut module) != 0 {
+                let mut buf = [0u8; 260];
+                let len = GetModuleFileNameA(module, buf.as_mut_ptr(), 260) as usize;
+                name = format!("{}+{:#x}", String::from_utf8_lossy(&buf[..len]).rsplit('\\').next().unwrap_or(""), start - module as usize);
+            }
+        }
+        rlog!("[thread] NtCreateThreadEx start {name} arg {a6:#x} process {a4:#x}");
+        let mut frames = [ptr::null_mut::<c_void>(); 16];
+        let n = unsafe { RtlCaptureStackBackTrace(1, 16, frames.as_mut_ptr(), ptr::null_mut()) } as usize;
+        for f in frames[..n].iter().map(|f| *f as usize) {
+            let mut m: *mut c_void = ptr::null_mut();
+            if unsafe { GetModuleHandleExA(0x6, f as *const i8, &mut m) } != 0 {
+                let mut buf = [0u8; 260];
+                let len = unsafe { GetModuleFileNameA(m, buf.as_mut_ptr(), 260) } as usize;
+                rlog!("  frame {}+{:#x}", String::from_utf8_lossy(&buf[..len]).rsplit('\\').next().unwrap_or(""), f - m as usize);
+            }
+        }
+    }
+    let f: extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize, usize, usize) -> i32 =
+        unsafe { std::mem::transmute(NT_CREATE_THREAD_TRAMPOLINE.load(Ordering::Relaxed)) };
+    f(a1, a2, a3, a4, start, a6, a7, a8, a9, a10, a11)
+}
+
+fn hook_nt_create_thread() {
+    unsafe {
+        let target = GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr()), c"NtCreateThreadEx".as_ptr()) as *mut u8;
+        if target.is_null() || *target != 0x4C || *target.add(3) != 0xB8 || *target.add(8) != 0xF6 {
+            return;
+        }
+        let tramp = VirtualAlloc(ptr::null_mut(), 64, 0x3000, 0x40) as *mut u8;
+        ptr::copy_nonoverlapping(target, tramp, 16);
+        let mut jump = [0x48u8, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0];
+        jump[2..10].copy_from_slice(&(target as u64 + 16).to_le_bytes());
+        ptr::copy_nonoverlapping(jump.as_ptr(), tramp.add(16), jump.len());
+        NT_CREATE_THREAD_TRAMPOLINE.store(tramp as usize, Ordering::Relaxed);
+        let mut old = 0u32;
+        if VirtualProtect(target as *mut c_void, 16, 0x40, &mut old) == 0 {
+            return;
+        }
+        let mut hook = [0x48u8, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0];
+        hook[2..10].copy_from_slice(&(hooked_nt_create_thread_ex as usize as u64).to_le_bytes());
+        ptr::copy_nonoverlapping(hook.as_ptr(), target, hook.len());
     }
 }
 

@@ -668,8 +668,16 @@ fn is_readable_ptr(p: *mut c_void) -> bool {
 /// `this` is treated as a possible out-parameter: if it points at writable memory, a new
 /// stand-in object is stored there and the call reports success (the common shape of a
 /// property getter or factory method). Otherwise the call fails with E_NOTIMPL.
-unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: *mut c_void, arg2: *mut c_void) -> HRESULT {
+unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: *mut c_void, arg2: *mut c_void, _a3: usize, _a4: usize, _a5: usize, a6: *mut c_void) -> HRESULT {
     let o = unsafe { &*(this as *const GenericObj) };
+    // `Store.Product` statics slot 11 is `(user, id, flag, ptr, ptr, Product** out)`: the object comes
+    // back through the sixth argument (found from the title's call site at 0x1948e55).
+    if o.class == "Windows.Xbox.ApplicationModel.Store.Product" && N == 11 && is_writable(a6) {
+        let child = create_generic("Windows.Xbox.ApplicationModel.Store.Product#slot11", &o.iid);
+        unsafe { *(a6 as *mut *mut c_void) = child };
+        wlog!("[winrt] {} slot 11 -> a stand-in object through the 6th argument", o.class);
+        return HRESULT(0);
+    }
     if o.kind == 2 {
         // Console CoreWindow. The title's vtable layout differs from desktop ICoreWindow:
         // observed calls are slots 7, 11, 15, 23, 25 and 35, and slot 7 is followed by
