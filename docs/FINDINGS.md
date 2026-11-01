@@ -237,7 +237,7 @@ The title runs and its state is mostly set up, then it faults either in the user
 3. Find what corrupts the GPU driver's thread.
 4. Texture data: decode the console tiling and mirror placement textures.
 5. The remaining decoding tasks listed earlier (`+0xA08`, `+0x4e0`, which context slot the console table lacks).
-6. Pin down
+6. Pin down the console `ICoreWindow` layout: keep logging slots as the title uses more of them, and give stand-in behavior to a slot only where the call pattern justifies it.
 7. Implement `DXGIXSetVLineNotification`, `DXGIXPresentArray` and the display/swap-chain path (the title's render-target view creation still fails once on a NULL back buffer).
 8. Work out the real shape of the `PackageTransferManager` interfaces and the `42A6A529` / `9FF3799E` `CoreApplication` extensions.
 9. Provide a `G:` equivalent and inspect `media/` (encrypted content is out of scope).
