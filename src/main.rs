@@ -1,4 +1,4 @@
-//! xb1layer: PE64 loader core for an Xbox One (GDK) compatibility layer.
+﻿//! xb1layer: PE64 loader core for an Xbox One (GDK) compatibility layer.
 //!
 //! Maps an x64 PE image manually, applies relocations, resolves imports
 //! against real Windows DLLs where possible, and routes everything else
@@ -10,17 +10,345 @@
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::{c_void, CString};
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::{env, fs, process, ptr};
 
 unsafe extern "system" {
     fn VirtualAlloc(addr: *mut c_void, size: usize, ty: u32, prot: u32) -> *mut c_void;
+    fn GetLastError() -> u32;
+    fn CreateThread(attrs: *mut c_void, stack: usize, routine: usize, param: *mut c_void, flags: u32, tid: *mut u32) -> *mut c_void;
+    fn HeapCreate(options: u32, initial: usize, max: usize) -> *mut c_void;
+    fn HeapValidate(heap: *mut c_void, flags: u32, mem: *const c_void) -> i32;
+    fn GetProcessHeap() -> *mut c_void;
+    fn VirtualQuery(addr: *const c_void, info: *mut c_void, len: usize) -> usize;
+    fn GetStdHandle(which: u32) -> *mut c_void;
+    fn WriteFile(h: *mut c_void, buf: *const u8, n: u32, written: *mut u32, overlapped: *mut c_void) -> i32;
+    fn GetCurrentThreadId() -> u32;
+    fn OpenThread(access: u32, inherit: i32, tid: u32) -> *mut c_void;
+    fn SuspendThread(thread: *mut c_void) -> u32;
+    fn ResumeThread(thread: *mut c_void) -> u32;
+    fn GetCurrentProcess() -> *mut c_void;
+    fn ReadProcessMemory(process: *mut c_void, addr: *const c_void, buf: *mut c_void, size: usize, read: *mut usize) -> i32;
+    fn GetThreadContext(thread: *mut c_void, ctx: *mut c_void) -> i32;
+    fn GetModuleHandleExA(flags: u32, addr: *const i8, out: *mut *mut c_void) -> i32;
+    fn GetModuleFileNameA(module: *mut c_void, buf: *mut u8, size: u32) -> u32;
+    fn RtlCaptureStackBackTrace(skip: u32, count: u32, frames: *mut *mut c_void, hash: *mut u32) -> u16;
+    fn RtlAddFunctionTable(table: *const c_void, count: u32, base: u64) -> u8;
+    fn AddVectoredExceptionHandler(first: u32, handler: extern "system" fn(*const *const u8) -> i32) -> *mut c_void;
     fn LoadLibraryA(name: *const i8) -> *mut c_void;
     fn GetProcAddress(module: *mut c_void, name: *const i8) -> *mut c_void;
 }
 
 const MEM_COMMIT_RESERVE: u32 = 0x3000;
 const PAGE_RWX: u32 = 0x40;
+
+static IMG_BASE: AtomicUsize = AtomicUsize::new(0);
+static IMG_SIZE: AtomicUsize = AtomicUsize::new(0);
+
+static TITLE_TID: AtomicU32 = AtomicU32::new(0);
+static WATCH_SECS: AtomicU32 = AtomicU32::new(0);
+static HEAPCHECK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SEEN_FAULTS: [AtomicUsize; 64] = [const { AtomicUsize::new(0) }; 64];
+static SEEN_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Fixed-size formatting buffer so crash reporting never touches the heap
+/// (the title may have crashed inside it, or corrupted it).
+struct RawBuf {
+    b: [u8; 1024],
+    n: usize,
+}
+
+impl RawBuf {
+    fn new() -> Self {
+        Self { b: [0; 1024], n: 0 }
+    }
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.b[..self.n]).unwrap_or("?")
+    }
+}
+
+impl std::fmt::Write for RawBuf {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let k = s.len().min(self.b.len() - self.n);
+        self.b[self.n..self.n + k].copy_from_slice(&s.as_bytes()[..k]);
+        self.n += k;
+        Ok(())
+    }
+}
+
+fn raw_log(args: std::fmt::Arguments) {
+    let mut w = RawBuf::new();
+    let _ = std::fmt::write(&mut w, args);
+    if w.n < w.b.len() {
+        w.b[w.n] = b'\n';
+        w.n += 1;
+    }
+    let mut written = 0u32;
+    unsafe { WriteFile(GetStdHandle(-12i32 as u32), w.b.as_ptr(), w.n as u32, &mut written, ptr::null_mut()) };
+}
+
+macro_rules! rlog {
+    ($($t:tt)*) => { raw_log(format_args!($($t)*)) };
+}
+
+/// Writes `title+RVA` or `module+offset` for an address, without allocating.
+fn describe(addr: usize, out: &mut RawBuf) {
+    use std::fmt::Write;
+    let (base, size) = (IMG_BASE.load(Ordering::Relaxed), IMG_SIZE.load(Ordering::Relaxed));
+    if addr >= base && addr < base + size {
+        let _ = write!(out, "title+{:#x}", addr - base);
+        return;
+    }
+    let mut m: *mut c_void = ptr::null_mut();
+    let mut name = [0u8; 260];
+    unsafe {
+        // GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | UNCHANGED_REFCOUNT
+        if GetModuleHandleExA(0x4 | 0x2, addr as *const i8, &mut m) == 0 {
+            let _ = write!(out, "{addr:#x}");
+            return;
+        }
+        let n = GetModuleFileNameA(m, name.as_mut_ptr(), name.len() as u32) as usize;
+        let full = &name[..n];
+        let start = full.iter().rposition(|&c| c == b'\\').map_or(0, |i| i + 1);
+        let _ = write!(out, "{}+{:#x}", std::str::from_utf8(&full[start..]).unwrap_or("?"), addr - m as usize);
+    }
+}
+
+#[repr(C, align(16))]
+struct Context([u8; 1232]);
+
+/// Freezes the title thread and prints where it is: RIP plus any return-address-looking
+/// values on its stack that point into the title.
+fn dump_title_thread() {
+    unsafe {
+        let h = OpenThread(0x1F_FFFF, 0, TITLE_TID.load(Ordering::Relaxed));
+        if h.is_null() {
+            rlog!("watch: cannot open title thread");
+            return;
+        }
+        rlog!("watch: opened thread");
+        SuspendThread(h);
+        rlog!("watch: suspended");
+        let mut c = Context([0; 1232]);
+        *(c.0.as_mut_ptr().add(0x30) as *mut u32) = 0x10_000B; // CONTEXT_FULL
+        let ok = GetThreadContext(h, c.0.as_mut_ptr() as *mut c_void);
+        let rip = *(c.0.as_ptr().add(0xF8) as *const usize);
+        let rsp = *(c.0.as_ptr().add(0x98) as *const usize);
+        let mut stack = [0usize; 1024];
+        let mut want = 8192;
+        let mut got = 0usize;
+        while ok != 0 && want >= 64 {
+            if ReadProcessMemory(GetCurrentProcess(), rsp as *const c_void, stack.as_mut_ptr() as *mut c_void, want, &mut got) != 0 {
+                break;
+            }
+            want /= 2;
+            got = 0;
+        }
+        ResumeThread(h);
+        if ok == 0 {
+            rlog!("watch: GetThreadContext failed");
+            return;
+        }
+        let mut loc = RawBuf::new();
+        describe(rip, &mut loc);
+        rlog!("watch: rip = {}  rsp = {rsp:#x}", loc.as_str());
+        let mut shown = 0;
+        for (i, &v) in stack[..got / 8].iter().enumerate() {
+            let (base, size) = (IMG_BASE.load(Ordering::Relaxed), IMG_SIZE.load(Ordering::Relaxed));
+            if v >= base && v < base + size {
+                let mut l = RawBuf::new();
+                describe(v, &mut l);
+                rlog!("  stack[{i}] -> {}", l.as_str());
+                shown += 1;
+                if shown == 16 {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Logs fatal-looking exceptions as `title+RVA` so crashes can be matched to the binary.
+/// Always continues the search so the title's own SEH handlers still run. Allocation-free.
+extern "system" fn crash_logger(info: *const *const u8) -> i32 {
+    unsafe {
+        let rec = *info;
+        let code = *(rec as *const u32);
+        if code & 0xF000_0000 != 0xC000_0000 {
+            return 0;
+        }
+        let addr = *(rec.add(16) as *const usize);
+        let seen = SEEN_COUNT.load(Ordering::Relaxed).min(SEEN_FAULTS.len());
+        if SEEN_FAULTS[..seen].iter().any(|s| s.load(Ordering::Relaxed) == addr) {
+            return 0;
+        }
+        if seen < SEEN_FAULTS.len() {
+            SEEN_FAULTS[SEEN_COUNT.fetch_add(1, Ordering::Relaxed).min(SEEN_FAULTS.len() - 1)].store(addr, Ordering::Relaxed);
+        }
+        let mut loc = RawBuf::new();
+        describe(addr, &mut loc);
+        rlog!("[exception] {code:#x} at {}", loc.as_str());
+        let ctx = *info.add(1);
+        let reg = |off: usize| *(ctx.add(off) as *const u64);
+        rlog!(
+            "  rax={:#x} rcx={:#x} rdx={:#x} rbx={:#x} rsi={:#x} rdi={:#x} r8={:#x} r9={:#x} rsp={:#x}",
+            reg(0x78), reg(0x80), reg(0x88), reg(0x90), reg(0xA8), reg(0xB0), reg(0xB8), reg(0xC0), reg(0x98)
+        );
+        if code == 0xC000_0005 {
+            let kind = *(rec.add(32) as *const usize);
+            let target = *(rec.add(40) as *const usize);
+            let kind = match kind { 0 => "read", 1 => "write", _ => "execute" };
+            rlog!("  access violation: {kind} of {target:#x}");
+            // MEMORY_BASIC_INFORMATION: BaseAddress, AllocationBase, AllocationProtect(+pad), RegionSize, State, Protect, Type
+            let mut mbi = [0u64; 8];
+            if VirtualQuery(target as *const c_void, mbi.as_mut_ptr() as *mut c_void, 48) != 0 {
+                rlog!(
+                    "  region base={:#x} alloc_base={:#x} size={:#x} state={:#x} protect={:#x} type={:#x}",
+                    mbi[0], mbi[1], mbi[3], mbi[4] & 0xFFFF_FFFF, mbi[4] >> 32, mbi[5] & 0xFFFF_FFFF
+                );
+            }
+            let mut mbi2 = [0u64; 8];
+            let buf = reg(0x78) as usize;
+            if VirtualQuery(buf as *const c_void, mbi2.as_mut_ptr() as *mut c_void, 48) != 0 {
+                rlog!(
+                    "  rax region base={:#x} alloc_base={:#x} size={:#x} state={:#x} protect={:#x}",
+                    mbi2[0], mbi2[1], mbi2[3], mbi2[4] & 0xFFFF_FFFF, mbi2[4] >> 32
+                );
+            }
+        }
+        let (base, size) = (IMG_BASE.load(Ordering::Relaxed), IMG_SIZE.load(Ordering::Relaxed));
+        let mut frames = [ptr::null_mut::<c_void>(); 32];
+        let n = RtlCaptureStackBackTrace(0, 32, frames.as_mut_ptr(), ptr::null_mut()) as usize;
+        for f in frames[..n].iter().map(|f| *f as usize).filter(|f| *f >= base && *f < base + size).take(8) {
+            rlog!("  caller title+{:#x}", f - base);
+        }
+        // The unwinder often stops early, so also scan the faulting stack for return-address-like values.
+        let rsp = reg(0x98) as usize;
+        let stack_base: usize;
+        std::arch::asm!("mov {}, gs:[8]", out(reg) stack_base, options(nostack, readonly, preserves_flags));
+        let mut shown = 0;
+        for i in 0..512 {
+            if rsp + i * 8 + 8 > stack_base {
+                break;
+            }
+            let v = *((rsp + i * 8) as *const usize);
+            if v >= base && v < base + size && *((v - 5) as *const u8) == 0xE8 || (v >= base + 6 && v < base + size && *((v - 6) as *const u8) == 0xFF && *((v - 5) as *const u8) == 0x15) {
+                rlog!("  stack+{:#x}: return address title+{:#x}", i * 8, v - base);
+                shown += 1;
+                if shown == 12 {
+                    break;
+                }
+            }
+        }
+    }
+    0
+}
+
+const TLS_TITLE_INDEX: usize = 100;
+static TLS_TEMPLATE: AtomicUsize = AtomicUsize::new(0);
+static TLS_LEN: AtomicUsize = AtomicUsize::new(0);
+static TLS_TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+/// Gives the calling thread its own copy of the title's static TLS.
+///
+/// The TEB's ThreadLocalStoragePointer array has no recorded length, so this swaps in a
+/// larger copy of its first entries and claims a high index for the title. Threads the
+/// title creates through `CreateThread` get this via `xb_create_thread`; threads made
+/// elsewhere (thread pools, host threads) do not.
+unsafe fn install_tls_for_current_thread() {
+    const SLOTS: usize = 128;
+    let (total, len) = (TLS_TOTAL.load(Ordering::Relaxed), TLS_LEN.load(Ordering::Relaxed));
+    let block = VirtualAlloc(ptr::null_mut(), total.max(1), MEM_COMMIT_RESERVE, 0x04) as *mut u8;
+    ptr::copy_nonoverlapping(TLS_TEMPLATE.load(Ordering::Relaxed) as *const u8, block, len);
+    let teb: usize;
+    std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb, options(nostack, readonly, preserves_flags));
+    let slot = (teb + 0x58) as *mut *mut *mut c_void;
+    let arr = VirtualAlloc(ptr::null_mut(), SLOTS * 8, MEM_COMMIT_RESERVE, 0x04) as *mut *mut c_void;
+    if !(*slot).is_null() {
+        ptr::copy_nonoverlapping(*slot, arr, 16);
+    }
+    *arr.add(TLS_TITLE_INDEX) = block as *mut c_void;
+    *slot = arr;
+}
+
+struct ThreadStart {
+    routine: usize,
+    param: usize,
+}
+
+extern "system" fn thread_trampoline(p: *mut c_void) -> u32 {
+    let ThreadStart { routine, param } = *unsafe { Box::from_raw(p as *mut ThreadStart) };
+    unsafe { install_tls_for_current_thread() };
+    let f: extern "system" fn(*mut c_void) -> u32 = unsafe { std::mem::transmute(routine) };
+    f(param as *mut c_void)
+}
+
+/// CreateThread for the title: wraps the start routine so the new thread gets static TLS first.
+extern "system" fn xb_create_thread(
+    attrs: *mut c_void,
+    stack: usize,
+    routine: usize,
+    param: usize,
+    flags: u32,
+    tid: *mut u32,
+) -> *mut c_void {
+    let boxed = Box::into_raw(Box::new(ThreadStart { routine, param }));
+    let h = unsafe { CreateThread(attrs, stack, thread_trampoline as usize, boxed as *mut c_void, flags, tid) };
+    if h.is_null() {
+        drop(unsafe { Box::from_raw(boxed) });
+    }
+    h
+}
+
+/// Process-level setup a real loader would have done for the title:
+/// unwind tables, PEB image base, main-thread static TLS and TLS callbacks.
+unsafe fn bootstrap(base: *mut u8, size: usize, tls: (u32, u32), exc: (u32, u32)) -> Result<(), String> {
+    IMG_BASE.store(base as usize, Ordering::Relaxed);
+    IMG_SIZE.store(size, Ordering::Relaxed);
+    AddVectoredExceptionHandler(1, crash_logger);
+
+    if exc.0 != 0 {
+        let count = exc.1 / 12;
+        if RtlAddFunctionTable(base.add(exc.0 as usize) as *const c_void, count, base as u64) == 0 {
+            return Err("RtlAddFunctionTable failed".into());
+        }
+        println!("registered {count} unwind entries");
+    }
+
+    // GetModuleHandle(NULL) reads PEB.ImageBaseAddress.
+    let peb: usize;
+    std::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, readonly, preserves_flags));
+    *((peb + 0x10) as *mut usize) = base as usize;
+
+    if tls.0 != 0 {
+        let d = base.add(tls.0 as usize);
+        let start = *(d as *const u64) as usize;
+        let end = *(d.add(8) as *const u64) as usize;
+        let idx_ptr = *(d.add(16) as *const u64) as *mut u32;
+        let callbacks = *(d.add(24) as *const u64) as *const usize;
+        let zero_fill = *(d.add(32) as *const u32) as usize;
+        let len = end - start;
+
+        TLS_TEMPLATE.store(start, Ordering::Relaxed);
+        TLS_LEN.store(len, Ordering::Relaxed);
+        TLS_TOTAL.store(len + zero_fill, Ordering::Relaxed);
+        *idx_ptr = TLS_TITLE_INDEX as u32;
+        install_tls_for_current_thread();
+        println!("static TLS: {len} bytes + {zero_fill} zero-fill at index {TLS_TITLE_INDEX}");
+
+        if !callbacks.is_null() {
+            let mut i = 0;
+            while *callbacks.add(i) != 0 {
+                let cb: extern "system" fn(*mut c_void, u32, *mut c_void) = std::mem::transmute(*callbacks.add(i));
+                cb(base as *mut c_void, 1, ptr::null_mut());
+                i += 1;
+            }
+            println!("ran {i} TLS callbacks");
+        }
+    }
+    Ok(())
+}
 
 static STUB_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static HIT_LOG: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
@@ -66,8 +394,8 @@ struct StubArena {
 }
 
 impl StubArena {
-    const SLOT: usize = 32;
-    const CAP: usize = 4096 * 16;
+    const SLOT: usize = 128;
+    const CAP: usize = 4096 * 64;
 
     fn new() -> Self {
         let mem = unsafe { VirtualAlloc(ptr::null_mut(), Self::CAP, MEM_COMMIT_RESERVE, PAGE_RWX) } as *mut u8;
@@ -94,6 +422,139 @@ impl StubArena {
         unsafe { ptr::copy_nonoverlapping(code.as_ptr(), slot, code.len()) };
         slot as u64
     }
+
+    /// Wraps a real function in a thunk that logs the call, preserving the argument
+    /// registers (rcx, rdx, r8, r9, xmm0-3) and stack alignment, then jumps to `real`.
+    fn make_trace(&mut self, label: String, real: u64) -> u64 {
+        assert!(self.used + Self::SLOT <= Self::CAP, "stub arena full");
+        let idx = {
+            let mut names = TRACE_NAMES.lock().unwrap();
+            names.push(label);
+            names.len() - 1
+        };
+        let slot = unsafe { self.mem.add(self.used) };
+        self.used += Self::SLOT;
+        let mut c: Vec<u8> = vec![
+            0x51, // push rcx
+            0x52, // push rdx
+            0x41, 0x50, // push r8
+            0x41, 0x51, // push r9
+            0x48, 0x83, 0xEC, 0x68, // sub rsp, 0x68
+            0xF3, 0x0F, 0x7F, 0x44, 0x24, 0x20, // movdqu [rsp+20h], xmm0
+            0xF3, 0x0F, 0x7F, 0x4C, 0x24, 0x30, // xmm1
+            0xF3, 0x0F, 0x7F, 0x54, 0x24, 0x40, // xmm2
+            0xF3, 0x0F, 0x7F, 0x5C, 0x24, 0x50, // xmm3
+            0x48, 0xB9, // mov rcx, idx
+        ];
+        c.extend_from_slice(&(idx as u64).to_le_bytes());
+        c.extend_from_slice(&[0x48, 0xB8]); // mov rax, trace_hit
+        c.extend_from_slice(&(trace_hit as usize as u64).to_le_bytes());
+        c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+        c.extend_from_slice(&[
+            0xF3, 0x0F, 0x6F, 0x44, 0x24, 0x20, // movdqu xmm0, [rsp+20h]
+            0xF3, 0x0F, 0x6F, 0x4C, 0x24, 0x30,
+            0xF3, 0x0F, 0x6F, 0x54, 0x24, 0x40,
+            0xF3, 0x0F, 0x6F, 0x5C, 0x24, 0x50,
+            0x48, 0x83, 0xC4, 0x68, // add rsp, 0x68
+            0x41, 0x59, // pop r9
+            0x41, 0x58, // pop r8
+            0x5A, // pop rdx
+            0x59, // pop rcx
+            0x48, 0xB8, // mov rax, real
+        ]);
+        c.extend_from_slice(&real.to_le_bytes());
+        c.extend_from_slice(&[0xFF, 0xE0]); // jmp rax
+        assert!(c.len() <= Self::SLOT);
+        unsafe { ptr::copy_nonoverlapping(c.as_ptr(), slot, c.len()) };
+        slot as u64
+    }
+}
+
+static TRACE_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static TRACE_API: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Called from the trace thunks; logs each API call the title makes (capped).
+extern "system" fn trace_hit(idx: u64) {
+    if let Ok(names) = TRACE_NAMES.try_lock() {
+        let name = &names[idx as usize];
+        // High-volume calls that only drown out the interesting ones.
+        const NOISE: [&str; 10] = [
+            "CriticalSection", "GetProcessHeap", "HeapAlloc", "HeapFree", "QueryPerformance",
+            "TlsGetValue", "!memcpy", "!memmove", "!memset", "!memcmp",
+        ];
+        if NOISE.iter().any(|n| name.contains(n)) || TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 20000 {
+            return;
+        }
+        rlog!("[api] {name}");
+    }
+}
+
+/// The title gets its own heap so it cannot corrupt (or be corrupted by) the host's.
+static GUEST_HEAP: AtomicUsize = AtomicUsize::new(0);
+
+extern "system" fn xb_get_process_heap() -> *mut c_void {
+    GUEST_HEAP.load(Ordering::Relaxed) as *mut c_void
+}
+
+/// Imports we implement ourselves instead of forwarding to Windows.
+fn override_for(dll: &str, func: &str) -> Option<usize> {
+    if !dll.eq_ignore_ascii_case("kernelx.dll") && !dll.eq_ignore_ascii_case("kernel32.dll") {
+        return None;
+    }
+    match func {
+        "GetProcessHeap" => Some(xb_get_process_heap as usize),
+        "HeapAlloc" if TRACE_HEAP.load(Ordering::Relaxed) => Some(xb_heap_alloc as usize),
+        "HeapFree" if TRACE_HEAP.load(Ordering::Relaxed) => Some(xb_heap_free as usize),
+        "VirtualAlloc" => Some(xb_virtual_alloc as usize),
+        "CreateThread" => Some(xb_create_thread as usize),
+        _ => None,
+    }
+}
+
+static TRACE_HEAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn real_kernel32(name: &std::ffi::CStr) -> usize {
+    unsafe { GetProcAddress(LoadLibraryA(c"kernel32.dll".as_ptr()), name.as_ptr()) as usize }
+}
+
+extern "system" fn xb_heap_alloc(heap: *mut c_void, flags: u32, size: usize) -> *mut c_void {
+    let real: extern "system" fn(*mut c_void, u32, usize) -> *mut c_void =
+        unsafe { std::mem::transmute(real_kernel32(c"HeapAlloc")) };
+    let p = real(heap, flags, size);
+    rlog!("HeapAlloc(heap={heap:p}, flags={flags:#x}, size={size}) -> {p:p}");
+    p
+}
+
+/// Allocation-type bits desktop Windows accepts. Titles also pass console-only bits
+/// (observed: 0x40000000 and 0x10000000) and large pages, which make VirtualAlloc fail
+/// with ERROR_INVALID_PARAMETER, so those are stripped.
+const VALID_ALLOC_TYPE: u32 = 0x1000 | 0x2000 | 0x80000 | 0x100000 | 0x200000 | 0x400000 | 0x100_0000;
+
+/// Console VirtualAlloc: strips unsupported flags and keeps the title's fixed-address hint,
+/// falling back to any address for a reservation if that range is not available here.
+extern "system" fn xb_virtual_alloc(addr: *mut c_void, size: usize, ty: u32, prot: u32) -> *mut c_void {
+    let clean = ty & VALID_ALLOC_TYPE;
+    let mut p = unsafe { VirtualAlloc(addr, size, clean, prot) };
+    let mut moved = false;
+    if p.is_null() && !addr.is_null() && clean & 0x2000 != 0 {
+        p = unsafe { VirtualAlloc(ptr::null_mut(), size, clean, prot) };
+        moved = !p.is_null();
+    }
+    if TRACE_HEAP.load(Ordering::Relaxed) {
+        let err = if p.is_null() { unsafe { GetLastError() } } else { 0 };
+        let note = if moved { " (address hint unavailable, moved)" } else { "" };
+        rlog!("VirtualAlloc(addr={addr:p}, size={size:#x}, type={ty:#x}->{clean:#x}, protect={prot:#x}) -> {p:p} err={err}{note}");
+    }
+    p
+}
+
+extern "system" fn xb_heap_free(heap: *mut c_void, flags: u32, p: *mut c_void) -> i32 {
+    let real: extern "system" fn(*mut c_void, u32, *mut c_void) -> i32 =
+        unsafe { std::mem::transmute(real_kernel32(c"HeapFree")) };
+    let r = real(heap, flags, p);
+    rlog!("HeapFree(heap={heap:p}, p={p:p}) -> {r}");
+    r
 }
 
 /// Prefers a DLL shipped next to the title, then falls back to the system search path.
@@ -136,7 +597,7 @@ fn print_import_report() {
     }
 }
 
-fn load(data: &[u8], dir: &Path, run: bool, report: bool) -> Result<(), String> {
+fn load(data: &[u8], dir: &Path, run: bool, report: bool, dump_iat: bool) -> Result<(), String> {
     let pe = Pe(data);
     if pe.u16(0)? != 0x5A4D {
         return Err("not an MZ executable".into());
@@ -160,6 +621,8 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool) -> Result<(), String> 
     let size_of_headers = pe.u32(opt + 60)? as usize;
     let import_dir = (pe.u32(opt + 112 + 8)?, pe.u32(opt + 112 + 12)?);
     let reloc_dir = (pe.u32(opt + 112 + 5 * 8)?, pe.u32(opt + 112 + 5 * 8 + 4)?);
+    let exc_dir = (pe.u32(opt + 112 + 3 * 8)?, pe.u32(opt + 112 + 3 * 8 + 4)?);
+    let tls_dir = (pe.u32(opt + 112 + 9 * 8)?, pe.u32(opt + 112 + 9 * 8 + 4)?);
 
     let mut base = unsafe { VirtualAlloc(image_base as *mut c_void, size_of_image, MEM_COMMIT_RESERVE, PAGE_RWX) };
     if base.is_null() {
@@ -209,6 +672,7 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool) -> Result<(), String> 
     }
 
     // Imports
+    GUEST_HEAP.store(unsafe { HeapCreate(0, 0, 0) } as usize, Ordering::Relaxed);
     let mut arena = StubArena::new();
     let (mut real, mut stubbed) = (0usize, 0usize);
     if import_dir.0 != 0 {
@@ -239,8 +703,11 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool) -> Result<(), String> 
                     let n = unsafe { cstr_at(base, (thunk as u32) + 2) };
                     (format!("{dll}!{n}"), Some(CString::new(n).unwrap()))
                 };
-                let mut addr = 0u64;
-                if !module.is_null() {
+                let mut addr = cname
+                    .as_ref()
+                    .and_then(|c| override_for(&dll, c.to_str().unwrap_or("")))
+                    .unwrap_or(0) as u64;
+                if addr == 0 && !module.is_null() {
                     let p = match &cname {
                         Some(c) => unsafe { GetProcAddress(module, c.as_ptr()) },
                         None => unsafe { GetProcAddress(module, (thunk & 0xFFFF) as usize as *const i8) },
@@ -248,12 +715,18 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool) -> Result<(), String> 
                     addr = p as u64;
                 }
                 if addr == 0 {
-                    addr = arena.make(label);
+                    addr = arena.make(label.clone());
                     stubbed += 1;
                 } else {
                     real += 1;
+                    if TRACE_API.load(Ordering::Relaxed) {
+                        addr = arena.make_trace(label.clone(), addr);
+                    }
                 }
                 unsafe { *(base.add(ft as usize + i * 8) as *mut u64) = addr };
+                if dump_iat {
+                    println!("iat {:#x} {label}", ft as usize + i * 8);
+                }
                 i += 1;
             }
             if module.is_null() {
@@ -268,9 +741,42 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool) -> Result<(), String> 
     }
 
     if run {
-        println!("jumping to entry point {:#x}", base as usize + entry as usize);
-        let f: extern "system" fn() -> u32 = unsafe { std::mem::transmute(base.add(entry as usize)) };
-        let code = f();
+        // Titles expect a much larger main-thread stack than Rust's default, and the
+        // TLS setup in `bootstrap` patches the calling thread's TEB, so do both on a
+        // dedicated thread.
+        let (base_addr, entry_addr) = (base as usize, base as usize + entry as usize);
+        let worker = std::thread::Builder::new()
+            .stack_size(256 << 20)
+            .spawn(move || -> Result<u32, String> {
+                TITLE_TID.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
+                unsafe { bootstrap(base_addr as *mut u8, size_of_image, tls_dir, exc_dir)? };
+                println!("jumping to entry point {entry_addr:#x}");
+                let f: extern "system" fn() -> u32 = unsafe { std::mem::transmute(entry_addr) };
+                Ok(f())
+            })
+            .map_err(|e| e.to_string())?;
+        let watch = WATCH_SECS.load(Ordering::Relaxed);
+        if watch > 0 {
+            eprintln!("watch: sleeping {watch}s in main");
+            if HEAPCHECK.load(Ordering::Relaxed) {
+                // Poll the process heap so the corrupting write is caught close to when it happens.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(watch as u64);
+                while std::time::Instant::now() < deadline {
+                    if unsafe { HeapValidate(GetProcessHeap(), 0, ptr::null()) } == 0 {
+                        rlog!("heapcheck: process heap is corrupt");
+                        dump_title_thread();
+                        process::exit(1);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                rlog!("heapcheck: heap stayed valid for {watch}s");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(watch as u64));
+            eprintln!("watch: dumping title thread {}", TITLE_TID.load(Ordering::Relaxed));
+            dump_title_thread();
+            process::exit(0);
+        }
+        let code = worker.join().map_err(|_| "title thread panicked".to_string())??;
         println!("entry returned {code}");
     }
     Ok(())
@@ -289,7 +795,14 @@ fn main() {
     let dir = Path::new(path).parent().unwrap_or(Path::new("."));
     let run = args.iter().any(|a| a == "--run");
     let report = args.iter().any(|a| a == "--imports");
-    if let Err(e) = load(&data, dir, run, report) {
+    let dump_iat = args.iter().any(|a| a == "--iat");
+    HEAPCHECK.store(args.iter().any(|a| a == "--heapcheck"), Ordering::Relaxed);
+    TRACE_API.store(args.iter().any(|a| a == "--trace-api"), Ordering::Relaxed);
+    TRACE_HEAP.store(args.iter().any(|a| a == "--trace-heap"), Ordering::Relaxed);
+    if let Some(n) = args.iter().find_map(|a| a.strip_prefix("--watch=")) {
+        WATCH_SECS.store(n.parse().unwrap_or(5), Ordering::Relaxed);
+    }
+    if let Err(e) = load(&data, dir, run, report, dump_iat) {
         eprintln!("load failed: {e}");
         process::exit(1);
     }

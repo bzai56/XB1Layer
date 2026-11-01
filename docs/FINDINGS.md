@@ -43,7 +43,19 @@ Caveat: aliasing resolves names only. Console semantics can differ (for example 
 
 The GPU surface is small by import count: only 4 `d3d11_x` entry points are imported directly. The rest of the D3D11.X API is reached through the device object that `D3D11XCreateDeviceX` returns, so the shim will need to wrap that device and its interfaces.
 
+## First runs (`--run`)
+Calling the entry point after the process bootstrap (see [ARCHITECTURE.md](ARCHITECTURE.md)) gets the title through CRT startup and a long stretch of static initialization (20,000+ traced API calls) before it dies. What it took to get there, in order:
+
+1. **Stack size.** The title overflowed Rust's 1 MB main-thread stack and died silently. Running it on a 256 MB-reserve thread fixed the random hangs and crashes.
+2. **Console `VirtualAlloc` flags.** The title reserves seven large regions at fixed addresses (for example `0x60000000000` for 12 GiB, `0x800000000`, `0x900400000`) with allocation-type bits that desktop Windows rejects with `ERROR_INVALID_PARAMETER`: `0x40000000` and `0x10000000` (plus `0x20000000`, large pages). With every reservation failing, its pool allocator computed `size / element_size = 0`, called `HeapAlloc(0)` and then looped on `count - 1`. Stripping the unsupported bits and keeping the address hint fixed this; all seven reservations now succeed at the requested addresses, and later commits use `0x40000000` as well.
+3. **Static TLS on every thread.** The title uses `__declspec(thread)` and starts worker threads. Threads created through `CreateThread` now get their own TLS block via a trampoline.
+4. **`XMemSetAllocationHooks`** is the first console-only stub the title actually calls, and it returns 0.
+
+## Where it stops now
+The process ends with `0xC0000409` (fast-fail), which bypasses exception handlers, so the crash logger prints nothing. The last traced activity is heavy string processing (`isalpha`, `tolower`, `strcpy_s`) after thousands of `memcpy` calls, so the title is still in initialization, not in a game loop. Finding the fast-fail site needs either a debugger or a ring buffer of the last API calls that survives process death.
+
 ## Next investigation steps
-1. Inspect `media/` to see whether content is plain or encrypted (encrypted content is out of scope).
+1. Locate the fast-fail (ring buffer or debugger), then implement whatever it was waiting for.
 2. Implement `XMem*` and `TitleMemoryStatus`.
-3. Work out which D3D11.X-only interfaces and methods the title calls on the returned device.
+3. Inspect `media/` to see whether content is plain or encrypted (encrypted content is out of scope).
+4. Work out which D3D11.X-only interfaces and methods the title calls on the returned device.

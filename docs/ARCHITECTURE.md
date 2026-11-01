@@ -24,11 +24,40 @@ jmp rax
 
 `stub_hit` logs the import's `dll!name` on first call and returns 0. Original arguments are discarded, so stubs are for discovery only, not correct behavior.
 
+### Process bootstrap (`bootstrap`, `--run` only)
+Done on a dedicated thread with a 256 MB stack reserve, because titles expect far more than Rust's default:
+- **Unwind tables:** the exception directory is registered with `RtlAddFunctionTable`, so SEH and C++ exceptions can unwind through title code.
+- **PEB image base:** `PEB.ImageBaseAddress` is pointed at the title so `GetModuleHandle(NULL)` returns it.
+- **Static TLS:** the TLS template is copied per thread and installed in `TEB.ThreadLocalStoragePointer` at a fixed high index (100); `_tls_index` is set to match. The array has no recorded length, so a larger copy of the first 16 entries is swapped in. TLS callbacks run once for the main thread.
+- **Threads:** `CreateThread` is overridden to wrap the start routine in a trampoline that installs TLS first.
+
+### Import overrides (`override_for`)
+Some imports are implemented by us instead of forwarded to Windows:
+
+| Import | Why |
+|--------|-----|
+| `GetProcessHeap` | Returns a private guest heap so the title cannot corrupt the host's heap |
+| `VirtualAlloc` | Strips console-only allocation-type bits and falls back to any address if a fixed-address reservation is unavailable |
+| `CreateThread` | Installs static TLS on new threads |
+
+### Debugging aids
+| Flag | Effect |
+|------|--------|
+| `--imports` | Lists every stubbed import by DLL |
+| `--iat` | Prints `slot-RVA dll!name` for every import |
+| `--watch=N` | After N seconds, briefly suspends the title thread and prints RIP plus title return addresses on its stack |
+| `--trace-api` | Logs every natively resolved import call through a register-preserving thunk (noisy calls are filtered, capped at 20,000 lines) |
+| `--trace-heap` | Logs `HeapAlloc`, `HeapFree` and `VirtualAlloc` arguments and results |
+| `--heapcheck` | With `--watch`, polls `HeapValidate`. Experimental: it takes the heap lock and can stall a title that is itself stuck in the heap |
+
+The crash logger is a vectored exception handler that reports `title+RVA`, registers, access-violation target, memory-region state and return-address-looking stack values. It allocates nothing, because the title may have crashed inside the heap. It cannot see fast-fails (`int 0x29`), which bypass exception dispatch.
+
 ## Known limitations
-- The entry point is called directly. There is no PEB/loader-list registration, no TLS callbacks, no CRT/process setup, so `--run` on real titles will fail.
-- `GetModuleHandle(NULL)` returns the host process, not the loaded title.
+- Threads not created through the title's `CreateThread` import (thread pools, fibers) do not get static TLS.
+- Only one TLS callback pass, for the main thread; thread attach/detach callbacks are not run.
 - Image memory is RWX instead of per-section protections.
-- No delay-load imports, no import forwarders handling beyond what `GetProcAddress` does, no exception tables (`RtlAddFunctionTable`), so SEH will not work.
+- No delay-load imports or loader-list registration.
+- Stubs lose their arguments and return 0, so they are for discovery only.
 
 ## Planned layers
 | Layer | Replaces | Approach |
