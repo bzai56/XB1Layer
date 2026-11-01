@@ -90,12 +90,21 @@ fn patched_helper() -> Result<Vec<u8>, String> {
 /// # Safety
 /// `title_template` must be the title's TLS template bytes.
 pub unsafe fn load_helper(title_template: &[u8], zero_fill: usize) -> Result<u32, String> {
+    unsafe { load_helper_n(title_template, zero_fill, 0) }
+}
+
+/// Like `load_helper`, for the `n`th TLS owner: 0 is the title, 1 and up are guest DLLs that have
+/// their own TLS directory. Each gets its own copy of the helper (a different file, hence a
+/// different loader-assigned index).
+pub unsafe fn load_helper_n(title_template: &[u8], zero_fill: usize, n: u32) -> Result<u32, String> {
     if title_template.len() + zero_fill > BUFFER_SIZE {
         return Err(format!("title TLS is {} bytes, larger than the helper's {BUFFER_SIZE}", title_template.len() + zero_fill));
     }
     let dir = std::env::temp_dir();
-    remove_stale(&dir);
-    let path = dir.join(format!("xb1layer_tls_{}.dll", std::process::id()));
+    if n == 0 {
+        remove_stale(&dir);
+    }
+    let path = dir.join(format!("xb1layer_tls_{}_{n}.dll", std::process::id()));
     std::fs::write(&path, patched_helper()?).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
 
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();

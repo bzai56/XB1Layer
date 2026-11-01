@@ -14,7 +14,7 @@ mod winrt;
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::{c_void, CString};
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::{env, fs, process, ptr};
 
@@ -37,6 +37,8 @@ unsafe extern "system" {
     fn TerminateProcess(process: *mut c_void, code: u32) -> i32;
     fn ExitProcess(code: u32) -> !;
     fn VirtualProtect(addr: *mut c_void, size: usize, new: u32, old: *mut u32) -> i32;
+    fn DefineDosDeviceW(flags: u32, name: *const u16, target: *const u16) -> i32;
+    fn QueryDosDeviceW(name: *const u16, target: *mut u16, max: u32) -> u32;
     fn GetModuleHandleA(name: *const i8) -> *mut c_void;
     fn HeapCreate(options: u32, initial: usize, max: usize) -> *mut c_void;
     fn HeapValidate(heap: *mut c_void, flags: u32, mem: *const c_void) -> i32;
@@ -407,6 +409,10 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
         let mut loc = RawBuf::new();
         describe(addr, &mut loc);
         rlog!("[exception] {code:#x} at {}", loc.as_str());
+        if BACKTRACE_ON_CRASH.load(Ordering::Relaxed) && code == 0xC000_0005 {
+            // Allocates, so only on request (XB1_BT=1): the heap is usually fine for faults in the layer.
+            rlog!("{}", std::backtrace::Backtrace::force_capture());
+        }
         rlog!("  committed by the title so far: {} MiB", COMMITTED_BYTES.load(Ordering::Relaxed) >> 20);
         gpu::report_context_changes();
         {
@@ -700,6 +706,8 @@ unsafe fn bootstrap(base: *mut u8, size: usize, tls: (u32, u32), exc: (u32, u32)
     IMG_BASE.store(base as usize, Ordering::Relaxed);
     IMG_SIZE.store(size, Ordering::Relaxed);
     AddVectoredExceptionHandler(1, crash_logger);
+    FILES_TO_STDERR.store(std::env::var_os("XB1_FILES").is_some(), Ordering::Relaxed);
+    BACKTRACE_ON_CRASH.store(std::env::var_os("XB1_BT").is_some(), Ordering::Relaxed);
     hook_nt_terminate();
     // hook_nt_create_thread() hangs the run (logging while the thread is being created); kept for reference.
     let _ = hook_nt_create_thread as fn();
@@ -922,6 +930,10 @@ fn ring_init(path: &str) -> Result<(), String> {
 fn ring_write(args: std::fmt::Arguments) {
     let ring = RING.load(Ordering::Relaxed);
     if ring == 0 {
+        // XB1_FILES=1: the file-call loggers write to stderr instead of the ring.
+        if FILES_TO_STDERR.load(Ordering::Relaxed) {
+            raw_log(args);
+        }
         return;
     }
     let mut w = RawBuf::new();
@@ -975,6 +987,48 @@ static GUEST_HEAP: AtomicUsize = AtomicUsize::new(0);
 
 extern "system" fn xb_get_process_heap() -> *mut c_void {
     GUEST_HEAP.load(Ordering::Relaxed) as *mut c_void
+}
+
+/// The folder `G:` was mapped to (so the mapping can be removed again), if this process made one.
+static FILES_TO_STDERR: AtomicBool = AtomicBool::new(false);
+static BACKTRACE_ON_CRASH: AtomicBool = AtomicBool::new(false);
+
+static CONTENT_DRIVE: Mutex<Option<Vec<u16>>> = Mutex::new(None);
+
+/// Maps `G:` to the title folder for this logon session, because the title reads its game data
+/// from `g:\media\...` (the console's content drive). An existing `G:` is left alone.
+fn map_content_drive(dir: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    let name: Vec<u16> = vec![b'G' as u16, b':' as u16, 0];
+    let mut buf = [0u16; 512];
+    let got = unsafe { QueryDosDeviceW(name.as_ptr(), buf.as_mut_ptr(), 512) } as usize;
+    if got != 0 {
+        // "\??\C:older": ours if a previous run of this layer left it behind.
+        let existing = String::from_utf16_lossy(&buf[..buf.iter().position(|c| *c == 0).unwrap_or(got)]);
+        if existing.trim_start_matches(r"\??\").eq_ignore_ascii_case(&dir.display().to_string()) {
+            println!("G: already maps to the title folder (left by an earlier run); reusing it");
+            *CONTENT_DRIVE.lock().unwrap() = Some(Vec::new());
+        } else {
+            println!("G: is already in use ({existing}); not mapping the title folder to it");
+        }
+        return;
+    }
+    let target: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    if unsafe { DefineDosDeviceW(0, name.as_ptr(), target.as_ptr()) } != 0 {
+        println!("mapped G: to {}", dir.display());
+        *CONTENT_DRIVE.lock().unwrap() = Some(target);
+    } else {
+        println!("could not map G: to the title folder");
+    }
+}
+
+/// Removes the `G:` mapping made by `map_content_drive`.
+fn unmap_content_drive() {
+    if CONTENT_DRIVE.lock().unwrap().take().is_some() {
+        let name: Vec<u16> = vec![b'G' as u16, b':' as u16, 0];
+        // DDD_REMOVE_DEFINITION (0x2) with no target removes the most recent mapping of the name.
+        unsafe { DefineDosDeviceW(0x2, name.as_ptr(), ptr::null()) };
+    }
 }
 
 /// Logs who ends the process, then does it.
@@ -1034,6 +1088,7 @@ static NT_TERMINATE_TRAMPOLINE: AtomicUsize = AtomicUsize::new(0);
 extern "system" fn hooked_nt_terminate_process(process: isize, status: u32) -> i32 {
     if process == -1 || process == 0 {
         log_exit_request("NtTerminateProcess", status);
+        unmap_content_drive();
     }
     let f: extern "system" fn(isize, u32) -> i32 = unsafe { std::mem::transmute(NT_TERMINATE_TRAMPOLINE.load(Ordering::Relaxed)) };
     f(process, status)
@@ -1204,20 +1259,6 @@ fn override_for(dll: &str, func: &str) -> Option<usize> {
     if dll.eq_ignore_ascii_case("d3d11_x.dll") && func == "DXGIXSetVLineNotification" {
         return Some(gpu::set_vline_notification as usize);
     }
-    if dll.eq_ignore_ascii_case("commonEventLoggingLibrary_Release.dll") && func.starts_with("?Get@CellGlobalAllocator@details@CELL@") {
-        return Some(cell_global_allocator_get as usize);
-    }
-    if dll.eq_ignore_ascii_case("commonEventLoggingLibrary_Release.dll") {
-        if func.starts_with("?get_Global") {
-            return Some(cell_zeroed_table as usize);
-        }
-        if func.starts_with("?Get@CellGlobalAssertHandle") {
-            return Some(cell_create_cell_internal as usize); // a no-op object
-        }
-    }
-    if dll.eq_ignore_ascii_case("commonEventLoggingLibrary_Release.dll") && func.starts_with("?CreateCellInternal@CellGlobal@CELL@") {
-        return Some(cell_create_cell_internal as usize);
-    }
     if func == "CoCreateInstance" {
         return Some(xb_co_create_instance as usize);
     }
@@ -1237,13 +1278,13 @@ fn override_for(dll: &str, func: &str) -> Option<usize> {
         "TitleMemoryStatus" => Some(xb_title_memory_status as usize),
         "CreateThread" => Some(xb_create_thread as usize),
         "CreateThreadpoolIo" => Some(xb_create_threadpool_io as usize),
-        "LoadLibraryExW" if RING.load(Ordering::Relaxed) != 0 => Some(xb_load_library_ex_w as usize),
-        "CreateFile2" if RING.load(Ordering::Relaxed) != 0 => Some(xb_create_file2 as usize),
-        "FindFirstFileExA" if RING.load(Ordering::Relaxed) != 0 => Some(xb_find_first_file_ex_a as usize),
-        "GetFileAttributesExA" if RING.load(Ordering::Relaxed) != 0 => Some(xb_get_file_attributes_ex_a as usize),
-        "CreateFileW" if RING.load(Ordering::Relaxed) != 0 => Some(xb_create_file_w as usize),
-        "ReadFile" if RING.load(Ordering::Relaxed) != 0 => Some(xb_read_file as usize),
-        "GetFileInformationByHandleEx" if RING.load(Ordering::Relaxed) != 0 => Some(xb_get_file_info as usize),
+        "LoadLibraryExW" if RING.load(Ordering::Relaxed) != 0 || std::env::var_os("XB1_FILES").is_some() => Some(xb_load_library_ex_w as usize),
+        "CreateFile2" if RING.load(Ordering::Relaxed) != 0 || std::env::var_os("XB1_FILES").is_some() => Some(xb_create_file2 as usize),
+        "FindFirstFileExA" if RING.load(Ordering::Relaxed) != 0 || std::env::var_os("XB1_FILES").is_some() => Some(xb_find_first_file_ex_a as usize),
+        "GetFileAttributesExA" if RING.load(Ordering::Relaxed) != 0 || std::env::var_os("XB1_FILES").is_some() => Some(xb_get_file_attributes_ex_a as usize),
+        "CreateFileW" if RING.load(Ordering::Relaxed) != 0 || std::env::var_os("XB1_FILES").is_some() => Some(xb_create_file_w as usize),
+        "ReadFile" if RING.load(Ordering::Relaxed) != 0 || std::env::var_os("XB1_FILES").is_some() => Some(xb_read_file as usize),
+        "GetFileInformationByHandleEx" if RING.load(Ordering::Relaxed) != 0 || std::env::var_os("XB1_FILES").is_some() => Some(xb_get_file_info as usize),
         _ => None,
     }
 }
@@ -1492,6 +1533,263 @@ extern "system" fn xb_heap_free(heap: *mut c_void, flags: u32, p: *mut c_void) -
     r
 }
 
+/// Resolves the import table of a mapped image (the title or a guest DLL). Returns (resolved, stubbed).
+unsafe fn resolve_imports(base: *mut u8, import_dir: (u32, u32), dir: &Path, arena: &mut StubArena, dump_iat: bool) -> (usize, usize) {
+    let (mut real, mut stubbed) = (0usize, 0usize);
+    if import_dir.0 != 0 {
+        let mut desc = import_dir.0 as usize;
+        loop {
+            let (oft, name_rva, ft) = unsafe {
+                (
+                    *(base.add(desc) as *const u32),
+                    *(base.add(desc + 12) as *const u32),
+                    *(base.add(desc + 16) as *const u32),
+                )
+            };
+            if name_rva == 0 {
+                break;
+            }
+            let dll = unsafe { cstr_at(base, name_rva) };
+            let module = load_dll(dir, &dll);
+            let lookup = if oft != 0 { oft } else { ft } as usize;
+            let mut i = 0;
+            loop {
+                let thunk = unsafe { *(base.add(lookup + i * 8) as *const u64) };
+                if thunk == 0 {
+                    break;
+                }
+                let (label, cname) = if thunk >> 63 == 1 {
+                    (format!("{dll}!#{}", thunk & 0xFFFF), None)
+                } else {
+                    let n = unsafe { cstr_at(base, (thunk as u32) + 2) };
+                    (format!("{dll}!{n}"), Some(CString::new(n).unwrap()))
+                };
+                let mut addr = cname
+                    .as_ref()
+                    .and_then(|c| override_for(&dll, c.to_str().unwrap_or("")))
+                    .unwrap_or(0) as u64;
+                if addr == 0 && !module.is_null() {
+                    let p = match &cname {
+                        Some(c) => unsafe { proc_address(module, c.as_ptr(), 0) },
+                        None => unsafe { proc_address(module, ptr::null(), (thunk & 0xFFFF) as usize) },
+                    };
+                    addr = p as u64;
+                }
+                if addr == 0 {
+                    addr = arena.make(label.clone());
+                    stubbed += 1;
+                } else {
+                    real += 1;
+                    if TRACE_API.load(Ordering::Relaxed) {
+                        addr = arena.make_trace(label.clone(), addr);
+                    }
+                }
+                unsafe { *(base.add(ft as usize + i * 8) as *mut u64) = addr };
+                if dump_iat {
+                    println!("iat {:#x} {label}", ft as usize + i * 8);
+                }
+                i += 1;
+            }
+            if module.is_null() {
+                println!("  missing DLL (stubbed): {dll}");
+            }
+            desc += 20;
+        }
+    }
+    (real, stubbed)
+}
+
+
+/// A console DLL shipped with the title, mapped by this loader (Windows cannot load it: it
+/// imports console-only DLLs).
+struct GuestDll {
+    base: usize,
+    size: usize,
+    entry: u32,
+    exc: (u32, u32),
+    name: String,
+}
+
+static GUEST_DLLS: Mutex<Vec<GuestDll>> = Mutex::new(Vec::new());
+
+/// `GetProcAddress` that also understands guest DLLs (a guest module handle is its base address).
+fn proc_address(module: *mut c_void, name: *const i8, ordinal: usize) -> *mut c_void {
+    let is_guest = GUEST_DLLS.lock().unwrap().iter().any(|g| g.base == module as usize);
+    if !is_guest {
+        let arg = if name.is_null() { ordinal as *const i8 } else { name };
+        return unsafe { GetProcAddress(module, arg) };
+    }
+    unsafe { guest_export(module as *const u8, name, ordinal) as *mut c_void }
+}
+
+/// Looks up an export of a mapped image by name or ordinal. Forwarded exports are not followed.
+unsafe fn guest_export(base: *const u8, name: *const i8, ordinal: usize) -> usize {
+    let nt = *(base.add(0x3C) as *const u32) as usize;
+    let dir_rva = *(base.add(nt + 24 + 112) as *const u32) as usize;
+    let dir_size = *(base.add(nt + 24 + 112 + 4) as *const u32) as usize;
+    if dir_rva == 0 {
+        return 0;
+    }
+    let dir = base.add(dir_rva);
+    let ord_base = *(dir.add(16) as *const u32) as usize;
+    let n_funcs = *(dir.add(20) as *const u32) as usize;
+    let n_names = *(dir.add(24) as *const u32) as usize;
+    let funcs = base.add(*(dir.add(28) as *const u32) as usize) as *const u32;
+    let names = base.add(*(dir.add(32) as *const u32) as usize) as *const u32;
+    let ords = base.add(*(dir.add(36) as *const u32) as usize) as *const u16;
+    let index = if name.is_null() {
+        match ordinal.checked_sub(ord_base) {
+            Some(i) if i < n_funcs => i,
+            _ => return 0,
+        }
+    } else {
+        let want = std::ffi::CStr::from_ptr(name).to_bytes();
+        let mut found = None;
+        for i in 0..n_names {
+            let n = std::ffi::CStr::from_ptr(base.add(*names.add(i) as usize) as *const i8).to_bytes();
+            if n == want {
+                found = Some(*ords.add(i) as usize);
+                break;
+            }
+        }
+        match found {
+            Some(i) if i < n_funcs => i,
+            _ => return 0,
+        }
+    };
+    let rva = *funcs.add(index) as usize;
+    if rva >= dir_rva && rva < dir_rva + dir_size {
+        return 0; // a forwarder
+    }
+    base as usize + rva
+}
+
+/// Maps a console DLL from the title folder with this loader: sections, relocations, imports.
+/// Its unwind tables are registered and `DllMain` is called later, on the title thread (see
+/// `init_guest_dlls`). Returns the base address, which serves as the module handle.
+fn load_guest_dll(dir: &Path, name: &str) -> *mut c_void {
+    if let Some(g) = GUEST_DLLS.lock().unwrap().iter().find(|g| g.name.eq_ignore_ascii_case(name)) {
+        return g.base as *mut c_void;
+    }
+    let path = dir.join(name);
+    let Ok(data) = std::fs::read(&path) else { return ptr::null_mut() };
+    let pe = Pe(&data);
+    let parse = || -> Result<(u32, u64, usize, usize, (u32, u32), (u32, u32), usize, usize, usize), String> {
+        if pe.u16(0)? != 0x5A4D {
+            return Err("not MZ".into());
+        }
+        let nt = pe.u32(0x3C)? as usize;
+        if pe.u32(nt)? != 0x4550 || pe.u16(nt + 4)? != 0x8664 {
+            return Err("not an x64 PE".into());
+        }
+        let nsec = pe.u16(nt + 6)? as usize;
+        let opt_size = pe.u16(nt + 20)? as usize;
+        let opt = nt + 24;
+        Ok((
+            pe.u32(opt + 16)?,
+            pe.u64(opt + 24)?,
+            pe.u32(opt + 56)? as usize,
+            pe.u32(opt + 60)? as usize,
+            (pe.u32(opt + 112 + 8)?, pe.u32(opt + 112 + 12)?),
+            (pe.u32(opt + 112 + 5 * 8)?, pe.u32(opt + 112 + 5 * 8 + 4)?),
+            nsec,
+            opt_size,
+            opt,
+        ))
+    };
+    let Ok((entry, image_base, size_of_image, size_of_headers, import_dir, reloc_dir, nsec, opt_size, opt)) = parse() else {
+        return ptr::null_mut();
+    };
+    let exc = (pe.u32(opt + 112 + 3 * 8).unwrap_or(0), pe.u32(opt + 112 + 3 * 8 + 4).unwrap_or(0));
+    let mut base = unsafe { VirtualAlloc(image_base as *mut c_void, size_of_image, MEM_COMMIT_RESERVE, PAGE_RWX) };
+    if base.is_null() {
+        base = unsafe { VirtualAlloc(ptr::null_mut(), size_of_image, MEM_COMMIT_RESERVE, PAGE_RWX) };
+    }
+    if base.is_null() {
+        return ptr::null_mut();
+    }
+    let base = base as *mut u8;
+    unsafe {
+        ptr::copy_nonoverlapping(data.as_ptr(), base, size_of_headers.min(data.len()));
+        for i in 0..nsec {
+            let s = opt + opt_size + i * 40;
+            let (Ok(vsize), Ok(va), Ok(raw_size), Ok(raw_ptr)) = (pe.u32(s + 8), pe.u32(s + 12), pe.u32(s + 16), pe.u32(s + 20)) else { continue };
+            let n = (raw_size as usize).min((vsize as usize).max(raw_size as usize));
+            if let Some(src) = data.get(raw_ptr as usize..raw_ptr as usize + n) {
+                ptr::copy_nonoverlapping(src.as_ptr(), base.add(va as usize), n);
+            }
+        }
+        let delta = (base as u64).wrapping_sub(image_base);
+        if delta != 0 && reloc_dir.0 != 0 {
+            let mut off = reloc_dir.0 as usize;
+            let end = off + reloc_dir.1 as usize;
+            while off + 8 <= end {
+                let page = *(base.add(off) as *const u32) as usize;
+                let size = *(base.add(off + 4) as *const u32) as usize;
+                if size < 8 {
+                    break;
+                }
+                for e in 0..(size - 8) / 2 {
+                    let entry = *(base.add(off + 8 + e * 2) as *const u16);
+                    if entry >> 12 == 10 {
+                        let p = base.add(page + (entry & 0xFFF) as usize) as *mut u64;
+                        *p = (*p).wrapping_add(delta);
+                    }
+                }
+                off += size;
+            }
+        }
+    }
+    // A DLL with a static TLS directory (the CRT's thread-safe statics use it) gets its own helper
+    // DLL, so the Windows loader owns its block on every thread, and its `_tls_index` is pointed at
+    // the index the loader assigned.
+    unsafe {
+        let tls_rva = pe.u32(opt + 112 + 9 * 8).unwrap_or(0);
+        if tls_rva != 0 {
+            static NEXT_OWNER: AtomicU32 = AtomicU32::new(1);
+            let d = base.add(tls_rva as usize);
+            let (start, end, index_ptr, zero) = (*(d as *const usize), *(d.add(8) as *const usize), *(d.add(16) as *const usize) as *mut u32, *(d.add(32) as *const u32) as usize);
+            let template = std::slice::from_raw_parts(start as *const u8, end.saturating_sub(start));
+            match tlsdll::load_helper_n(template, zero, NEXT_OWNER.fetch_add(1, Ordering::Relaxed)) {
+                Ok(index) => {
+                    *index_ptr = index;
+                    eprintln!("[guest-dll] {name}: static TLS ({} bytes) owned by the loader at index {index}", template.len());
+                }
+                Err(e) => eprintln!("[guest-dll] {name}: static TLS not set up ({e})"),
+            }
+        }
+    }
+    // Registered before the imports are resolved so a cycle finds it.
+    GUEST_DLLS.lock().unwrap().push(GuestDll { base: base as usize, size: size_of_image, entry, exc, name: name.to_string() });
+    let mut arena = StubArena::new();
+    let (real, stubbed) = unsafe { resolve_imports(base, import_dir, dir, &mut arena, false) };
+    std::mem::forget(arena);
+    eprintln!("[guest-dll] {name}: mapped at {:#x}, {real} imports resolved, {stubbed} stubbed", base as usize);
+    base as *mut c_void
+}
+
+/// On the title thread, after bootstrap: unwind tables and `DllMain(DLL_PROCESS_ATTACH)` for each
+/// guest DLL, dependencies first (they were pushed in load order, which is dependencies last, so
+/// the list is walked in reverse).
+unsafe fn init_guest_dlls() {
+    let dlls: Vec<(usize, u32, (u32, u32), String)> =
+        GUEST_DLLS.lock().unwrap().iter().rev().map(|g| (g.base, g.entry, g.exc, g.name.clone())).collect();
+    for (base, entry, exc, name) in dlls {
+        if exc.0 != 0 {
+            RtlAddFunctionTable((base + exc.0 as usize) as *const c_void, exc.1 / 12, base as u64);
+        }
+        if entry != 0 {
+            let dll_main: extern "system" fn(*mut c_void, u32, *mut c_void) -> i32 = std::mem::transmute(base + entry as usize);
+            let ok = dll_main(base as *mut c_void, 1, ptr::null_mut());
+            eprintln!("[guest-dll] {name}: DllMain(DLL_PROCESS_ATTACH) -> {ok}");
+            if std::env::var_os("XB1_PROBE_GUEST").is_some() {
+                let p = (base + 0x7cf70) as *const usize;
+                eprintln!("[guest-dll] probe: [base+0x7cf70] = {:#x}, [+8] = {:#x}", unsafe { *p }, unsafe { *p.add(1) });
+            }
+        }
+    }
+}
+
 /// Prefers a DLL shipped next to the title, then falls back to the system search path.
 fn load_dll(dir: &Path, name: &str) -> *mut c_void {
     // kernelx.dll is the console's kernel API surface; nearly all of its
@@ -1508,6 +1806,12 @@ fn load_dll(dir: &Path, name: &str) -> *mut c_void {
             if !m.is_null() {
                 return m;
             }
+        }
+    }
+    if local.is_file() {
+        let g = load_guest_dll(dir, name);
+        if !g.is_null() {
+            return g;
         }
     }
     let c = CString::new(name).unwrap();
@@ -1609,73 +1913,14 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool, dump_iat: bool) -> Res
     // Imports
     GUEST_HEAP.store(unsafe { HeapCreate(0, 0, 0) } as usize, Ordering::Relaxed);
     let mut arena = StubArena::new();
-    let (mut real, mut stubbed) = (0usize, 0usize);
-    if import_dir.0 != 0 {
-        let mut desc = import_dir.0 as usize;
-        loop {
-            let (oft, name_rva, ft) = unsafe {
-                (
-                    *(base.add(desc) as *const u32),
-                    *(base.add(desc + 12) as *const u32),
-                    *(base.add(desc + 16) as *const u32),
-                )
-            };
-            if name_rva == 0 {
-                break;
-            }
-            let dll = unsafe { cstr_at(base, name_rva) };
-            let module = load_dll(dir, &dll);
-            let lookup = if oft != 0 { oft } else { ft } as usize;
-            let mut i = 0;
-            loop {
-                let thunk = unsafe { *(base.add(lookup + i * 8) as *const u64) };
-                if thunk == 0 {
-                    break;
-                }
-                let (label, cname) = if thunk >> 63 == 1 {
-                    (format!("{dll}!#{}", thunk & 0xFFFF), None)
-                } else {
-                    let n = unsafe { cstr_at(base, (thunk as u32) + 2) };
-                    (format!("{dll}!{n}"), Some(CString::new(n).unwrap()))
-                };
-                let mut addr = cname
-                    .as_ref()
-                    .and_then(|c| override_for(&dll, c.to_str().unwrap_or("")))
-                    .unwrap_or(0) as u64;
-                if addr == 0 && !module.is_null() {
-                    let p = match &cname {
-                        Some(c) => unsafe { GetProcAddress(module, c.as_ptr()) },
-                        None => unsafe { GetProcAddress(module, (thunk & 0xFFFF) as usize as *const i8) },
-                    };
-                    addr = p as u64;
-                }
-                if addr == 0 {
-                    addr = arena.make(label.clone());
-                    stubbed += 1;
-                } else {
-                    real += 1;
-                    if TRACE_API.load(Ordering::Relaxed) {
-                        addr = arena.make_trace(label.clone(), addr);
-                    }
-                }
-                unsafe { *(base.add(ft as usize + i * 8) as *mut u64) = addr };
-                if dump_iat {
-                    println!("iat {:#x} {label}", ft as usize + i * 8);
-                }
-                i += 1;
-            }
-            if module.is_null() {
-                println!("  missing DLL (stubbed): {dll}");
-            }
-            desc += 20;
-        }
-    }
+    let (real, stubbed) = unsafe { resolve_imports(base, import_dir, dir, &mut arena, dump_iat) };
     println!("imports: {real} resolved natively, {stubbed} stubbed");
     if report {
         print_import_report();
     }
 
     if run {
+        map_content_drive(dir);
         // Titles expect a much larger main-thread stack than Rust's default, and the
         // TLS setup in `bootstrap` patches the calling thread's TEB, so do both on a
         // dedicated thread.
@@ -1699,6 +1944,7 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool, dump_iat: bool) -> Res
             .spawn(move || -> Result<u32, String> {
                 TITLE_TID.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
                 unsafe { bootstrap(base_addr as *mut u8, size_of_image, tls_dir, exc_dir)? };
+                unsafe { init_guest_dlls() };
                 println!("jumping to entry point {entry_addr:#x}");
                 let f: extern "system" fn() -> u32 = unsafe { std::mem::transmute(entry_addr) };
                 Ok(f())
@@ -1726,6 +1972,7 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool, dump_iat: bool) -> Res
             process::exit(0);
         }
         let code = worker.join().map_err(|_| "title thread panicked".to_string())??;
+        unmap_content_drive();
         println!("entry returned {code}");
     }
     Ok(())
