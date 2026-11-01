@@ -357,6 +357,21 @@ The folder given for Sonic Mania is a mounted Xbox package: `Mount\Sonic Mania.e
 
 Where it stops: the title now initialises (engine init returns success; audio and device are created), creates its views, enters its main loop and faults inside `IFrameworkView::Run` after a call on the console window object (slot 11), with a crash in `ntdll` (a read of `0x23`, from a call with `rcx=0x76`). Not analysed yet. Nothing is presented yet.
 
+## Sonic Mania: it runs, presents, makes sound, and shows black
+The crash after `IFrameworkView::Run` began was three separate bugs:
+- **A heap overflow of mine.** For the console window's event-add slots the stand-in treated any two aligned pointers as `add_Event(handler, &token)` and wrote an 8-byte token through the second one. Sonic calls slot 11 with a small value there, so the write corrupted the heap and the process died later inside `RtlAllocateHeap` (`ntdll+0x328c7`, found by resolving the nearest export). The token is now written only when the first argument is a real delegate object.
+- **A `LoadLibrary` of XAudio2 inside `Run`.** Loading a DLL with static TLS after the title's threads exist makes ntdll rebuild every thread's TLS vector (the same family of problem as before), so `xaudio2_9.dll` and `x3daudio1_7.dll` are now loaded at start-up, before any title thread exists.
+- **`Present1` with NULL parameters.** The title calls `IDXGISwapChain1::Present1(1, 0, NULL)`; this DXGI build dereferences the parameters unguarded (`mov rax, [r9+0x10]` at `dxgi+0x194d9`), so the swap chain class's `Present1` slot (shared vtable) is patched to substitute an empty `DXGI_PRESENT_PARAMETERS`.
+
+Result: Sonic Mania runs for the full 40 s test, calls `Present1` every frame (sync interval 1) and **plays sound** (reported by the user; the audio goes through the desktop XAudio2 behind the `CreateXAudio2Object` shim). The native window is **black**: nothing visible is drawn.
+
+Why: the game draws through the console's embedded context functions (calls through function pointers stored in the context object), and only a few indices forward to the desktop context. From the arguments of the per-frame calls the console table is not simply the desktop one:
+- indices 10, 11, 12, 14, 15, 16, 18, 19 and 23 match the desktop slots (`PSSetSamplers(0, 1, &s)`, `VSSetShader`, `DrawIndexed(54, ...)`, `PSSetConstantBuffers`, `IASetVertexBuffers(0, 1, &b)`, `IASetIndexBuffer(buffer, fmt, 0)`);
+- index 8 is called as `(pointer, 0, ...)`, which is not `PSSetShaderResources(start, count, views)` (the desktop slot 8); it looks like a shader or resource setter with a pointer first;
+- from index 32 up the console index is one below the desktop one: 32 is `OMSetRenderTargets(1, &rtv, dsv)` (desktop 33), 35 is `OMSetDepthStencilState(state, 1)` (desktop 36), 42 is `RSSetState` (desktop 43), 43 is `RSSetViewports(1, &vp)` (desktop 44);
+- index 53 is `ClearDepthStencilView(dsv, 3, ...)` (flags 3), which is desktop slot 53, not 54, so the console table has one more method somewhere between 49 and 53 than the "one below" rule gives.
+So the mapping has to be built per index from the arguments of real calls, and Sonic Mania is a good source: a small 2D renderer with about eleven different calls per frame. Next step: replace the range-based forwarding with an explicit console-to-desktop table, add the Sonic indices, and check what the screen shows.
+
 ## Tools added
 `--watch-sites=0x...,0x...` plants one-shot breakpoints at title RVAs (report registers, text pointed at by the argument registers, and the title's call chain, then continue); `--watch-repeat` keeps them armed (re-arming by single-step) and prints one compact line per hit for the title's logger; `--patch-fastfail` was added earlier. The device's standard creation methods now log failures with a dump of the description and, for views, the resource's own type and description.
 

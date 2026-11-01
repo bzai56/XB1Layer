@@ -1636,7 +1636,12 @@ extern "system" fn xb_d3d11_create_device(
         unsafe { std::mem::transmute(f) };
     let first = if !levels.is_null() && n_levels > 0 { unsafe { *levels } } else { 0 };
     // The console SDK version (131090) is not a desktop one; D3D11_SDK_VERSION is 7.
+    let debug = std::env::var_os("XB1_D3D_DEBUG").is_some();
+    let flags = if debug { flags | 0x2 } else { flags }; // D3D11_CREATE_DEVICE_DEBUG
     let hr = real(adapter, driver_type, software, flags, levels, n_levels, 7, device, level, context);
+    if debug && hr >= 0 && !device.is_null() {
+        unsafe { gpu::start_debug_pump_raw(*device) };
+    }
     rlog!(
         "[gpu] D3D11CreateDevice(adapter {adapter:p}, driver {driver_type}, flags {flags:#x}, {n_levels} level(s), first {first:#x}, sdk {sdk}) -> {:#x}",
         hr as u32
@@ -1662,6 +1667,18 @@ extern "system" fn xb_create_xaudio2_object(out: *mut *mut c_void, flags: u32, p
     let _ = processor;
     rlog!("[audio] CreateXAudio2Object -> XAudio2Create -> {:#x}", hr as u32);
     hr
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn LoadLibraryW(name: *const u16) -> *mut c_void;
+}
+
+extern "system" fn xb_load_library_w(name: *const u16) -> *mut c_void {
+    let shown = if name.is_null() { String::new() } else { wide_to_string(name) };
+    let r = unsafe { LoadLibraryW(name) };
+    rlog!("[dll] LoadLibraryW({shown}) -> {r:p}");
+    r
 }
 
 /// `GetProcAddress` for the title: names that only exist in console DLLs are redirected.
@@ -1719,6 +1736,8 @@ fn override_for(dll: &str, func: &str) -> Option<usize> {
     match func {
         "GetProcessHeap" => Some(xb_get_process_heap as usize),
         "GetProcAddress" => Some(xb_get_proc_address as usize),
+        "LoadLibraryExW" => Some(xb_load_library_ex_w as usize),
+        "LoadLibraryW" => Some(xb_load_library_w as usize),
         "ExitProcess" => Some(xb_exit_process as usize),
         "TerminateProcess" => Some(xb_terminate_process as usize),
         "HeapAlloc" => Some(xb_heap_alloc as usize),
@@ -2426,6 +2445,12 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool, dump_iat: bool) -> Res
     }
 
     if run {
+        // DLLs with static TLS that the title loads later (on its own threads) make ntdll rebuild every
+        // thread's TLS vector, which crashed inside the loader; loaded now, before any title thread
+        // exists, the later LoadLibrary only bumps a reference count.
+        for name in [c"xaudio2_9.dll", c"x3daudio1_7.dll"] {
+            let _ = unsafe { LoadLibraryA(name.as_ptr()) };
+        }
         map_content_drive(dir);
         // Titles expect a much larger main-thread stack than Rust's default, and the
         // TLS setup in `bootstrap` patches the calling thread's TEB, so do both on a

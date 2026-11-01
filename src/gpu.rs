@@ -1653,6 +1653,15 @@ fn vtable(kind: Kind) -> *const usize {
     }
 }
 
+/// Starts the debug-message pump for a raw real device (XB1_D3D_DEBUG with the plain `D3D11CreateDevice` path).
+pub unsafe fn start_debug_pump_raw(device: *mut c_void) {
+    if device.is_null() {
+        return;
+    }
+    let d: ID3D11Device = unsafe { Interface::from_raw_borrowed(&device) }.cloned().expect("device");
+    spawn_debug_message_pump(d);
+}
+
 /// If `device` is one of the layer's proxy devices, returns the real device behind it.
 pub unsafe fn unwrap_device(device: *mut c_void) -> *mut c_void {
     if device.is_null() {

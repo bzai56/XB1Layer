@@ -852,8 +852,10 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
                     let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(1));
                     add_ref(arg1);
                     WINDOW_HANDLERS.lock().unwrap().push((N, arg1 as usize));
+                    ptr::write_unaligned(arg2 as *mut i64, next_token());
                 }
-                ptr::write_unaligned(arg2 as *mut i64, next_token())
+                // Not a delegate: arg2 may be a small value (a bool or int), and an 8-byte token written
+                // through it overflowed into the heap (Sonic Mania, slot 11).
             },
             _ => {}
         }
