@@ -207,8 +207,34 @@ struct Context([u8; 1232]);
 /// Freezes the title thread and prints where it is: RIP plus any return-address-looking
 /// values on its stack that point into the title.
 fn dump_title_thread() {
+    dump_thread(TITLE_TID.load(Ordering::Relaxed));
+}
+
+/// Samples every thread of the process (a short stack summary each): what is everyone doing?
+fn dump_all_threads() {
     unsafe {
-        let h = OpenThread(0x1F_FFFF, 0, TITLE_TID.load(Ordering::Relaxed));
+        let snap = CreateToolhelp32Snapshot(0x4, 0);
+        if snap as isize == -1 {
+            return;
+        }
+        let mut entry = [0u32; 7];
+        entry[0] = 28;
+        let (me, pid) = (GetCurrentThreadId(), GetCurrentProcessId());
+        let mut ok = Thread32First(snap, entry.as_mut_ptr());
+        while ok != 0 {
+            if entry[3] == pid && entry[2] != me {
+                rlog!("=== thread {}", entry[2]);
+                dump_thread(entry[2]);
+            }
+            ok = Thread32Next(snap, entry.as_mut_ptr());
+        }
+        CloseHandle(snap);
+    }
+}
+
+fn dump_thread(tid: u32) {
+    unsafe {
+        let h = OpenThread(0x1F_FFFF, 0, tid);
         if h.is_null() {
             rlog!("watch: cannot open title thread");
             return;
@@ -2329,7 +2355,11 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool, dump_iat: bool) -> Res
             }
             std::thread::sleep(std::time::Duration::from_secs(watch as u64));
             eprintln!("watch: dumping title thread {}", TITLE_TID.load(Ordering::Relaxed));
-            dump_title_thread();
+            if std::env::var_os("XB1_ALL_THREADS").is_some() {
+                dump_all_threads();
+            } else {
+                dump_title_thread();
+            }
             process::exit(0);
         }
         let code = worker.join().map_err(|_| "title thread panicked".to_string())??;
