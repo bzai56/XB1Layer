@@ -2,7 +2,16 @@
 
 The goal is a layer that runs many Xbox One titles on Windows x64 without graphical glitches. Today nothing is drawn. Details of each item are in [FINDINGS.md](FINDINGS.md).
 
-## Next up (in order)
+**Focus: Sonic Mania.** It is far simpler than the Forza Horizon 3 kiosk demo (plain D3D11 device, about eleven context calls a frame, XAudio2), so it is the vehicle for the first real picture. The Forza items below are parked until Sonic Mania renders.
+
+## Next up: Sonic Mania (in order)
+
+1. **Explicit console-to-desktop context call table.** Replace range-based forwarding of the embedded context functions with a per-index `(console, desktop)` list built from observed call arguments (indices 8, 10, 12, 16, 18, 19, 32, 35, 42, 43, 53 are evidenced so far).
+2. **First picture.** Run Sonic Mania and get the title's 2D scene into the window.
+3. **Hunt glitches.** Compare with the expected output, fix formats, blending, sampling and de-tiling that look wrong.
+4. **Input.** Gamepad and keyboard so the game can be played.
+
+## Parked: Forza Horizon 3 kiosk demo
 
 1. **Get the title to render.** It boots into its main loop and stays there but never draws or presents. Find what its loading screens wait on (the `CPresentation` readiness flag, window events the shell never raises, the database gate in FINDINGS). Until it renders there are no draw packets to decode.
 2. **Remove the startup gaps.** The test title now stops on a different Xbox stand-in gap from run to run, before its first present. Each gap is a console WinRT method whose shape was guessed wrong; fix them from the call sites until the title reaches its first present.

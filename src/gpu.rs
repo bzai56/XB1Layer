@@ -155,6 +155,16 @@ const EMBED_SHIFTED_TO: usize = 63;
 /// showed the rest of 34 to 63 receiving garbage (`RSSetViewports`, `ExecuteCommandList`).
 const EMBED_VERIFIED_SHIFTED: [usize; 5] = [34, 46, 49, 59, 63];
 
+/// Explicit `(console index, desktop slot)` pairs seen in Sonic Mania's per-frame calls (arguments
+/// logged, not guessed): 8 is called as (shader, 0, ...) so it is `PSSetShader` (desktop 9);
+/// 10 `PSSetSamplers(0,1,&s)`, 12 `DrawIndexed(54,..)`, 16 `PSSetConstantBuffers`,
+/// 18 `IASetVertexBuffers(0,1,&b)`, 19 `IASetIndexBuffer(buf,fmt,0)`; from 32 the console index is
+/// one behind: 32 `OMSetRenderTargets(1,&rtv,dsv)`, 35 `OMSetDepthStencilState(state,1)`,
+/// 42 `RSSetState`, 43 `RSSetViewports(1,&vp)`; console 52 (offset +0x580) is
+/// `ClearDepthStencilView(dsv,3,..)` = desktop 53, so the shift is a constant one from 32 on.
+const EMBED_EXTRA: [(usize, usize); 11] =
+    [(8, 9), (10, 10), (12, 12), (16, 16), (18, 18), (19, 19), (32, 33), (35, 36), (42, 43), (43, 44), (52, 53)];
+
 /// `(embedded index, entry)` pairs that forward to the real context. Built once.
 fn forwarded_entries() -> &'static Vec<(usize, usize)> {
     static ENTRIES: OnceLock<Vec<(usize, usize)>> = OnceLock::new();
@@ -187,6 +197,10 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
                 continue;
             }
             let thunk = forward_context_thunk(unsafe { thunks.add((64 + console_slot - EMBED_SHIFTED_FROM) * 32) }, console_slot + 1);
+            v.push((index_of(EMBED_TABLE + console_slot * 8), thunk));
+        }
+        for (console_slot, desktop_slot) in EMBED_EXTRA {
+            let thunk = forward_context_thunk(unsafe { thunks.add((128 + console_slot) * 32) }, desktop_slot);
             v.push((index_of(EMBED_TABLE + console_slot * 8), thunk));
         }
         // Draws and dispatches first mirror the placement buffers (see sync_before_draw).

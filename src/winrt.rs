@@ -29,6 +29,18 @@ macro_rules! wlog {
     ($($t:tt)*) => { crate::raw_log(format_args!($($t)*)) };
 }
 
+/// Like `wlog!`, but only the first 20 calls from this site and then each power of two, so calls
+/// a title makes every frame do not flood the log.
+macro_rules! wlog_rare {
+    ($($t:tt)*) => {{
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 20 || n.is_power_of_two() {
+            crate::raw_log(format_args!($($t)*))
+        }
+    }};
+}
+
 unsafe extern "system" {
     fn GetCurrentThreadId() -> u32;
 }
@@ -302,7 +314,7 @@ impl Iface for CoreWindowStaticsTag {
 }
 
 unsafe extern "system" fn core_window_for_current_thread(_this: *mut c_void, out: *mut *mut c_void) -> HRESULT {
-    wlog!("[winrt] CoreWindow::GetForCurrentThread");
+    wlog_rare!("[winrt] CoreWindow::GetForCurrentThread");
     // The console-layout window: titles call slot 7 expecting the dispatcher (the desktop layout has
     // Bounds there).
     unsafe { *out = generic_add_ref_ret(shell().console_window) };
@@ -859,7 +871,7 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
             },
             _ => {}
         }
-        wlog!("[winrt] console CoreWindow slot {N} called (arg1={arg1:p}, arg2={arg2:p}) -> S_OK");
+        wlog_rare!("[winrt] console CoreWindow slot {N} called (arg1={arg1:p}, arg2={arg2:p}) -> S_OK");
         return HRESULT(0);
     }
     if o.kind == 1 {
@@ -1309,7 +1321,7 @@ pub fn try_activation_factory(class: &str, iid: &GUID, out: *mut *mut c_void) ->
         let obj = Com::<CoreWindowStaticsTag>::create(());
         let hr = unsafe { com_query_interface::<CoreWindowStaticsTag>(obj, iid, out) };
         unsafe { com_release::<CoreWindowStaticsTag>(obj) };
-        wlog!("[winrt] CoreWindow statics: iid={iid:?} -> {:#x}", hr.0 as u32);
+        wlog_rare!("[winrt] CoreWindow statics: iid={iid:?} -> {:#x}", hr.0 as u32);
         return Some(hr);
     }
     if class != CoreAppTag::NAME {

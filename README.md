@@ -2,9 +2,9 @@
 
 An experimental compatibility layer for running Xbox One (GDK/XDK "Durango") x64 titles on Windows x64.
 
-**The aim is to be compatible with a wide range of Xbox One games**, not one title. The Forza Horizon 3 kiosk demo is only the first test case, used to find out what the console APIs need; anything specific to it is a stand-in to be replaced by a general implementation.
+**The aim is to be compatible with a wide range of Xbox One games**, not one title. The Forza Horizon 3 kiosk demo was the first test case, used to find out what the console APIs need; anything specific to it is a stand-in to be replaced by a general implementation. **Development now focuses on Sonic Mania**, a much simpler title (plain D3D11 2D renderer, XAudio2), to get the first real picture; Forza Horizon 3 is parked until then.
 
-**Status: early prototype. Nothing is drawn yet.** It loads and starts an unpacked Xbox One title (the Forza Horizon 3 kiosk demo is the current test case), runs it through startup into its main loop, and gives it a desktop Direct3D 11 device. The title writes its GPU work as console command packets that are not decoded yet, and there is no swap chain or window, so there is no picture. The goal is a layer that runs titles without graphical glitches; it is not there.
+**Status: early prototype. Nothing is drawn yet.** It loads and starts unpacked Xbox One titles and runs them through startup into their main loop. Sonic Mania runs, presents every frame to a native window and plays sound, but the window is still black: the title draws through console context functions that are only partly mapped to the desktop D3D11 context. Forza Horizon 3 boots into its main loop but never presents. The goal is a layer that runs titles without graphical glitches; it is not there.
 
 ## What works
 - Manual PE64 mapping (headers, sections, base relocations)
@@ -50,7 +50,7 @@ Run a title from its own folder so relative paths resolve.
 [MIT](LICENSE).
 
 ## Contributing
-Contributions are welcome. The biggest open problem is decoding the console GPU command packets (see the [Roadmap](docs/ROADMAP.md)); reports of what other titles need are useful too.
+Contributions are welcome. The biggest open problem is mapping the console's embedded context functions (and, for Forza, its GPU command packets) to desktop D3D11 (see the [Roadmap](docs/ROADMAP.md)); reports of what other titles need are useful too.
 
 ## Docs
 - [Architecture](docs/ARCHITECTURE.md)
