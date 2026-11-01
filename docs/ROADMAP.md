@@ -9,7 +9,9 @@
 3d. **`G:` content root**: map the title folder as the game-content drive.
 3e. ~~`XMem*` and `TitleMemoryStatus`~~ Done, with undecoded attributes and a guessed status layout.
 3f. **`Windows.Xbox.*` classes**: replace the generic stand-in with real implementations, starting with `PackageTransferManager`. Needs the real interface shapes.
-3g. **Find the failing `QueryInterface`** at `title+0x1616fd1` that the FH3 demo hits after the stand-in loop.
+3g. ~~**Find the failing `QueryInterface`**~~ Done: the console audio extension of `MMDeviceEnumerator`, now proxied.
+3h. ~~`D3D11XCreateDeviceX`~~ First version done (plain desktop device). Remaining: `ID3D11DeviceX`/`ID3D11DeviceContextX` extensions, `DXGIX*` functions, swap chain on a real window.
+3i. **NULL read at `title+0x156fab7`** in `IFrameworkView::Run` after `CoreWindow::Bounds`.
 4. **`kernelx` shim**: real implementations of the most-called functions, driven by stub-hit logs.
 5. **`xg_x` and `EtwPlus`**: resource-layout helpers and no-op tracing.
 6. **GPU**: `d3d11_x` onto desktop D3D11, then D3D12.X for newer titles.

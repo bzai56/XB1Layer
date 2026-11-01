@@ -44,6 +44,12 @@ Objects behind that lifecycle: a `CoreApplicationView` (`ICoreApplicationView`),
 
 **Generic stand-in for console-only classes.** There is no metadata for `Windows.Xbox.*`, so its interfaces are unknown. The stand-in answers `QueryInterface` for any IID with itself and logs each method call by vtable slot. If the first argument looks like writable memory it stores a new stand-in there and returns success; otherwise it returns success without writing anything. This is a discovery aid that fakes behavior, not an implementation.
 
+### Graphics (`src/gpu.rs`)
+`D3D11XCreateDeviceX(params, &device, &context)` is overridden to call desktop `D3D11CreateDevice` (hardware, feature levels 11.1 then 11.0, BGRA support) and return the device and context. The console's parameter struct is logged (first 64 bytes) and otherwise ignored, and its flags are not forwarded. This is a plain desktop device: the console's extended interfaces (`ID3D11DeviceX`, `ID3D11DeviceContextX`) are not provided, nor are the `DXGIX*` functions (`DXGIXPresentArray` is still a stub). `xb1layer --test-d3d` creates a device without loading a title.
+
+### MMDevice enumerator proxy
+`CoCreateInstance` is overridden. When the title creates `CLSID_MMDeviceEnumerator`, the result is wrapped in a forwarding proxy (`IMMDeviceEnumerator`, 5 methods) that answers the console-only IID `8B557ADC-555E-47A0-B223-43477E481DAD` with a stand-in: slot 8 reports two zero 32-bit values, slot 9 accepts a pointer to the caller's own object. Anything else is forwarded to the real object.
+
 ### Console memory API
 `XMemAlloc`/`XMemAllocDefault`/`XMemFree`/`XMemFreeDefault` allocate whole pages aligned to 64 KB; the attribute bits (alignment, memory type) are not decoded. `XMemSetAllocationHooks` is accepted and ignored. `TitleMemoryStatus` zero-fills the caller's struct and reports 5 GiB total / 4.5 GiB available at offsets 8 and 16; that layout is a guess.
 

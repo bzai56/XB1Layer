@@ -7,6 +7,7 @@
 //!
 //! Usage: xb1layer <file.exe> [--run]
 
+mod gpu;
 mod winrt;
 
 use std::collections::{BTreeMap, HashSet};
@@ -575,6 +576,9 @@ fn override_for(dll: &str, func: &str) -> Option<usize> {
     if dll.eq_ignore_ascii_case("vccorlib140.dll") && func.starts_with("?GetActivationFactoryByPCWSTR") {
         return Some(xb_get_activation_factory as usize);
     }
+    if dll.eq_ignore_ascii_case("d3d11_x.dll") && func == "D3D11XCreateDeviceX" {
+        return Some(gpu::create_device_x as usize);
+    }
     if func == "CoCreateInstance" {
         return Some(xb_co_create_instance as usize);
     }
@@ -1024,6 +1028,13 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool, dump_iat: bool) -> Res
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--test-d3d") {
+        // Exercises the D3D11.X -> desktop D3D11 device creation without loading a title.
+        let (mut dev, mut ctx) = (ptr::null_mut(), ptr::null_mut());
+        let hr = gpu::create_device_x(ptr::null(), &mut dev, &mut ctx);
+        println!("D3D11XCreateDeviceX -> hr={:#x} device={dev:p} context={ctx:p}", hr as u32);
+        process::exit(if hr == 0 && !dev.is_null() && !ctx.is_null() { 0 } else { 1 });
+    }
     let Some(path) = args.iter().find(|a| !a.starts_with("--")) else {
         eprintln!("usage: xb1layer <file.exe> [--run] [--imports]");
         process::exit(2);

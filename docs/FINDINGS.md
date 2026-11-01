@@ -84,9 +84,17 @@ With that in place the lifecycle goes much further: `Initialize` returns, then `
 
 Two more console-only interfaces are requested from the `CoreApplication` factory, `9FF3799E-6E83-468C-A5B0-501CE6BB0FA1` and `42A6A529-3CC6-4867-B5B7-6D1FAF5325F9`. Neither is in the Windows metadata. The title handles `E_NOINTERFACE` for them. Answering them with the generic stand-in made things worse (the title called a returned pointer as code and jumped to address `0x47`), so they stay unimplemented. This also shows the limit of the generic stand-in: its "write a new object into the first out-pointer" guess is wrong for some methods.
 
+## Graphics device and the next fault
+`D3D11XCreateDeviceX` now creates a real desktop D3D11 hardware device (feature level 11.1, checked with `xb1layer --test-d3d`) and returns it with its immediate context. The title's parameter struct starts with `0x00020011` (looks like a version) and `0x04000000` (a flags word with a console-only bit that desktop D3D11 would reject, so flags are not forwarded). The rest of the first 64 bytes is mostly zeros and a few pointers. Its meaning is not decoded.
+
+The title calls this on a worker thread. Meanwhile the UI thread, inside `IFrameworkView::Run`, calls `CoreWindow::Bounds` and then reads through a NULL pointer at `title+0x156fab7`. The code there calls vtable slot 7 on a COM object with a pointer to a two-field local, expects a result back in that local, and then dereferences it. It is next to a `Platform::WeakReference` resolve (`vccorlib140!ResolveWeakReference` is the last WinRT call in the trace). Which object that is, and what it should return, is not known. Because the process dies on that thread, the log of the device creation finishing never prints in a title run, so completion is only verified by the standalone test.
+
+**What is established:** device creation works in isolation. **What is not:** whether the title accepts a plain desktop device (it will likely call console-only `ID3D11DeviceX` methods and `DXGIX*` functions), and what the NULL read depends on.
+
 ## Next investigation steps
-1. Implement `D3D11XCreateDeviceX` (and `DXGIXSetVLineNotification`) on top of desktop D3D11. This is the next real wall.
-2. Work out the real shape of the `PackageTransferManager` interfaces, from the title's own usage or from the console SDK's published API reference if available, and implement them for real.
+1. Find out which object the NULL read at `title+0x156fab7` goes through (its slot-7 call returns nothing).
+2. Implement `DXGIXSetVLineNotification`, `DXGIXPresentArray` and any other `DXGIX*` the title uses.
+3. Work out the real shape of the `PackageTransferManager` interfaces, from the title's own usage or from the console SDK's published API reference if available, and implement them for real.
 3. Implement `DXGIXSetVLineNotification` and the rest of the `d3d11_x` surface.
 4. Provide a `G:` equivalent: map the title folder as the content root instead of relying on the working directory.
 5. Inspect `media/` to see whether content is plain or encrypted (encrypted content is out of scope).
