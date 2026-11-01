@@ -311,6 +311,51 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                         "  rax={:#x} rcx={:#x} rdx={:#x} rbx={:#x} rsi={:#x} rdi={:#x} r8={:#x} r9={:#x}",
                         reg(0x78), reg(0x80), reg(0x88), reg(0x90), reg(0xA8), reg(0xB0), reg(0xB8), reg(0xC0)
                     );
+                    // XB1_PEEK="r13+0x24de:8;r15+0x230:2": memory at register+offset (hex bytes), for
+                    // reading object fields at a watch site.
+                    if let Some(spec) = PEEK_SPEC.get() {
+                        for item in spec.split(';') {
+                            let Some((target, len)) = item.split_once(':') else { continue };
+                            let Some((rname, off)) = target.split_once('+') else { continue };
+                            let slot = match rname {
+                                "rax" => 0x78, "rcx" => 0x80, "rdx" => 0x88, "rbx" => 0x90, "rsi" => 0xA8, "rdi" => 0xB0,
+                                "r8" => 0xB8, "r9" => 0xC0, "r10" => 0xC8, "r11" => 0xD0, "r12" => 0xD8, "r13" => 0xE0,
+                                "r14" => 0xE8, "r15" => 0xF0, _ => continue,
+                            };
+                            let off = usize::from_str_radix(off.trim_start_matches("0x"), 16).unwrap_or(0);
+                            let len = len.parse::<usize>().unwrap_or(8).min(32);
+                            let p = (reg(slot) as usize).wrapping_add(off);
+                            let mut buf = [0u8; 32];
+                            let mut got = 0usize;
+                            if ReadProcessMemory(GetCurrentProcess(), p as *const c_void, buf.as_mut_ptr() as *mut c_void, len, &mut got) != 0 {
+                                let mut line = RawBuf::new();
+                                for b in &buf[..got] {
+                                    use std::fmt::Write;
+                                    let _ = write!(line, "{b:02x} ");
+                                }
+                                rlog!("  peek {item} = {}", line.as_str());
+                            } else {
+                                rlog!("  peek {item} unreadable at {p:#x}");
+                            }
+                        }
+                    }
+                    // XB1_POKE="r13+0x3224=1": experiment only, writes one byte at register+offset.
+                    if let Some(spec) = POKE_SPEC.get() {
+                        for item in spec.split(';') {
+                            let Some((target, val)) = item.split_once('=') else { continue };
+                            let Some((rname, off)) = target.split_once('+') else { continue };
+                            let slot = match rname {
+                                "rax" => 0x78, "rcx" => 0x80, "rdx" => 0x88, "rbx" => 0x90, "rsi" => 0xA8, "rdi" => 0xB0,
+                                "r8" => 0xB8, "r9" => 0xC0, "r10" => 0xC8, "r11" => 0xD0, "r12" => 0xD8, "r13" => 0xE0,
+                                "r14" => 0xE8, "r15" => 0xF0, _ => continue,
+                            };
+                            let off = usize::from_str_radix(off.trim_start_matches("0x"), 16).unwrap_or(0);
+                            let v = u8::from_str_radix(val.trim_start_matches("0x"), 16).unwrap_or(0);
+                            let p = (reg(slot) as usize).wrapping_add(off) as *mut u8;
+                            *p = v;
+                            rlog!("  poked {item}");
+                        }
+                    }
                     let rsp = reg(0x98) as usize;
                     // Any readable text the argument registers and the fifth stack argument point at.
                     let text_at = |p: u64| -> Option<([u8; 160], usize)> {
@@ -706,6 +751,12 @@ unsafe fn bootstrap(base: *mut u8, size: usize, tls: (u32, u32), exc: (u32, u32)
     IMG_BASE.store(base as usize, Ordering::Relaxed);
     IMG_SIZE.store(size, Ordering::Relaxed);
     AddVectoredExceptionHandler(1, crash_logger);
+    if let Ok(spec) = std::env::var("XB1_POKE") {
+        let _ = POKE_SPEC.set(spec);
+    }
+    if let Ok(spec) = std::env::var("XB1_PEEK") {
+        let _ = PEEK_SPEC.set(spec);
+    }
     FILES_TO_STDERR.store(std::env::var_os("XB1_FILES").is_some(), Ordering::Relaxed);
     BACKTRACE_ON_CRASH.store(std::env::var_os("XB1_BT").is_some(), Ordering::Relaxed);
     hook_nt_terminate();
@@ -990,6 +1041,8 @@ extern "system" fn xb_get_process_heap() -> *mut c_void {
 }
 
 /// The folder `G:` was mapped to (so the mapping can be removed again), if this process made one.
+static POKE_SPEC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static PEEK_SPEC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static FILES_TO_STDERR: AtomicBool = AtomicBool::new(false);
 static BACKTRACE_ON_CRASH: AtomicBool = AtomicBool::new(false);
 

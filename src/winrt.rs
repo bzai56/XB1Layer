@@ -272,6 +272,14 @@ fn run_view(source: &IFrameworkViewSource) -> Result<()> {
     wlog!("[winrt] IFrameworkViewSource::CreateView ok");
     let app_view: CoreApplicationView = unsafe { ICoreApplicationView::from_raw_borrowed(&sh.view) }.unwrap().cast()?;
 
+    {
+        use windows_core::Interface;
+        let vtbl = unsafe { *(view.as_raw() as *const *const usize) };
+        let names = ["Initialize", "SetWindow", "Load", "Run", "Uninitialize"];
+        for (i, n) in names.iter().enumerate() {
+            wlog!("[winrt] title IFrameworkView::{n} = {:#x}", unsafe { *vtbl.add(6 + i) });
+        }
+    }
     wlog!("[winrt] IFrameworkView::Initialize");
     view.Initialize(&app_view)?;
     let window: CoreWindow = unsafe { CoreWindow::from_raw_borrowed(&sh.console_window) }.unwrap().clone();
@@ -285,6 +293,11 @@ fn run_view(source: &IFrameworkViewSource) -> Result<()> {
     let handlers: Vec<_> = sh.activated.lock().unwrap().iter().map(|(_, h)| h.clone()).collect();
     wlog!("[winrt] raising CoreApplicationView::Activated to {} handler(s)", handlers.len());
     for h in handlers {
+        {
+            use windows_core::Interface;
+            let vtbl = unsafe { *(h.as_raw() as *const *const usize) };
+            wlog!("[winrt] Activated handler Invoke = {:#x}", unsafe { *vtbl.add(3) });
+        }
         h.Invoke(&app_view, &args)?;
     }
 
