@@ -202,18 +202,43 @@ The NULL read at `title+0xe6319c` is in a small helper (`GetX(out)`: `*out = NUL
 - The console CoreWindow stand-in treated vtable slot 3 as `IInspectable::GetIids` and wrote through its arguments. The title calls slot 3 with non-pointers, a misaligned write panicked in the debug build, and the abort showed up as exit code `0xC0000409` (identical to a real fast-fail). The console window now has its own vtable where slots 3 to 5 are logging slots. Some earlier "fast-fail" endings may have been this.
 - A tool for real fast-fails: `--patch-fastfail` replaces the compiler's `mov ecx, code; int 0x29` sequences with a breakpoint, so the crash logger reports the site and the code. Only one such site exists in the image, and it was not reached in the runs checked.
 
+## The NULL object, found
+The NULL read was the title using the result of a failed resource load. Following it back:
+1. The crash was in a helper called with a NULL `this`. Its caller is a lock-and-acquire function (`0x140389F00`) that returns a pointer to a member of a resource wrapper only if the wrapper's state check passes. The wrapper keeps two state bytes at `+0x34`/`+0x35`; `4` means ready and `6` means failed. The caller ignores the failure and uses the NULL.
+2. Only two places in the whole title store `6` into that byte. A one-shot watchpoint on them fired, and the code just before it logs an error through the title's own logger at `0x1416DDB90` with a file, a line and a message.
+3. A repeating watchpoint on that logger (`--watch-sites=0x16DDB90 --watch-repeat`) printed the title's own messages: `ResourceManager.cpp:835: Failed to load Create(worldrender) (Texture Resources)`, and the same for **`worlddepthdsv`**, **`finaltemp`** and **`velocity`**. These are the main render targets and depth buffer.
+4. Logging the device's standard creation calls (they are forwarded to desktop D3D11, and used to fail silently) showed why: `CreateTexture2D` and `CreateBuffer` failed with `E_INVALIDARG` because the console descriptions carry console-only `MiscFlags` bits (`0x20000` on the render targets, `0x20020` on a buffer: a valid raw-view bit plus `0x20000`). Those standard methods now mask the flags the same way the placement methods do.
+5. View creation then failed on resources whose descriptions the console accepts but desktop D3D rejects: shader-resource views on multisampled (4x) render textures with a plain 2D view dimension, some descriptions that are all zeros. A fallback retries with no description, which lets D3D derive the view from the resource; those retries succeed.
+
+After these fixes the title no longer marks those resources failed, and the NULL read is gone.
+
+## Console methods on resources
+A resource the title creates is called through methods a desktop resource does not have. First seen: `call [rax+0x68]` (vtable slot 13) on a 2D texture, which reads two dwords that the title stores as the texture size. A desktop texture's vtable has only 11 slots, so the call read past the end and crashed inside `d3d11.dll`. Each created resource now gets an extended copy of its vtable (the 11 real entries, argument-logging stubs after them, slot 13 returning width and height from the real `GetDesc`) and its object's vtable pointer is redirected to it. Desktop D3D11 accepts the patched objects (checked: a patched buffer still copies correctly and creation and view calls work). Slot 13 reported `1920x1080`.
+
+## The title writes GPU command packets itself
+The next fault was in code like this: load a cursor from `[ctx+0x50]`, compare with an end at `[ctx+0x58]`, call `[ctx+0xA68]` to get more space if full, then write a packet header `((n + 0x35A) << 5) | 0x70000` and 36 bytes of payload at the cursor and advance it. So the title does not draw through functions: **it emits packets into a command buffer that lives in the context object**, and the console GPU consumes them. This is why none of the draw and dispatch hooks ever fired.
+
+It also showed a mistake in my earlier stub fill. Only the context object's offsets from `0x3E0` up are function pointers; the fields below that are data (cursor, end, flags such as `+0x168`, `+0x180`, `+0x390`). Filling them with stub pointers made the title write packets into my stub memory. Only offsets from `0x3E0` are stubs now, and each context proxy owns a 4 MB command buffer with the cursor and end set and a `+0xA68` function that logs the flush and resets the cursor. The packets are not interpreted yet: they are discarded on flush.
+
+**This is the core of the remaining work.** To draw anything, the layer has to decode the title's packet stream (draw, state, resource binding, clears, copies) and turn it into desktop D3D11 calls, or the equivalent. The packet format is not documented here; it has to be worked out from the stream itself. The dump at each flush (`[gpu] command buffer flush #n`) is the starting point.
+
+## The `Users` list
+With the above, the run stayed up for 40 seconds, producing 150,000 lines. The title was polling `Windows.Xbox.System.User`: the statics' slot 9 returns the `Users` list, an `IVectorView<User>` (`GetAt` at slot 6, `get_Size` at slot 7). My generic stand-in treated slot 7's output as a pointer and wrote an object address into the size, so the title believed it had about 20,000 users and looped over them. A vector-view stand-in now returns size 1 with a generic element for each index. The loop is gone. The single user element has none of a user's real methods, and the title faults calling it (`title+0x16f244f`, `rcx` is a generic stand-in).
+
 ## Where the run ends now
-The title creates its textures and drives the real context (copies, clears, blend state), its main loop runs, and then a thread reads a NULL pointer at `title+0xe6319c`, in code that is not graphics-specific (`[rdi+0x50]` with `rdi=0`). What object is missing there is not known.
+The title runs and its state is mostly set up, then it faults either in the user stand-in (above) or occasionally inside the GPU driver's own worker thread (`nvwgf2umx.dll`), which means something handed to Direct3D is corrupting driver state. That second fault is not understood.
+
+## Tools added
+`--watch-sites=0x...,0x...` plants one-shot breakpoints at title RVAs (report registers, text pointed at by the argument registers, and the title's call chain, then continue); `--watch-repeat` keeps them armed (re-arming by single-step) and prints one compact line per hit for the title's logger; `--patch-fastfail` was added earlier. The device's standard creation methods now log failures with a dump of the description and, for views, the resource's own type and description.
 
 ## Next investigation steps
-1. Find out what the NULL read at `title+0xe6319c` depends on.
-2. Decode device extension slot 73 (probably a texture view) and context `+0x4e0` and `+0xA08`; find the console-only interface `DFDBA067-...` and the NULL object behind the NULL read.
-3. Find which of desktop context slots 24 to 34 the console table lacks.
-4. Work out what slot 7 of `42A6A529` is (it takes a small value `1`).
-5. Pin down the console `ICoreWindow` layout: keep logging slots as the title uses more of them, and keep stand-in behavior per slot only where the call pattern justifies it.
-6. Implement `DXGIXSetVLineNotification`, `DXGIXPresentArray` and any other `DXGIX*` the title uses.
-7. Work out the real shape of the `PackageTransferManager` interfaces, from the title's own usage or from the console SDK's published API reference if available, and implement them for real.
-8. Provide a `G:` equivalent: map the title folder as the content root instead of relying on the working directory.
-
-9. Inspect `media/` to see whether content is plain or encrypted (encrypted content is out of scope).
+1. Decode the command packet stream (the flush dumps), starting with the packet header layout and the common opcodes.
+2. Give the Xbox `User` element real methods (gamertag, user ID, signed-in state), decoded from the title's use.
+3. Find what corrupts the GPU driver's thread.
+4. Texture data: decode the console tiling and mirror placement textures.
+5. The remaining decoding tasks listed earlier (`+0xA08`, `+0x4e0`, which context slot the console table lacks).
+6. Pin down
+7. Implement `DXGIXSetVLineNotification`, `DXGIXPresentArray` and the display/swap-chain path (the title's render-target view creation still fails once on a NULL back buffer).
+8. Work out the real shape of the `PackageTransferManager` interfaces and the `42A6A529` / `9FF3799E` `CoreApplication` extensions.
+9. Provide a `G:` equivalent and inspect `media/` (encrypted content is out of scope).
 10. Back the window with a native `HWND` and raise `CoreWindow` events.

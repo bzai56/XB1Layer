@@ -57,7 +57,14 @@ const EMBED_BASE: usize = 0x18;
 /// offsets such as 0x438, 0x498, 0x5B8, 0x5D8 and 0xA08, and also reads and writes state
 /// fields (0x168, 0x180, 0x390) in the same object, so every slot is filled; a slot that is
 /// really data just holds a harmless pointer value.
-const EMBED_FILL_FROM: usize = 0x18;
+const EMBED_FILL_FROM: usize = 0x3E0;
+
+/// The context object's command-buffer cursor and end fields (title code writes GPU command
+/// packets at the cursor and calls `+0xA68` for more space when it reaches the end).
+const CMD_CURSOR: usize = 0x50;
+const CMD_END: usize = 0x58;
+const CMD_GROW: usize = 0xA68;
+const CMD_BUFFER_BYTES: usize = 4 << 20;
 
 /// A proxy for a desktop D3D11 device or context. The forwarding thunks read `real` at offset 8.
 ///
@@ -72,6 +79,25 @@ struct Proxy {
     refs: AtomicU32,
     kind: Kind,
     embedded: [usize; EMBED_SLOTS],
+    /// Start of this context's command buffer (contexts only).
+    cmd_base: usize,
+}
+
+static CMD_FLUSHES: AtomicU32 = AtomicU32::new(0);
+
+/// `+0xA68`: called when the title has filled the command buffer. For now the contents are
+/// logged (the first flushes, with a dump of the first bytes) and the cursor is reset to the
+/// start, which discards the packets; interpreting them is the next step.
+unsafe extern "system" fn context_grow_command_buffer(this: *mut c_void) -> usize {
+    let p = unsafe { &mut *(this as *mut Proxy) };
+    let cursor = p.embedded[(CMD_CURSOR - EMBED_BASE) / 8];
+    let used = cursor.saturating_sub(p.cmd_base);
+    let n = CMD_FLUSHES.fetch_add(1, Ordering::Relaxed);
+    if n < 4 {
+        glog!("[gpu] command buffer flush #{n}: {used} bytes at {:#x}; first bytes: {}", p.cmd_base, safe_dump(p.cmd_base as u64, 96));
+    }
+    p.embedded[(CMD_CURSOR - EMBED_BASE) / 8] = p.cmd_base;
+    p.cmd_base
 }
 
 /// Offset in the context object where the title's calls suggest a copy of the desktop
@@ -160,6 +186,14 @@ fn new_proxy(real: *mut c_void, kind: Kind) -> *mut Proxy {
             for (index, entry) in forwarded_entries() {
                 (*p).embedded[*index] = *entry;
             }
+            // A command buffer for the packets the title writes into the context, and the
+            // function it calls when the buffer is full.
+            let buffer = VirtualAlloc(ptr::null_mut(), CMD_BUFFER_BYTES, 0x3000, 0x04) as usize;
+            assert!(buffer != 0, "command buffer allocation failed");
+            (*p).cmd_base = buffer;
+            (*p).embedded[(CMD_CURSOR - EMBED_BASE) / 8] = buffer;
+            (*p).embedded[(CMD_END - EMBED_BASE) / 8] = buffer + CMD_BUFFER_BYTES;
+            (*p).embedded[(CMD_GROW - EMBED_BASE) / 8] = context_grow_command_buffer as usize;
         }
     }
     p
@@ -612,6 +646,7 @@ unsafe fn create_placement_texture(
     let hr = unsafe { real_create_texture(p.real, desktop_create_slot, desktop.as_ptr() as *const u8, &mut texture) };
     if hr.0 >= 0 && !texture.is_null() {
         glog!("[gpu] device slot {which}: created a desktop texture {texture:p}");
+        extend_resource(texture, desktop_create_slot == 5);
         if !out.is_null() {
             unsafe { *out = texture };
         }
@@ -720,6 +755,247 @@ fn synced_forward_thunk(mem: *mut u8, slot: usize) -> usize {
     mem as usize
 }
 
+// ---------------------------------------------------------------------------------------
+// Logged forwarding of the device's standard creation methods
+// ---------------------------------------------------------------------------------------
+
+const LOGGED_CREATE_NAMES: [(usize, &str); 7] = [
+    (3, "CreateBuffer"),
+    (5, "CreateTexture2D"),
+    (6, "CreateTexture3D"),
+    (7, "CreateShaderResourceView"),
+    (8, "CreateUnorderedAccessView"),
+    (9, "CreateRenderTargetView"),
+    (10, "CreateDepthStencilView"),
+];
+
+/// Called after a logged creation call. `rdx` and `r8` are the first two arguments after `this`
+/// (a description and, depending on the method, a resource or initial data).
+extern "system" fn creation_result(result: u64, a2: u64, a3: u64, which: u64) {
+    let hr = result as u32 as i32;
+    if hr >= 0 {
+        return;
+    }
+    static FAILURES: AtomicU32 = AtomicU32::new(0);
+    let n = FAILURES.fetch_add(1, Ordering::Relaxed);
+    if n >= 40 {
+        return;
+    }
+    let name = LOGGED_CREATE_NAMES.iter().find(|(s, _)| *s as u64 == which).map(|(_, n)| *n).unwrap_or("?");
+    glog!("[gpu] {name} FAILED hr={:#x}: a2 = {} | a3 = {}", hr as u32, safe_dump(a2, 64), safe_dump(a3, 16));
+    // For the view creators, `a2` is the resource: ask it what it is.
+    if (7..=10).contains(&(which as usize)) && a2 > 0x10000 {
+        let vtbl = unsafe { *(a2 as *const *const usize) };
+        let mut got = 0usize;
+        let mut v = 0usize;
+        if unsafe { ReadProcessMemory(GetCurrentProcess(), vtbl as *const c_void, &mut v as *mut usize as *mut c_void, 8, &mut got) } != 0 && got == 8 {
+            // ID3D11Resource::GetType (slot 7) returns the dimension: 1 buffer, 2 tex1d, 3 tex2d, 4 tex3d.
+            let get_type: unsafe extern "system" fn(*mut c_void, *mut u32) = unsafe { std::mem::transmute(*vtbl.add(7)) };
+            let mut dim = 0u32;
+            unsafe { get_type(a2 as *mut c_void, &mut dim) };
+            let mut desc = [0u32; 12];
+            if dim == 3 || dim == 1 {
+                let get_desc: unsafe extern "system" fn(*mut c_void, *mut u32) = unsafe { std::mem::transmute(*vtbl.add(10)) };
+                unsafe { get_desc(a2 as *mut c_void, desc.as_mut_ptr()) };
+            }
+            glog!("[gpu]   the resource is dimension {dim} (1=buffer 3=2D 4=3D), its description: {}", hex_dump(desc.as_ptr() as *const u8, 48));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Extended resource vtables
+// ---------------------------------------------------------------------------------------
+//
+// The title calls console-only methods on the resources it creates (observed: slot 13 on a
+// 2D texture, which reads two dwords that look like width and height). A real desktop resource
+// has an 11-slot vtable (IUnknown 3, DeviceChild 4, Resource 3, GetDesc 1), so such a call
+// reads past its end. Each resource gets an extended copy of its vtable (the 11 real entries,
+// logging stubs after them, slot 13 implemented) and its object is pointed at it.
+
+const RESOURCE_STANDARD_SLOTS: usize = 11;
+const RESOURCE_EXT_SLOTS: usize = 64;
+
+static EXTENDED_VTABLES: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// Slot 13 of a 2D texture: `(this, u32 out[2])` writes the width and height.
+unsafe extern "system" fn texture_slot_13(this: *mut c_void, out: *mut u32) -> usize {
+    static COUNT: AtomicU32 = AtomicU32::new(0);
+    let vtbl = unsafe { *(this as *const *const usize) };
+    // Slot 10 (GetDesc) is still the real entry, copied into the extended vtable.
+    let get_desc: unsafe extern "system" fn(*mut c_void, *mut u32) = unsafe { std::mem::transmute(*vtbl.add(10)) };
+    let mut desc = [0u32; 12];
+    unsafe { get_desc(this, desc.as_mut_ptr()) };
+    if !out.is_null() {
+        unsafe {
+            *out = desc[0];
+            *out.add(1) = desc[1];
+        }
+    }
+    if COUNT.fetch_add(1, Ordering::Relaxed) < 3 {
+        glog!("[gpu] texture extension slot 13: reported size {}x{}", desc[0], desc[1]);
+    }
+    0
+}
+
+/// Gives the real resource `obj` an extended vtable. `is_texture2d` selects the slot-13 behavior.
+fn extend_resource(obj: *mut c_void, is_texture2d: bool) {
+    if obj.is_null() {
+        return;
+    }
+    let orig = unsafe { *(obj as *const usize) };
+    let mut map = EXTENDED_VTABLES.lock().unwrap();
+    let key = orig ^ (is_texture2d as usize); // 2D textures and others never share a vtable in practice
+    let ext = if let Some((_, e)) = map.iter().find(|(k, _)| *k == key) {
+        *e
+    } else {
+        let mut arena = ArgArena::new();
+        let mut v = vec![0usize; RESOURCE_EXT_SLOTS];
+        for i in 0..RESOURCE_STANDARD_SLOTS {
+            v[i] = unsafe { *((orig as *const usize).add(i)) };
+        }
+        for i in RESOURCE_STANDARD_SLOTS..RESOURCE_EXT_SLOTS {
+            v[i] = arena.make(format!("[gpu] resource extension slot {i}"), ret_zero as usize as u64);
+        }
+        if is_texture2d {
+            v[13] = texture_slot_13 as usize;
+        }
+        std::mem::forget(arena);
+        let leaked: &'static [usize] = Vec::leak(v);
+        map.push((key, leaked.as_ptr() as usize));
+        leaked.as_ptr() as usize
+    };
+    unsafe { *(obj as *mut usize) = ext };
+}
+
+/// Shared body of the sanitizing `CreateBuffer` / `CreateTexture2D` / `CreateTexture3D`
+/// wrappers: copies the first `dwords` of the description, keeps only the desktop-valid bits of
+/// the `MiscFlags` dword (console-only bits such as `0x20000` make desktop creation fail with
+/// `E_INVALIDARG`), calls the real method and logs a failure.
+unsafe fn create_sanitized(
+    this: *mut c_void,
+    slot: usize,
+    name: &str,
+    desc: *const u32,
+    dwords: usize,
+    misc_index: usize,
+    misc_keep: u32,
+    init: *const c_void,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    static DROPPED: AtomicU32 = AtomicU32::new(0);
+    let p = unsafe { &*(this as *const Proxy) };
+    let mut d = [0u32; 11];
+    unsafe { ptr::copy_nonoverlapping(desc, d.as_mut_ptr(), dwords) };
+    let dropped = d[misc_index] & !misc_keep;
+    if dropped != 0 {
+        if DROPPED.fetch_add(1, Ordering::Relaxed) < 6 {
+            glog!("[gpu] {name}: dropping console-only MiscFlags bits {dropped:#x}");
+        }
+        d[misc_index] &= misc_keep;
+    }
+    let f: unsafe extern "system" fn(*mut c_void, *const u32, *const c_void, *mut *mut c_void) -> HRESULT =
+        unsafe { std::mem::transmute(*((*(p.real as *const *const usize)).add(slot))) };
+    let hr = unsafe { f(p.real, d.as_ptr(), init, out) };
+    if hr.0 < 0 {
+        creation_result(hr.0 as u32 as u64, desc as u64, init as u64, slot as u64);
+    } else if !out.is_null() {
+        extend_resource(unsafe { *out }, slot == 5);
+    }
+    hr
+}
+
+unsafe extern "system" fn device_create_buffer(this: *mut c_void, desc: *const u32, init: *const c_void, out: *mut *mut c_void) -> HRESULT {
+    // D3D11_BUFFER_DESC: 6 dwords, MiscFlags is the 5th. Desktop-valid: DRAWINDIRECT_ARGS, RAW_VIEWS, STRUCTURED.
+    unsafe { create_sanitized(this, 3, "CreateBuffer", desc, 6, 4, 0x10 | 0x20 | 0x40, init, out) }
+}
+
+unsafe extern "system" fn device_create_texture2d(this: *mut c_void, desc: *const u32, init: *const c_void, out: *mut *mut c_void) -> HRESULT {
+    // D3D11_TEXTURE2D_DESC: 11 dwords, MiscFlags is the 11th. Kept: GENERATE_MIPS, TEXTURECUBE.
+    unsafe { create_sanitized(this, 5, "CreateTexture2D", desc, 11, 10, 0x1 | 0x4, init, out) }
+}
+
+unsafe extern "system" fn device_create_texture3d(this: *mut c_void, desc: *const u32, init: *const c_void, out: *mut *mut c_void) -> HRESULT {
+    // D3D11_TEXTURE3D_DESC: 9 dwords, MiscFlags is the 9th. Kept: GENERATE_MIPS.
+    unsafe { create_sanitized(this, 6, "CreateTexture3D", desc, 9, 8, 0x1, init, out) }
+}
+
+/// Shared body of the view creators `(this, resource, desc, out)`. If the description is
+/// rejected with `E_INVALIDARG` (the console accepted descriptions that do not match their
+/// resource, for example a plain 2D dimension on a multisampled texture, or an all-zero one),
+/// the view is retried with no description, which makes D3D derive it from the resource.
+unsafe fn create_view(this: *mut c_void, slot: usize, name: &str, resource: *mut c_void, desc: *const c_void, out: *mut *mut c_void) -> HRESULT {
+    static FALLBACKS: AtomicU32 = AtomicU32::new(0);
+    let p = unsafe { &*(this as *const Proxy) };
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, *mut *mut c_void) -> HRESULT =
+        unsafe { std::mem::transmute(*((*(p.real as *const *const usize)).add(slot))) };
+    let hr = unsafe { f(p.real, resource, desc, out) };
+    if hr.0 == 0x80070057u32 as i32 && !desc.is_null() && !resource.is_null() {
+        let retry = unsafe { f(p.real, resource, ptr::null(), out) };
+        let n = FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        if n < 8 {
+            glog!("[gpu] {name}: description rejected ({}), retry with no description -> {:#x}", safe_dump(desc as u64, 16), retry.0 as u32);
+        }
+        if retry.0 >= 0 {
+            return retry;
+        }
+    }
+    if hr.0 < 0 {
+        creation_result(hr.0 as u32 as u64, resource as u64, desc as u64, slot as u64);
+    }
+    hr
+}
+
+unsafe extern "system" fn device_create_srv(this: *mut c_void, res: *mut c_void, desc: *const c_void, out: *mut *mut c_void) -> HRESULT {
+    unsafe { create_view(this, 7, "CreateShaderResourceView", res, desc, out) }
+}
+unsafe extern "system" fn device_create_uav(this: *mut c_void, res: *mut c_void, desc: *const c_void, out: *mut *mut c_void) -> HRESULT {
+    unsafe { create_view(this, 8, "CreateUnorderedAccessView", res, desc, out) }
+}
+unsafe extern "system" fn device_create_rtv(this: *mut c_void, res: *mut c_void, desc: *const c_void, out: *mut *mut c_void) -> HRESULT {
+    unsafe { create_view(this, 9, "CreateRenderTargetView", res, desc, out) }
+}
+unsafe extern "system" fn device_create_dsv(this: *mut c_void, res: *mut c_void, desc: *const c_void, out: *mut *mut c_void) -> HRESULT {
+    unsafe { create_view(this, 10, "CreateDepthStencilView", res, desc, out) }
+}
+
+/// A thunk that calls desktop device slot `slot` and then `creation_result(result, a2, a3, slot)`,
+/// returning the real result. Only for methods with at most three arguments after `this`, so
+/// nothing is passed on the stack.
+fn logged_create_thunk(mem: *mut u8, slot: usize) -> usize {
+    let mut c: Vec<u8> = vec![
+        0x48, 0x83, 0xEC, 0x48, // sub rsp, 0x48
+        0x48, 0x89, 0x4C, 0x24, 0x20, // mov [rsp+20h], rcx
+        0x48, 0x89, 0x54, 0x24, 0x28, // mov [rsp+28h], rdx
+        0x4C, 0x89, 0x44, 0x24, 0x30, // mov [rsp+30h], r8
+        0x4C, 0x89, 0x4C, 0x24, 0x38, // mov [rsp+38h], r9
+        0x48, 0x8B, 0x41, 0x08, // mov rax, [rcx+8]    (real device)
+        0x48, 0x89, 0xC1, // mov rcx, rax
+        0x48, 0x8B, 0x00, // mov rax, [rax]      (real vtable)
+        0xFF, 0x90, // call [rax + slot*8]
+    ];
+    c.extend_from_slice(&((slot * 8) as u32).to_le_bytes());
+    c.extend_from_slice(&[
+        0x48, 0x89, 0x44, 0x24, 0x40, // mov [rsp+40h], rax
+        0x48, 0x89, 0xC1, // mov rcx, rax
+        0x48, 0x8B, 0x54, 0x24, 0x28, // mov rdx, [rsp+28h]
+        0x4C, 0x8B, 0x44, 0x24, 0x30, // mov r8, [rsp+30h]
+        0x41, 0xB9, // mov r9d, slot
+    ]);
+    c.extend_from_slice(&(slot as u32).to_le_bytes());
+    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, creation_result
+    c.extend_from_slice(&(creation_result as usize as u64).to_le_bytes());
+    c.extend_from_slice(&[
+        0xFF, 0xD0, // call rax
+        0x48, 0x8B, 0x44, 0x24, 0x40, // mov rax, [rsp+40h]
+        0x48, 0x83, 0xC4, 0x48, // add rsp, 0x48
+        0xC3, // ret
+    ]);
+    assert!(c.len() <= 128, "thunk is {} bytes", c.len());
+    unsafe { ptr::copy_nonoverlapping(c.as_ptr(), mem, c.len()) };
+    mem as usize
+}
+
 /// Desktop context slots that read resources: `DrawIndexed`, `Draw`, `DrawIndexedInstanced`,
 /// `DrawInstanced`, `DrawAuto`, `DrawIndexedInstancedIndirect`, `DrawInstancedIndirect`,
 /// `Dispatch`, `DispatchIndirect`, and the copies `CopySubresourceRegion` and `CopyResource`.
@@ -755,6 +1031,7 @@ unsafe extern "system" fn device_ext_62(this: *mut c_void, desc: *const u32, mem
         if !memory.is_null() {
             register_placed_buffer(buffer, memory as usize, d[0] as usize);
         }
+        extend_resource(buffer, false);
         if !out.is_null() {
             unsafe { *out = buffer };
         }
@@ -778,6 +1055,24 @@ fn safe_dump(p: u64, n: usize) -> String {
         return format!("{p:#x} (unreadable)");
     }
     format!("{p:#x}: {}", hex_dump(buf.as_ptr(), got.min(n)))
+}
+
+/// Device extension slot 73: `(device, desc*, Object** out)`. The title zeroes `*out` (a COM-pointer
+/// field of one of its resource wrappers), releases the old value, calls this, and expects the new
+/// object in `*out`; leaving it NULL leaves the wrapper empty and makes later code dereference
+/// NULL. The description (36 bytes, third dword often 0, the dword at +0xC an index 0/1/2, the one
+/// at +0x10 a count 5/8/0xb that matches texture mip counts, `0x20000` at +4) is not decoded, so
+/// a stand-in COM object is stored and its use is logged.
+unsafe extern "system" fn device_ext_73(_this: *mut c_void, desc: *const u32, out: *mut *mut c_void) -> HRESULT {
+    static COUNT: AtomicU32 = AtomicU32::new(0);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 6 {
+        glog!("[gpu] device slot 73: desc = {} -> stand-in object", hex_dump(desc as *const u8, 36));
+    }
+    if !out.is_null() {
+        unsafe { *out = new_stand_in() };
+    }
+    HRESULT(0)
 }
 
 /// Device slots 62 and 73: arguments unknown, so each call dumps what its pointer arguments
@@ -848,12 +1143,27 @@ fn build_vtable(kind: Kind) -> Vec<usize> {
         std::mem::forget(a);
     }
     if kind == Kind::Device {
+        // The standard creation methods log their failures (and the description) instead of
+        // forwarding silently.
+        let logged = unsafe { VirtualAlloc(ptr::null_mut(), 4096, 0x3000, 0x40) } as *mut u8;
+        assert!(!logged.is_null(), "thunk allocation failed");
+        for (n, (slot, _)) in LOGGED_CREATE_NAMES.iter().enumerate() {
+            v[*slot] = logged_create_thunk(unsafe { logged.add(n * 128) }, *slot);
+        }
+        // Buffers and textures also need their console-only MiscFlags bits removed.
+        v[3] = device_create_buffer as usize;
+        v[5] = device_create_texture2d as usize;
+        v[6] = device_create_texture3d as usize;
+        v[7] = device_create_srv as usize;
+        v[8] = device_create_uav as usize;
+        v[9] = device_create_rtv as usize;
+        v[10] = device_create_dsv as usize;
         // Creation methods decoded from the title's call sites.
         v[59] = device_ext_59 as usize;
         v[64] = device_ext_64 as usize;
         v[65] = device_ext_65 as usize;
         v[62] = device_ext_62 as usize;
-        v[73] = device_ext_dump::<73> as usize;
+        v[73] = device_ext_73 as usize;
     }
     v
 }

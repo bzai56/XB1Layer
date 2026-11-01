@@ -93,6 +93,31 @@ unsafe fn patch_fastfail_sites(base: *mut u8, size: usize) -> usize {
     n
 }
 
+/// Parses `--watch-sites=0x1B10F53,0x1B12D1D` (title RVAs) from the command line.
+fn args_watch_sites() -> Option<Vec<usize>> {
+    let arg = env::args().find_map(|a| a.strip_prefix("--watch-sites=").map(str::to_owned))?;
+    Some(arg.split(',').filter_map(|s| usize::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).collect())
+}
+
+/// One-shot watchpoints (`--watch-sites=0x1B10F53,...`, title RVAs): the first byte of the
+/// instruction is replaced with `int3`; on the first hit the crash logger reports the registers
+/// and the title's call chain, restores the byte and re-executes the instruction.
+static WATCH_ADDR: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
+static WATCH_ORIG: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
+static WATCH_PENDING: [std::sync::atomic::AtomicBool; 16] = [const { std::sync::atomic::AtomicBool::new(false) }; 16];
+/// `--watch-repeat`: watchpoints stay armed and report every hit (up to a cap) instead of once.
+static WATCH_REPEAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static WATCH_HITS: AtomicUsize = AtomicUsize::new(0);
+
+unsafe fn plant_watch_sites(base: *mut u8, rvas: &[usize]) {
+    for (i, rva) in rvas.iter().take(WATCH_ADDR.len()).enumerate() {
+        let p = unsafe { base.add(*rva) };
+        WATCH_ORIG[i].store(unsafe { *p } as usize, Ordering::Relaxed);
+        WATCH_ADDR[i].store(p as usize, Ordering::Relaxed);
+        unsafe { *p = 0xCC };
+    }
+}
+
 /// `(base, size)` of the mapped title image, for modules that log title addresses.
 pub fn image_range() -> (usize, usize) {
     (IMG_BASE.load(Ordering::Relaxed), IMG_SIZE.load(Ordering::Relaxed))
@@ -224,9 +249,110 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
     unsafe {
         let rec = *info;
         let code = *(rec as *const u32);
+        if code == 0x8000_0004 {
+            // Single-step after a repeating watchpoint: put the breakpoints back.
+            for (i, pending) in WATCH_PENDING.iter().enumerate() {
+                if pending.swap(false, Ordering::Relaxed) {
+                    let a = WATCH_ADDR[i].load(Ordering::Relaxed);
+                    if a != 0 {
+                        *(a as *mut u8) = 0xCC;
+                    }
+                }
+            }
+            return -1;
+        }
         if code == 0x8000_0003 {
-            // A patched fast-fail site: report it, then end the process the way the original would.
             let addr = *(rec.add(16) as *const usize);
+            // A one-shot watchpoint: report, restore the instruction byte and re-execute it.
+            for (i, w) in WATCH_ADDR.iter().enumerate() {
+                if w.load(Ordering::Relaxed) == addr && addr != 0 {
+                    let ctx = *info.add(1);
+                    let reg = |off: usize| *(ctx.add(off) as *const u64);
+                    let (base, size) = (IMG_BASE.load(Ordering::Relaxed), IMG_SIZE.load(Ordering::Relaxed));
+                    if WATCH_REPEAT.load(Ordering::Relaxed) {
+                        // Compact line per hit: the logged file, line, category and message.
+                        let hit = WATCH_HITS.fetch_add(1, Ordering::Relaxed);
+                        if hit < 400 {
+                            let rsp = reg(0x98) as usize;
+                            let mut out = RawBuf::new();
+                            let put = |out: &mut RawBuf, label: &str, p: u64, max: usize| {
+                                use std::fmt::Write;
+                                let mut buf = [0u8; 200];
+                                let mut got = 0usize;
+                                if p >= 0x10000 && (ReadProcessMemory(GetCurrentProcess(), p as *const c_void, buf.as_mut_ptr() as *mut c_void, max, &mut got) != 0 || got > 0) {
+                                    let n = buf[..got].iter().position(|&b| b == 0).unwrap_or(got);
+                                    if n >= 2 && buf[..n].iter().all(|&b| b == b'\t' || b == b'\n' || (0x20..0x7f).contains(&b)) {
+                                        let _ = write!(out, " {label}={:?}", std::str::from_utf8(&buf[..n]).unwrap_or("?"));
+                                    }
+                                }
+                            };
+                            put(&mut out, "file", reg(0x88), 150);
+                            {
+                                use std::fmt::Write;
+                                let _ = write!(out, " line={} cat={}", reg(0xB8) as u32, reg(0xC0) as u32);
+                            }
+                            put(&mut out, "msg", *((rsp + 0x28) as *const u64), 190);
+                            rlog!("[log #{hit}]{}", out.as_str());
+                        }
+                        *(addr as *mut u8) = WATCH_ORIG[i].load(Ordering::Relaxed) as u8;
+                        WATCH_PENDING[i].store(true, Ordering::Relaxed);
+                        *(ctx.add(0x44) as *mut u32) |= 0x100;
+                        *(ctx.add(0xF8) as *mut u64) = addr as u64;
+                        return -1;
+                    }
+                    rlog!("[watch] hit title+{:#x} on thread {}", addr - base, GetCurrentThreadId());
+                    rlog!(
+                        "  rax={:#x} rcx={:#x} rdx={:#x} rbx={:#x} rsi={:#x} rdi={:#x} r8={:#x} r9={:#x}",
+                        reg(0x78), reg(0x80), reg(0x88), reg(0x90), reg(0xA8), reg(0xB0), reg(0xB8), reg(0xC0)
+                    );
+                    let rsp = reg(0x98) as usize;
+                    // Any readable text the argument registers and the fifth stack argument point at.
+                    let text_at = |p: u64| -> Option<([u8; 160], usize)> {
+                        let mut buf = [0u8; 160];
+                        let mut got = 0usize;
+                        if p < 0x10000 || ReadProcessMemory(GetCurrentProcess(), p as *const c_void, buf.as_mut_ptr() as *mut c_void, 159, &mut got) == 0 && got == 0 {
+                            return None;
+                        }
+                        let n = buf[..got].iter().position(|&b| b == 0).unwrap_or(got);
+                        if n >= 3 && buf[..n].iter().all(|&b| b == b'\t' || b == b'\n' || (0x20..0x7f).contains(&b)) { Some((buf, n)) } else { None }
+                    };
+                    // At a function entry the fifth argument is at rsp+0x28; at a call site, at rsp+0x20.
+                    let fifth = *((rsp + 0x28) as *const u64);
+                    let fifth_at_call = *((rsp + 0x20) as *const u64);
+                    for (name, v) in [("rcx", reg(0x80)), ("rdx", reg(0x88)), ("r8", reg(0xB8)), ("r9", reg(0xC0)), ("arg5 (entry)", fifth), ("arg5 (call site)", fifth_at_call)] {
+                        if let Some((buf, n)) = text_at(v) {
+                            rlog!("  {name} text: {}", std::str::from_utf8(&buf[..n]).unwrap_or("?"));
+                        }
+                    }
+                    let stack_base: usize;
+                    std::arch::asm!("mov {}, gs:[8]", out(reg) stack_base, options(nostack, readonly, preserves_flags));
+                    let mut shown = 0;
+                    for k in 0..768 {
+                        if rsp + k * 8 + 8 > stack_base {
+                            break;
+                        }
+                        let v = *((rsp + k * 8) as *const usize);
+                        if v >= base + 8 && v < base + size && (*((v - 5) as *const u8) == 0xE8 || (*((v - 6) as *const u8) == 0xFF && *((v - 5) as *const u8) == 0x15)) {
+                            rlog!("  stack+{:#x}: return address title+{:#x}", k * 8, v - base);
+                            shown += 1;
+                            if shown == 14 {
+                                break;
+                            }
+                        }
+                    }
+                    *(addr as *mut u8) = WATCH_ORIG[i].load(Ordering::Relaxed) as u8;
+                    if WATCH_REPEAT.load(Ordering::Relaxed) {
+                        // Stay armed: single-step the restored instruction, then re-plant.
+                        WATCH_PENDING[i].store(true, Ordering::Relaxed);
+                        *(ctx.add(0x44) as *mut u32) |= 0x100; // EFlags.TF
+                    } else {
+                        w.store(0, Ordering::Relaxed);
+                    }
+                    *(ctx.add(0xF8) as *mut u64) = addr as u64; // RIP: re-execute the restored instruction
+                    return -1; // EXCEPTION_CONTINUE_EXECUTION
+                }
+            }
+            // A patched fast-fail site: report it, then end the process the way the original would.
             if FASTFAIL_SITES.iter().any(|s| s.load(Ordering::Relaxed) == addr) {
                 let ctx = *info.add(1);
                 let ecx = *(ctx.add(0x80) as *const u64);
@@ -1306,6 +1432,10 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool, dump_iat: bool) -> Res
                 Err(e) => println!("helper TLS DLL failed ({e}); falling back to the hand-built TLS vector"),
             }
         }
+        if let Some(list) = args_watch_sites() {
+            unsafe { plant_watch_sites(base, &list) };
+            println!("planted {} one-shot watchpoints", list.len());
+        }
         if PATCH_FASTFAIL.load(Ordering::Relaxed) {
             let n = unsafe { patch_fastfail_sites(base, size_of_image) };
             println!("patched {n} fast-fail sites with breakpoints (--patch-fastfail)");
@@ -1492,6 +1622,7 @@ fn main() {
             process::exit(1);
         }
     }
+    WATCH_REPEAT.store(args.iter().any(|a| a == "--watch-repeat"), Ordering::Relaxed);
     PATCH_FASTFAIL.store(args.iter().any(|a| a == "--patch-fastfail"), Ordering::Relaxed);
     LEGACY_TLS.store(args.iter().any(|a| a == "--legacy-tls"), Ordering::Relaxed);
     NO_PEB_PATCH.store(args.iter().any(|a| a == "--no-peb-patch"), Ordering::Relaxed);

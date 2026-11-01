@@ -672,6 +672,15 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         wlog!("[winrt] {} slot {N} called (arg1={arg1:p}, arg2={arg2:p}) -> S_OK", o.class);
         return HRESULT(0);
     }
+    // `Windows.Xbox.System.User.Users` (statics slot 9) is an IVectorView<User>. The title reads
+    // its size and then each element, and waits until the list has a signed-in user, so it gets
+    // a vector view with one user (a console always has one).
+    if o.class == "Windows.Xbox.System.User" && N == 9 && is_writable(arg1) {
+        let list = create_vector_view("Windows.Xbox.System.User.Users", &o.iid, 1);
+        unsafe { *(arg1 as *mut *mut c_void) = list };
+        wlog!("[winrt] {} slot 9 (Users) -> a vector view with 1 user", o.class);
+        return HRESULT(0);
+    }
     if is_writable(arg1) {
         let child = create_generic(&format!("{}#slot{N}", o.class), &o.iid);
         unsafe { *(arg1 as *mut *mut c_void) = child };
@@ -728,6 +737,81 @@ fn console_window_vtbl() -> *const usize {
         v
     })
     .as_ptr()
+}
+
+/// `IVectorView<T>::GetAt(index, T** out)`. The element type does not matter to the layout.
+unsafe extern "system" fn vector_view_get_at(this: *mut c_void, index: u32, out: *mut *mut c_void) -> HRESULT {
+    let o = unsafe { &*(this as *const GenericObj) };
+    let size = o.kind as u32; // the number of elements is kept in `kind`
+    if index >= size {
+        wlog!("[winrt] {}: GetAt({index}) is out of range (size {size}) -> E_BOUNDS", o.class);
+        return HRESULT(0x8000000Bu32 as i32);
+    }
+    let element = create_generic(&format!("{} (element {index})", o.class), &o.iid);
+    wlog!("[winrt] {}: GetAt({index}) -> a stand-in element", o.class);
+    unsafe { *out = element };
+    HRESULT(0)
+}
+
+/// `IVectorView<T>::get_Size(uint* out)`.
+unsafe extern "system" fn vector_view_get_size(this: *mut c_void, out: *mut u32) -> HRESULT {
+    let o = unsafe { &*(this as *const GenericObj) };
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        wlog!("[winrt] {}: get_Size -> {}", o.class, o.kind);
+    }
+    unsafe { *out = o.kind as u32 };
+    HRESULT(0)
+}
+
+/// `IVectorView<T>::IndexOf(T value, uint* index, bool* found)`: nothing is found.
+unsafe extern "system" fn vector_view_index_of(_this: *mut c_void, _value: *mut c_void, index: *mut u32, found: *mut bool) -> HRESULT {
+    unsafe {
+        if !index.is_null() {
+            *index = 0;
+        }
+        if !found.is_null() {
+            *found = false;
+        }
+    }
+    HRESULT(0)
+}
+
+/// Vtable for a vector-view stand-in: IUnknown and IInspectable as in the generic object, then
+/// the three `IVectorView` methods (`GetAt` 6, `get_Size` 7, `IndexOf` 8); the rest are the
+/// generic logging slots.
+fn vector_view_vtbl() -> *const usize {
+    static VTBL: OnceLock<[usize; GENERIC_SLOTS]> = OnceLock::new();
+    VTBL.get_or_init(|| {
+        let mut v = [0usize; GENERIC_SLOTS];
+        v[0] = generic_qi as usize;
+        v[1] = generic_add_ref as usize;
+        v[2] = generic_release as usize;
+        v[3] = com_get_iids as usize;
+        v[4] = generic_class_name as usize;
+        v[5] = com_get_trust_level as usize;
+        let slots = generic_slots!(
+            6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
+            35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
+        );
+        v[6..].copy_from_slice(&slots);
+        v[6] = vector_view_get_at as usize;
+        v[7] = vector_view_get_size as usize;
+        v[8] = vector_view_index_of as usize;
+        v
+    })
+    .as_ptr()
+}
+
+/// A vector-view stand-in holding `size` generic elements. The size is stored in `kind` (kinds 0
+/// to 2 are taken by the other generic objects, so the vtable, not the kind, selects behavior).
+fn create_vector_view(class: &str, iid: &GUID, size: u8) -> *mut c_void {
+    let o = create_generic(class, iid);
+    unsafe {
+        (*(o as *mut GenericObj)).kind = size;
+        (*(o as *mut GenericObj)).vtbl = vector_view_vtbl();
+    }
+    o
 }
 
 fn create_generic(class: &str, iid: &GUID) -> *mut c_void {

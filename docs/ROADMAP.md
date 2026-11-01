@@ -19,7 +19,10 @@
 3j6. ~~**Decode the context's embedded functions**~~ Partly done: the embedded region is a copy of the desktop context method table at `+0x3E0`; slots 0 to 23 and two shader slots now forward to the real context. Remaining: the rest of the table, and `+0xA08`.
 3j7. ~~**Device extension slots 59, 64, 65**~~ Done: 64 and 65 create real desktop textures (17 per run); 59 returns a logging stand-in. The context table mapping is exact from index 34 on.
 3j8. ~~Device slot 62~~ Done: a 1,168-byte constant buffer, created as a desktop buffer. **Slot 73** (probably a texture view) and context `+0x4e0`, `+0xA08` remain. Placement memory is mirrored for buffers (verified); textures still need the console tiling decoded and de-tiled.
-3j9. **NULL read at `title+0xe6319c`**: a helper queries console-only IID `DFDBA067-0B8D-4865-875B-D7B4516CC164` on a member of a NULL object.
+3j9. ~~**NULL read at `title+0xe6319c`**~~ Done: the title was using a render-target resource whose creation failed (console-only `MiscFlags` bits rejected by desktop D3D11). Fixed in the standard creation wrappers.
+3j11. **Decode the GPU command packet stream** the title writes into its context (the core of rendering): header layout, opcodes for draws, state, binding, clears, copies. Each context has a 4 MB buffer; flushes are logged.
+3j12. **Windows.Xbox.System.User element** methods (the `Users` list now has one stand-in user; the title calls into it).
+3j13. **A fault inside the GPU driver's worker thread** (`nvwgf2umx.dll`) seen in some runs: something handed to D3D11 corrupts state.
 3j10. **Which desktop context slot (24 to 34) the console table lacks.**
 3j3. **Decode the two `CoreApplication` console extension interfaces** (`42A6A529`, `9FF3799E`).
 3k. **Console `ICoreWindow` layout**: pin down the member list, then raise window events (activation, size, visibility, input).
