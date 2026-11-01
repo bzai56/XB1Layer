@@ -872,12 +872,19 @@ pub fn try_activation_factory(class: &str, iid: &GUID, out: *mut *mut c_void) ->
         return None;
     }
     let obj = Com::<CoreAppTag>::create(());
-    let hr = unsafe { com_query_interface::<CoreAppTag>(obj, iid, out) };
+    let mut hr = unsafe { com_query_interface::<CoreAppTag>(obj, iid, out) };
     unsafe { com_release::<CoreAppTag>(obj) };
-    // Note: the title also asks this factory for two console-only extension interfaces
-    // (9FF3799E-6E83-468C-A5B0-501CE6BB0FA1, 42A6A529-3CC6-4867-B5B7-6D1FAF5325F9). Answering
-    // them with the generic stand-in made the title jump to a bogus address (it called a
-    // returned pointer as code), so they are left as E_NOINTERFACE, which the title handles.
+    // The title asks this factory for two console-only extension interfaces:
+    //  - 9FF3799E-6E83-468C-A5B0-501CE6BB0FA1: the title tolerates E_NOINTERFACE. Answering it
+    //    with the generic stand-in made the title jump to a bogus address (it called a returned
+    //    pointer as code), so it is left unimplemented.
+    //  - 42A6A529-3CC6-4867-B5B7-6D1FAF5325F9: the title does not tolerate its absence (C++/CX
+    //    throws InvalidCastException, nothing catches it, terminate() is called), so it gets the
+    //    generic stand-in.
+    if hr == E_NOINTERFACE && *iid == GUID::from_u128(0x42A6A529_3CC6_4867_B5B7_6D1FAF5325F9) {
+        unsafe { *out = create_generic(&format!("{class} (console extension 42A6A529)"), iid) };
+        hr = HRESULT(0);
+    }
     wlog!("[winrt] activation factory for {class}: iid={iid:?} -> {:#x}", hr.0 as u32);
     Some(hr)
 }

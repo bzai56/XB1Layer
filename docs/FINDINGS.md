@@ -103,12 +103,22 @@ So the console's `ICoreWindow` has a different member list from the desktop inte
 
 With that in place the title's main loop runs: `IFrameworkView::Run` is entered, the dispatcher is called repeatedly, and the D3D11 device call is made.
 
-## The current fault
-A worker thread then crashes inside `ntdll` (`ntdll+0x5ac00`): a write at exactly 16 bytes below the start of a committed block, with the size argument a few KB (it varies per run: `0x333c`, `0x5938`). It looks like a fill or move that starts before the block, but nothing in the title's own frames is visible in the report. The cause is not known.
+## The `ntdll+0x5ac00` fault: our TLS array
+A thread-pool worker crashed inside `ntdll` with a write exactly 16 bytes below a 64 KB-aligned pointer, and no title frames. Mapping the stack frames onto `ntdll`'s exports showed `Tp*` and `Ldr*` functions, and logging the title's library loads showed it had just called `LoadLibraryExW("WindowsCodecs.dll")`. So the fault was in the Windows loader, not in title code.
+
+**Cause (confirmed by the fault disappearing):** the per-thread TLS pointer array I installed in `TEB.ThreadLocalStoragePointer` was allocated with `VirtualAlloc`. When a DLL with static TLS is loaded, `ntdll` reallocates that array and frees the old one with `RtlFreeHeap`. Freeing a `VirtualAlloc` block that way makes the heap code read a heap header 16 bytes below it, hence the fault. The array is now allocated from the process heap. Two hypotheses were tested first and ruled out: the PEB image-base patch (`--no-peb-patch` changed nothing) and `XMemAlloc` blocks being passed to `HeapFree` (never happened; the routing for it is kept as a harmless safety net).
+
+**Known risk of this design:** the title's TLS slot is a fixed index (100) in an array that `ntdll` can still reallocate and resize when later DLLs with static TLS load. If it rebuilds the array from its own bookkeeping, the title's entry would be lost for that thread. This has not been seen yet.
+
+## The next walls
+After that fix the title survives loading `WindowsCodecs.dll` and continues, and the end of the run changed twice:
+1. **Fast-fail from `terminate()`.** The title requests `CoreApplication`'s second console-only interface, `42A6A529-3CC6-4867-B5B7-6D1FAF5325F9`, gets `E_NOINTERFACE`, C++/CX throws `InvalidCastException`, nothing catches it, and the C runtime calls `terminate()`. (The other extension interface, `9FF3799E-...`, is tolerated by the title, and serving it with the generic stand-in breaks things, so it stays unimplemented.) The factory now serves `42A6A529` with the generic stand-in. The title then calls **slot 7 with the value `1`** on it; the stand-in reports success and writes nothing.
+2. **A NULL write** at `title+0x1960158` follows (`rdi` points at a global that holds `0xffffffffffffffff`). The cause is not known.
 
 ## Next investigation steps
-1. Find the thread and caller of the `ntdll+0x5ac00` write (capture the stack on that thread, not just the exception site).
-2. Pin down the console `ICoreWindow` layout: keep logging slots as the title uses more of them, and keep stand-in behavior per slot only where the call pattern justifies it.
+1. Find out what `title+0x1960158` writes through (probably something the previous step should have initialized).
+2. Work out what slot 7 of `42A6A529` is (it takes a small value `1`).
+3. Pin down the console `ICoreWindow` layout: keep logging slots as the title uses more of them, and keep stand-in behavior per slot only where the call pattern justifies it.
 3. Implement `DXGIXSetVLineNotification`, `DXGIXPresentArray` and any other `DXGIX*` the title uses.
 3. Work out the real shape of the `PackageTransferManager` interfaces, from the title's own usage or from the console SDK's published API reference if available, and implement them for real.
 3. Implement `DXGIXSetVLineNotification` and the rest of the `d3d11_x` surface.

@@ -28,7 +28,7 @@ jmp rax
 Done on a dedicated thread with a 256 MB stack reserve, because titles expect far more than Rust's default:
 - **Unwind tables:** the exception directory is registered with `RtlAddFunctionTable`, so SEH and C++ exceptions can unwind through title code.
 - **PEB image base:** `PEB.ImageBaseAddress` is pointed at the title so `GetModuleHandle(NULL)` returns it.
-- **Static TLS:** the TLS template is copied per thread and installed in `TEB.ThreadLocalStoragePointer` at a fixed high index (100); `_tls_index` is set to match. The array has no recorded length, so a larger copy of the first 16 entries is swapped in. TLS callbacks run once for the main thread.
+- **Static TLS:** the TLS template is copied per thread and installed in `TEB.ThreadLocalStoragePointer` at a fixed high index (100); `_tls_index` is set to match. The array has no recorded length, so a larger copy of the first 16 entries is swapped in. **The array must be allocated from the process heap**, because `ntdll` frees and reallocates it with `RtlFreeHeap` when a DLL with static TLS is loaded; a `VirtualAlloc` block there crashes the loader. TLS callbacks run once for the main thread.
 - **Threads:** `CreateThread` is overridden to wrap the start routine in a trampoline that installs TLS first.
 
 ### WinRT shell layer (`src/winrt.rs`)
@@ -73,6 +73,7 @@ Some imports are implemented by us instead of forwarded to Windows:
 | `--trace-api` | Logs every natively resolved import call through a register-preserving thunk (noisy calls are filtered, capped at 20,000 lines) |
 | `--trace-heap` | Logs `HeapAlloc`, `HeapFree` and `VirtualAlloc` arguments and results |
 | `--ring=<path>` | Crash-proof trace: every native import call, with the title address that made it, goes into a 64 MB memory-mapped circular buffer that survives the process dying (fast-fails included). Also logs arguments and results for file calls (`CreateFile2`, `CreateFileW`, `ReadFile`, `GetFileInformationByHandleEx`, `FindFirstFileExA`, `GetFileAttributesExA`) and `GetActivationFactoryByPCWSTR`. Read it with `tools\read-ring.ps1` |
+| `--no-peb-patch` | Leaves `PEB.ImageBaseAddress` pointing at the host (used to rule the patch out as a cause) |
 | `--trace-window` | Replaces the `windows`-crate window's vtable with a logging copy (`CoreWindow slot N`). Only useful for the desktop-layout window object |
 | `--test-d3d` | Creates the desktop D3D11 device through the `D3D11XCreateDeviceX` path without loading a title |
 | `--heapcheck` | With `--watch`, polls `HeapValidate`. Experimental: it takes the heap lock and can stall a title that is itself stuck in the heap |

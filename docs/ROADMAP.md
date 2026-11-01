@@ -12,7 +12,9 @@
 3g. ~~**Find the failing `QueryInterface`**~~ Done: the console audio extension of `MMDeviceEnumerator`, now proxied.
 3h. ~~`D3D11XCreateDeviceX`~~ First version done (plain desktop device). Remaining: `ID3D11DeviceX`/`ID3D11DeviceContextX` extensions, `DXGIX*` functions, swap chain on a real window.
 3i. ~~**NULL read at `title+0x156fab7`**~~ Done: the title's `ICoreWindow` has a console layout (slot 7 = Dispatcher). The title's main loop now runs.
-3j. **Worker-thread fault at `ntdll+0x5ac00`**: a write 16 bytes below a committed block. Needs the faulting thread's stack.
+3j. ~~**Worker-thread fault at `ntdll+0x5ac00`**~~ Done: the TLS pointer array was allocated with `VirtualAlloc` and `ntdll` freed it as a heap block when the title loaded `WindowsCodecs.dll`. Now allocated from the process heap.
+3j2. **NULL write at `title+0x1960158`**, after the title gets the `CoreApplication` extension interface `42A6A529`.
+3j3. **Decode the two `CoreApplication` console extension interfaces** (`42A6A529`, `9FF3799E`).
 3k. **Console `ICoreWindow` layout**: pin down the member list, then raise window events (activation, size, visibility, input).
 4. **`kernelx` shim**: real implementations of the most-called functions, driven by stub-hit logs.
 5. **`xg_x` and `EtwPlus`**: resource-layout helpers and no-op tracing.

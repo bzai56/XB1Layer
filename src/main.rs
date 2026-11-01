@@ -23,6 +23,7 @@ unsafe extern "system" {
     fn CreateFileMappingA(file: *mut c_void, sec: *mut c_void, prot: u32, hi: u32, lo: u32, name: *const i8) -> *mut c_void;
     fn MapViewOfFile(map: *mut c_void, access: u32, hi: u32, lo: u32, bytes: usize) -> *mut c_void;
     fn CreateFileW(name: *const u16, access: u32, share: u32, sec: *mut c_void, disp: u32, flags: u32, tmpl: *mut c_void) -> *mut c_void;
+    fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
     fn CreateFile2(name: *const u16, access: u32, share: u32, disp: u32, params: *mut c_void) -> *mut c_void;
     fn FindFirstFileExA(name: *const i8, level: u32, data: *mut c_void, op: u32, filter: *mut c_void, flags: u32) -> *mut c_void;
     fn GetFileAttributesExA(name: *const i8, level: u32, data: *mut c_void) -> i32;
@@ -34,6 +35,7 @@ unsafe extern "system" {
     fn HeapCreate(options: u32, initial: usize, max: usize) -> *mut c_void;
     fn HeapValidate(heap: *mut c_void, flags: u32, mem: *const c_void) -> i32;
     fn GetProcessHeap() -> *mut c_void;
+    fn HeapAlloc(heap: *mut c_void, flags: u32, size: usize) -> *mut c_void;
     fn VirtualQuery(addr: *const c_void, info: *mut c_void, len: usize) -> usize;
     fn GetStdHandle(which: u32) -> *mut c_void;
     fn WriteFile(h: *mut c_void, buf: *const u8, n: u32, written: *mut u32, overlapped: *mut c_void) -> i32;
@@ -206,6 +208,7 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
         let mut loc = RawBuf::new();
         describe(addr, &mut loc);
         rlog!("[exception] {code:#x} at {}", loc.as_str());
+        rlog!("  committed by the title so far: {} MiB", COMMITTED_BYTES.load(Ordering::Relaxed) >> 20);
         let ctx = *info.add(1);
         let reg = |off: usize| *(ctx.add(off) as *const u64);
         rlog!(
@@ -257,6 +260,40 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
         for f in frames[..n].iter().map(|f| *f as usize).filter(|f| *f >= base && *f < base + size).take(8) {
             rlog!("  caller title+{:#x}", f - base);
         }
+        // Return-address-like values pointing into any loaded module's executable code, named
+        // by module. Shows system and driver frames the title-only scan below cannot.
+        {
+            let rsp = reg(0x98) as usize;
+            let mut stack_base: usize;
+            std::arch::asm!("mov {}, gs:[8]", out(reg) stack_base, options(nostack, readonly, preserves_flags));
+            let mut shown = 0;
+            for i in 0..384 {
+                if rsp + i * 8 + 8 > stack_base {
+                    break;
+                }
+                let v = *((rsp + i * 8) as *const usize);
+                if v < 0x10000 {
+                    continue;
+                }
+                let mut mbi = [0u64; 8];
+                if VirtualQuery(v as *const c_void, mbi.as_mut_ptr() as *mut c_void, 48) == 0 {
+                    continue;
+                }
+                // MEM_IMAGE with an executable protection (PAGE_EXECUTE_*)
+                let (ty, protect) = (mbi[5] & 0xFFFF_FFFF, mbi[4] >> 32);
+                if ty == 0x0100_0000 && protect & 0xF0 != 0 {
+                    let mut l = RawBuf::new();
+                    describe(v, &mut l);
+                    rlog!("  frame+{:#x}: {}", i * 8, l.as_str());
+                    shown += 1;
+                    if shown == 24 {
+                        break;
+                    }
+                }
+            }
+            stack_base = 0;
+            let _ = stack_base;
+        }
         // The unwinder often stops early, so also scan the faulting stack for return-address-like values.
         let rsp = reg(0x98) as usize;
         let stack_base: usize;
@@ -298,7 +335,11 @@ unsafe fn install_tls_for_current_thread() {
     let teb: usize;
     std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb, options(nostack, readonly, preserves_flags));
     let slot = (teb + 0x58) as *mut *mut *mut c_void;
-    let arr = VirtualAlloc(ptr::null_mut(), SLOTS * 8, MEM_COMMIT_RESERVE, 0x04) as *mut *mut c_void;
+    // This array must come from the process heap: when a DLL with static TLS is loaded later,
+    // ntdll reallocates and frees the thread's TLS pointer array with RtlFreeHeap, and freeing
+    // a VirtualAlloc block that way faults (ntdll reads a heap header 16 bytes below it).
+    // HEAP_ZERO_MEMORY = 0x8.
+    let arr = HeapAlloc(GetProcessHeap(), 0x8, SLOTS * 8) as *mut *mut c_void;
     if !(*slot).is_null() {
         ptr::copy_nonoverlapping(*slot, arr, 16);
     }
@@ -353,7 +394,11 @@ unsafe fn bootstrap(base: *mut u8, size: usize, tls: (u32, u32), exc: (u32, u32)
     // GetModuleHandle(NULL) reads PEB.ImageBaseAddress.
     let peb: usize;
     std::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, readonly, preserves_flags));
-    *((peb + 0x10) as *mut usize) = base as usize;
+    if NO_PEB_PATCH.load(Ordering::Relaxed) {
+        println!("PEB.ImageBaseAddress left pointing at the host (--no-peb-patch)");
+    } else {
+        *((peb + 0x10) as *mut usize) = base as usize;
+    }
 
     if tls.0 != 0 {
         let d = base.add(tls.0 as usize);
@@ -552,6 +597,7 @@ fn ring_write(args: std::fmt::Arguments) {
 static TRACE_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static TRACE_API: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static NO_PEB_PATCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static TRACE_WINDOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Called from the trace thunks; logs each API call the title makes (capped).
@@ -606,13 +652,14 @@ fn override_for(dll: &str, func: &str) -> Option<usize> {
     match func {
         "GetProcessHeap" => Some(xb_get_process_heap as usize),
         "HeapAlloc" if TRACE_HEAP.load(Ordering::Relaxed) => Some(xb_heap_alloc as usize),
-        "HeapFree" if TRACE_HEAP.load(Ordering::Relaxed) => Some(xb_heap_free as usize),
+        "HeapFree" => Some(xb_heap_free as usize),
         "VirtualAlloc" => Some(xb_virtual_alloc as usize),
         "XMemAlloc" | "XMemAllocDefault" => Some(xb_xmem_alloc as usize),
         "XMemFree" | "XMemFreeDefault" => Some(xb_xmem_free as usize),
         "XMemSetAllocationHooks" => Some(xb_xmem_set_hooks as usize),
         "TitleMemoryStatus" => Some(xb_title_memory_status as usize),
         "CreateThread" => Some(xb_create_thread as usize),
+        "LoadLibraryExW" if RING.load(Ordering::Relaxed) != 0 => Some(xb_load_library_ex_w as usize),
         "CreateFile2" if RING.load(Ordering::Relaxed) != 0 => Some(xb_create_file2 as usize),
         "FindFirstFileExA" if RING.load(Ordering::Relaxed) != 0 => Some(xb_find_first_file_ex_a as usize),
         "GetFileAttributesExA" if RING.load(Ordering::Relaxed) != 0 => Some(xb_get_file_attributes_ex_a as usize),
@@ -644,6 +691,10 @@ extern "system" fn xb_xmem_alloc(size: usize, attrs: u64) -> *mut c_void {
     const GRANULE: usize = 64 << 10;
     let rounded = (size.max(1) + GRANULE - 1) & !(GRANULE - 1);
     let p = unsafe { VirtualAlloc(ptr::null_mut(), rounded, MEM_COMMIT_RESERVE, 0x04) };
+    if !p.is_null() {
+        COMMITTED_BYTES.fetch_add(rounded, Ordering::Relaxed);
+        XMEM_BLOCKS.lock().unwrap().insert(p as usize);
+    }
     ring_write(format_args!("  XMemAlloc(size={size:#x}, attrs={attrs:#x}) -> {p:p}\n"));
     p
 }
@@ -651,7 +702,7 @@ extern "system" fn xb_xmem_alloc(size: usize, attrs: u64) -> *mut c_void {
 /// `XMemFree(address, attributes)`; any further arguments a title passes are ignored.
 extern "system" fn xb_xmem_free(p: *mut c_void, attrs: u64) {
     ring_write(format_args!("  XMemFree({p:p}, attrs={attrs:#x})\n"));
-    if !p.is_null() {
+    if !p.is_null() && XMEM_BLOCKS.lock().unwrap().remove(&(p as usize)) {
         unsafe { VirtualFree(p, 0, 0x8000) }; // MEM_RELEASE
     }
 }
@@ -683,6 +734,12 @@ extern "system" fn xb_title_memory_status(p: *mut u8) -> i32 {
 /// Allocation-type bits desktop Windows accepts. Titles also pass console-only bits
 /// (observed: 0x40000000 and 0x10000000) and large pages, which make VirtualAlloc fail
 /// with ERROR_INVALID_PARAMETER, so those are stripped.
+/// Blocks handed out by `XMemAlloc`, so a stray `HeapFree` on one can be routed correctly.
+static XMEM_BLOCKS: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// Total bytes the title has committed through `VirtualAlloc`/`XMemAlloc`, for crash reports.
+static COMMITTED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
 const VALID_ALLOC_TYPE: u32 = 0x1000 | 0x2000 | 0x80000 | 0x100000 | 0x200000 | 0x400000 | 0x100_0000;
 
 /// Console VirtualAlloc: strips unsupported flags and keeps the title's fixed-address hint,
@@ -690,6 +747,9 @@ const VALID_ALLOC_TYPE: u32 = 0x1000 | 0x2000 | 0x80000 | 0x100000 | 0x200000 | 
 extern "system" fn xb_virtual_alloc(addr: *mut c_void, size: usize, ty: u32, prot: u32) -> *mut c_void {
     let clean = ty & VALID_ALLOC_TYPE;
     let mut p = unsafe { VirtualAlloc(addr, size, clean, prot) };
+    if !p.is_null() && clean & 0x1000 != 0 {
+        COMMITTED_BYTES.fetch_add(size, Ordering::Relaxed);
+    }
     let mut moved = false;
     if p.is_null() && !addr.is_null() && clean & 0x2000 != 0 {
         p = unsafe { VirtualAlloc(ptr::null_mut(), size, clean, prot) };
@@ -775,6 +835,16 @@ fn ansi_to_string(p: *const i8) -> String {
     unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned()
 }
 
+extern "system" fn xb_load_library_ex_w(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void {
+    let s = wide_to_string(name);
+    ring_write(format_args!("  LoadLibraryExW({s:?}, flags={flags:#x}) ...\n"));
+    // Mirror stderr too, because a crash inside the load would lose the ring's result line.
+    rlog!("[load] LoadLibraryExW({s:?}, flags={flags:#x})");
+    let m = unsafe { LoadLibraryExW(name, file, flags) };
+    ring_write(format_args!("  LoadLibraryExW({s:?}) -> {m:p}\n"));
+    m
+}
+
 extern "system" fn xb_create_file2(name: *const u16, access: u32, share: u32, disp: u32, params: *mut c_void) -> *mut c_void {
     let h = unsafe { CreateFile2(name, access, share, disp, params) };
     let err = if h as isize == -1 { unsafe { GetLastError() } } else { 0 };
@@ -812,10 +882,25 @@ extern "system" fn xb_get_file_info(h: *mut c_void, class: u32, buf: *mut c_void
 }
 
 extern "system" fn xb_heap_free(heap: *mut c_void, flags: u32, p: *mut c_void) -> i32 {
+    static REAL: AtomicUsize = AtomicUsize::new(0);
+    if REAL.load(Ordering::Relaxed) == 0 {
+        REAL.store(real_kernel32(c"HeapFree"), Ordering::Relaxed);
+    }
     let real: extern "system" fn(*mut c_void, u32, *mut c_void) -> i32 =
-        unsafe { std::mem::transmute(real_kernel32(c"HeapFree")) };
+        unsafe { std::mem::transmute(REAL.load(Ordering::Relaxed)) };
+    // A block from XMemAlloc is page-backed, not a heap block: handing it to the real
+    // HeapFree makes ntdll look for a header 16 bytes before it.
+    if XMEM_BLOCKS.lock().unwrap().remove(&(p as usize)) {
+        if TRACE_HEAP.load(Ordering::Relaxed) {
+            rlog!("HeapFree({p:p}) was an XMemAlloc block -> released with VirtualFree");
+        }
+        unsafe { VirtualFree(p, 0, 0x8000) };
+        return 1;
+    }
     let r = real(heap, flags, p);
-    rlog!("HeapFree(heap={heap:p}, p={p:p}) -> {r}");
+    if TRACE_HEAP.load(Ordering::Relaxed) {
+        rlog!("HeapFree(heap={heap:p}, p={p:p}) -> {r}");
+    }
     r
 }
 
@@ -1073,6 +1158,7 @@ fn main() {
             process::exit(1);
         }
     }
+    NO_PEB_PATCH.store(args.iter().any(|a| a == "--no-peb-patch"), Ordering::Relaxed);
     TRACE_WINDOW.store(args.iter().any(|a| a == "--trace-window"), Ordering::Relaxed);
     TRACE_API.store(ring_path.is_some() || args.iter().any(|a| a == "--trace-api"), Ordering::Relaxed);
     TRACE_HEAP.store(args.iter().any(|a| a == "--trace-heap"), Ordering::Relaxed);
@@ -1084,3 +1170,4 @@ fn main() {
         process::exit(1);
     }
 }
+
