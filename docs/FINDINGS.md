@@ -191,16 +191,17 @@ Device slots **62** and **73** are the remaining unimplemented calls. Slot 62 is
 - A tool for real fast-fails: `--patch-fastfail` replaces the compiler's `mov ecx, code; int 0x29` sequences with a breakpoint, so the crash logger reports the site and the code. Only one such site exists in the image, and it was not reached in the runs checked.
 
 ## Where the run ends now
-The title's main loop runs (hundreds of `window->Dispatcher` calls), then it faults at `title+0x17b75fb` reading NULL, with a register set that looks like it is using one of the objects slot 59 should have created.
+The title creates its textures and drives the real context (copies, clears, blend state), its main loop runs, and then a thread reads a NULL pointer at `title+0xe6319c`, in code that is not graphics-specific (`[rdi+0x50]` with `rdi=0`). What object is missing there is not known.
 
 ## Next investigation steps
-1. Implement device extension slots 59, 64 and 65 enough to hand back objects: they look like creation functions (two objects of kinds 1 and 2; a 1920x1080 display-sized object; something 16x16).
-2. Map the rest of the embedded context table (which method is missing between slots 24 and 59) as more calls show up.
-3. Work out what slot 7 of `42A6A529` is (it takes a small value `1`).
-4. Pin down the console `ICoreWindow` layout: keep logging slots as the title uses more of them, and keep stand-in behavior per slot only where the call pattern justifies it.
-3. Implement `DXGIXSetVLineNotification`, `DXGIXPresentArray` and any other `DXGIX*` the title uses.
-3. Work out the real shape of the `PackageTransferManager` interfaces, from the title's own usage or from the console SDK's published API reference if available, and implement them for real.
-3. Implement `DXGIXSetVLineNotification` and the rest of the `d3d11_x` surface.
-4. Provide a `G:` equivalent: map the title folder as the content root instead of relying on the working directory.
-5. Inspect `media/` to see whether content is plain or encrypted (encrypted content is out of scope).
-6. Back the window with a native `HWND` and raise `CoreWindow` events.
+1. Find out what the NULL read at `title+0xe6319c` depends on.
+2. Decode device extension slots 62 and 73 (probably shader creation), and context `+0x4e0` and `+0xA08`.
+3. Find which of desktop context slots 24 to 34 the console table lacks.
+4. Work out what slot 7 of `42A6A529` is (it takes a small value `1`).
+5. Pin down the console `ICoreWindow` layout: keep logging slots as the title uses more of them, and keep stand-in behavior per slot only where the call pattern justifies it.
+6. Implement `DXGIXSetVLineNotification`, `DXGIXPresentArray` and any other `DXGIX*` the title uses.
+7. Work out the real shape of the `PackageTransferManager` interfaces, from the title's own usage or from the console SDK's published API reference if available, and implement them for real.
+8. Provide a `G:` equivalent: map the title folder as the content root instead of relying on the working directory.
+
+9. Inspect `media/` to see whether content is plain or encrypted (encrypted content is out of scope).
+10. Back the window with a native `HWND` and raise `CoreWindow` events.
