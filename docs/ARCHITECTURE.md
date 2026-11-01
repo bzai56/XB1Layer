@@ -31,6 +31,22 @@ Done on a dedicated thread with a 256 MB stack reserve, because titles expect fa
 - **Static TLS:** the TLS template is copied per thread and installed in `TEB.ThreadLocalStoragePointer` at a fixed high index (100); `_tls_index` is set to match. The array has no recorded length, so a larger copy of the first 16 entries is swapped in. TLS callbacks run once for the main thread.
 - **Threads:** `CreateThread` is overridden to wrap the start routine in a trampoline that installs TLS first.
 
+### WinRT shell layer (`src/winrt.rs`)
+Titles are C++/CX (UWP) apps: their entry point calls `CoreApplication::Run(IFrameworkViewSource)`. The real Windows implementation cannot host them in a plain desktop process, so `GetActivationFactoryByPCWSTR` (imported from `vccorlib140.dll`) is overridden and class lookups are intercepted:
+
+| Class | Handling |
+|-------|----------|
+| `Windows.ApplicationModel.Core.CoreApplication` | Our own `ICoreApplication`. `Run` calls the title's `IFrameworkView` lifecycle: `CreateView`, `Initialize`, `SetWindow`, `Load`, then raises `CoreApplicationView.Activated`, then `Run`, `Uninitialize` |
+| `Windows.Xbox.*`, `Microsoft.Xbox.*` | A generic stand-in object (see below) |
+| everything else | Passed through to the real Windows runtime |
+
+Objects behind that lifecycle: a `CoreApplicationView` (`ICoreApplicationView`), a `CoreWindow` (`ICoreWindow`, all events accepted but never raised yet) and a `CoreDispatcher` (`ICoreDispatcher`: `RunAsync` queues work, `ProcessEvents` runs the queue and pumps Win32 messages, `ProcessUntilQuit` loops until `CoreWindow::Close`). `ICoreWindow` and the launch-activation args are implemented with the `windows` crate. `ICoreApplication`, `ICoreApplicationView` and `ICoreDispatcher` have no implementable trait there, so they are hand-written COM objects built on the crate's vtable structs, which gives the correct slot order. Not done: a native window handle behind `CoreWindow`, window events, input, `CoreWindow::GetForCurrentThread`, `ICoreApplicationExit`.
+
+**Generic stand-in for console-only classes.** There is no metadata for `Windows.Xbox.*`, so its interfaces are unknown. The stand-in answers `QueryInterface` for any IID with itself and logs each method call by vtable slot. If the first argument looks like writable memory it stores a new stand-in there and returns success; otherwise it returns success without writing anything. This is a discovery aid that fakes behavior, not an implementation.
+
+### Console memory API
+`XMemAlloc`/`XMemAllocDefault`/`XMemFree`/`XMemFreeDefault` allocate whole pages aligned to 64 KB; the attribute bits (alignment, memory type) are not decoded. `XMemSetAllocationHooks` is accepted and ignored. `TitleMemoryStatus` zero-fills the caller's struct and reports 5 GiB total / 4.5 GiB available at offsets 8 and 16; that layout is a guess.
+
 ### Import overrides (`override_for`)
 Some imports are implemented by us instead of forwarded to Windows:
 
@@ -39,6 +55,8 @@ Some imports are implemented by us instead of forwarded to Windows:
 | `GetProcessHeap` | Returns a private guest heap so the title cannot corrupt the host's heap |
 | `VirtualAlloc` | Strips console-only allocation-type bits and falls back to any address if a fixed-address reservation is unavailable |
 | `CreateThread` | Installs static TLS on new threads |
+| `XMem*`, `TitleMemoryStatus` | Console memory API (see below) |
+| `GetActivationFactoryByPCWSTR` (vccorlib140) | Routes WinRT class lookups to the shell layer |
 
 ### Debugging aids
 | Flag | Effect |
@@ -50,6 +68,8 @@ Some imports are implemented by us instead of forwarded to Windows:
 | `--trace-heap` | Logs `HeapAlloc`, `HeapFree` and `VirtualAlloc` arguments and results |
 | `--ring=<path>` | Crash-proof trace: every native import call, with the title address that made it, goes into a 64 MB memory-mapped circular buffer that survives the process dying (fast-fails included). Also logs arguments and results for file calls (`CreateFile2`, `CreateFileW`, `ReadFile`, `GetFileInformationByHandleEx`, `FindFirstFileExA`, `GetFileAttributesExA`) and `GetActivationFactoryByPCWSTR`. Read it with `tools\read-ring.ps1` |
 | `--heapcheck` | With `--watch`, polls `HeapValidate`. Experimental: it takes the heap lock and can stall a title that is itself stuck in the heap |
+
+`tools\run-title.ps1 -Title <exe> -Seconds N -Ring` builds the command line, runs the title from its own folder with a timeout, and prints the exit code and stderr. The crash logger also reports MSVC C++ throws (`0xE06D7363`, first 30), which shows where a title throws.
 
 The crash logger is a vectored exception handler that reports `title+RVA`, registers, access-violation target, memory-region state and return-address-looking stack values. It allocates nothing, because the title may have crashed inside the heap. It cannot see fast-fails (`int 0x29`), which bypass exception dispatch.
 

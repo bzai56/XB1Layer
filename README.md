@@ -11,7 +11,9 @@ An experimental compatibility layer for running Xbox One (GDK/XDK "Durango") x64
 - `kernelx.dll` forwarded to `kernel32.dll`; DLLs next to the title are searched first
 - On the FH3 demo: 701 imports resolve natively, 39 remain stubbed
 - Process bootstrap (unwind tables, PEB image base, per-thread static TLS) and console `VirtualAlloc` handling
-- The FH3 demo runs through CRT startup and static initialization, activates `CoreApplication`, starts reading its `hash.manifest`, then fails on an uncaught WinRT `E_INVALIDARG` exception; it does not reach a game loop. Titles are UWP apps, so a WinRT shell layer is the next big piece
+- The FH3 demo runs through CRT startup and static initialization and into `IFrameworkView::Initialize`, then fails after a failed `QueryInterface`; it does not reach a game loop
+- A WinRT shell layer (`src/winrt.rs`): our own `CoreApplication`, view, window and dispatcher run the title's `IFrameworkView` lifecycle. The FH3 demo now reaches `IFrameworkView::Initialize`, then needs the console-only `Windows.Xbox.*` WinRT classes (served by a generic discovery stand-in for now)
+- `XMem*` console memory API
 - `--ring=<path>` crash-proof trace and `tools\read-ring.ps1` to read it
 - Successfully loads the unpacked Forza Horizon 3 kiosk demo binary in load-only mode
 

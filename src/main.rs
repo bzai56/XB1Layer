@@ -7,6 +7,8 @@
 //!
 //! Usage: xb1layer <file.exe> [--run]
 
+mod winrt;
+
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::{c_void, CString};
 use std::path::Path;
@@ -27,6 +29,7 @@ unsafe extern "system" {
     fn GetFileInformationByHandleEx(h: *mut c_void, class: u32, buf: *mut c_void, size: u32) -> i32;
     fn GetLastError() -> u32;
     fn CreateThread(attrs: *mut c_void, stack: usize, routine: usize, param: *mut c_void, flags: u32, tid: *mut u32) -> *mut c_void;
+    fn VirtualFree(addr: *mut c_void, size: usize, ty: u32) -> i32;
     fn HeapCreate(options: u32, initial: usize, max: usize) -> *mut c_void;
     fn HeapValidate(heap: *mut c_void, flags: u32, mem: *const c_void) -> i32;
     fn GetProcessHeap() -> *mut c_void;
@@ -184,15 +187,19 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
     unsafe {
         let rec = *info;
         let code = *(rec as *const u32);
-        if code & 0xF000_0000 != 0xC000_0000 {
+        // Fatal-looking codes, plus MSVC C++ throws (0xE06D7363), which are routine but
+        // worth seeing while a title is failing: they show where it throws.
+        static CPP_LOGGED: AtomicUsize = AtomicUsize::new(0);
+        let is_cpp = code == 0xE06D_7363 && CPP_LOGGED.fetch_add(1, Ordering::Relaxed) < 30;
+        if code & 0xF000_0000 != 0xC000_0000 && !is_cpp {
             return 0;
         }
         let addr = *(rec.add(16) as *const usize);
         let seen = SEEN_COUNT.load(Ordering::Relaxed).min(SEEN_FAULTS.len());
-        if SEEN_FAULTS[..seen].iter().any(|s| s.load(Ordering::Relaxed) == addr) {
+        if !is_cpp && SEEN_FAULTS[..seen].iter().any(|s| s.load(Ordering::Relaxed) == addr) {
             return 0;
         }
-        if seen < SEEN_FAULTS.len() {
+        if !is_cpp && seen < SEEN_FAULTS.len() {
             SEEN_FAULTS[SEEN_COUNT.fetch_add(1, Ordering::Relaxed).min(SEEN_FAULTS.len() - 1)].store(addr, Ordering::Relaxed);
         }
         let mut loc = RawBuf::new();
@@ -242,7 +249,7 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                 break;
             }
             let v = *((rsp + i * 8) as *const usize);
-            if v >= base && v < base + size && *((v - 5) as *const u8) == 0xE8 || (v >= base + 6 && v < base + size && *((v - 6) as *const u8) == 0xFF && *((v - 5) as *const u8) == 0x15) {
+            if v >= base + 8 && v < base + size && (*((v - 5) as *const u8) == 0xE8 || (*((v - 6) as *const u8) == 0xFF && *((v - 5) as *const u8) == 0x15)) {
                 rlog!("  stack+{:#x}: return address title+{:#x}", i * 8, v - base);
                 shown += 1;
                 if shown == 12 {
@@ -565,10 +572,7 @@ extern "system" fn xb_get_process_heap() -> *mut c_void {
 
 /// Imports we implement ourselves instead of forwarding to Windows.
 fn override_for(dll: &str, func: &str) -> Option<usize> {
-    if dll.eq_ignore_ascii_case("vccorlib140.dll")
-        && func.starts_with("?GetActivationFactoryByPCWSTR")
-        && RING.load(Ordering::Relaxed) != 0
-    {
+    if dll.eq_ignore_ascii_case("vccorlib140.dll") && func.starts_with("?GetActivationFactoryByPCWSTR") {
         return Some(xb_get_activation_factory as usize);
     }
     if !dll.eq_ignore_ascii_case("kernelx.dll") && !dll.eq_ignore_ascii_case("kernel32.dll") {
@@ -579,6 +583,10 @@ fn override_for(dll: &str, func: &str) -> Option<usize> {
         "HeapAlloc" if TRACE_HEAP.load(Ordering::Relaxed) => Some(xb_heap_alloc as usize),
         "HeapFree" if TRACE_HEAP.load(Ordering::Relaxed) => Some(xb_heap_free as usize),
         "VirtualAlloc" => Some(xb_virtual_alloc as usize),
+        "XMemAlloc" | "XMemAllocDefault" => Some(xb_xmem_alloc as usize),
+        "XMemFree" | "XMemFreeDefault" => Some(xb_xmem_free as usize),
+        "XMemSetAllocationHooks" => Some(xb_xmem_set_hooks as usize),
+        "TitleMemoryStatus" => Some(xb_title_memory_status as usize),
         "CreateThread" => Some(xb_create_thread as usize),
         "CreateFile2" if RING.load(Ordering::Relaxed) != 0 => Some(xb_create_file2 as usize),
         "FindFirstFileExA" if RING.load(Ordering::Relaxed) != 0 => Some(xb_find_first_file_ex_a as usize),
@@ -602,6 +610,49 @@ extern "system" fn xb_heap_alloc(heap: *mut c_void, flags: u32, size: usize) -> 
     let p = real(heap, flags, size);
     rlog!("HeapAlloc(heap={heap:p}, flags={flags:#x}, size={size}) -> {p:p}");
     p
+}
+
+/// `XMemAlloc(size, attributes)`: the console's title-memory allocator. The attribute bits
+/// (alignment, memory type) are not decoded yet, so every block is page-backed and aligned
+/// to 64 KB, which satisfies any alignment a title is likely to ask for.
+extern "system" fn xb_xmem_alloc(size: usize, attrs: u64) -> *mut c_void {
+    const GRANULE: usize = 64 << 10;
+    let rounded = (size.max(1) + GRANULE - 1) & !(GRANULE - 1);
+    let p = unsafe { VirtualAlloc(ptr::null_mut(), rounded, MEM_COMMIT_RESERVE, 0x04) };
+    ring_write(format_args!("  XMemAlloc(size={size:#x}, attrs={attrs:#x}) -> {p:p}\n"));
+    p
+}
+
+/// `XMemFree(address, attributes)`; any further arguments a title passes are ignored.
+extern "system" fn xb_xmem_free(p: *mut c_void, attrs: u64) {
+    ring_write(format_args!("  XMemFree({p:p}, attrs={attrs:#x})\n"));
+    if !p.is_null() {
+        unsafe { VirtualFree(p, 0, 0x8000) }; // MEM_RELEASE
+    }
+}
+
+/// `XMemSetAllocationHooks`: accepted and ignored for now (allocations are not redirected).
+extern "system" fn xb_xmem_set_hooks(_alloc: usize, _free: usize) {
+    ring_write(format_args!("  XMemSetAllocationHooks (ignored)\n"));
+}
+
+/// `TitleMemoryStatus(TITLEMEMORYSTATUS*)`. The struct layout is not verified: this zero-fills
+/// up to the caller-supplied `dwLength` and reports a total/available pair at offsets 8/16,
+/// which is a guess based on the console SDK's documented field order.
+extern "system" fn xb_title_memory_status(p: *mut u8) -> i32 {
+    if p.is_null() {
+        return 0;
+    }
+    unsafe {
+        let len = (*(p as *const u32) as usize).min(256);
+        ptr::write_bytes(p.add(4), 0, len.saturating_sub(4));
+        if len >= 24 {
+            *(p.add(8) as *mut u64) = 5 << 30; // total title memory: 5 GiB
+            *(p.add(16) as *mut u64) = (9u64 << 30) / 2; // available: 4.5 GiB
+        }
+    }
+    ring_write(format_args!("  TitleMemoryStatus (layout guessed)\n"));
+    1
 }
 
 /// Allocation-type bits desktop Windows accepts. Titles also pass console-only bits
@@ -647,6 +698,12 @@ extern "system" fn xb_create_file_w(name: *const u16, access: u32, share: u32, s
 /// C++/CX `GetActivationFactoryByPCWSTR(class_name, guid, out)`: looks up a WinRT class factory.
 /// Passed through to the real vccorlib140; logs the class name and the HRESULT.
 extern "system" fn xb_get_activation_factory(name: *const u16, guid: *const u8, out: *mut *mut c_void) -> i32 {
+    if !guid.is_null() && !out.is_null() {
+        let class = wide_to_string(name);
+        if let Some(hr) = winrt::try_activation_factory(&class, unsafe { &*(guid as *const windows::core::GUID) }, out) {
+            return hr.0;
+        }
+    }
     let real: extern "system" fn(*const u16, *const u8, *mut *mut c_void) -> i32 = unsafe {
         let m = LoadLibraryA(c"vccorlib140.dll".as_ptr());
         std::mem::transmute(GetProcAddress(m, c"?GetActivationFactoryByPCWSTR@@YAJPEAXAEAVGuid@Platform@@PEAPEAX@Z".as_ptr()))

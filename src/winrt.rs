@@ -1,0 +1,680 @@
+﻿//! WinRT shell layer: our own `CoreApplication`, `CoreApplicationView`, `CoreWindow`
+//! and dispatcher, so a UWP-style title's `IFrameworkView` callbacks run under our control.
+//!
+//! The title is a C++/CX app. It reaches this layer through `GetActivationFactoryByPCWSTR`
+//! (see `try_activation_factory`), calls `ICoreApplication::Run(source)`, and from then on
+//! talks to the view, window and dispatcher objects created here.
+//!
+//! `ICoreWindow` and the activation-args interfaces are implemented with the `windows`
+//! crate. `ICoreApplication`, `ICoreApplicationView` and `ICoreDispatcher` have no
+//! implementable trait there, so they are small hand-written COM objects built on the
+//! crate's vtable structs (which gives the correct slot order).
+
+use std::collections::VecDeque;
+use std::ffi::c_void;
+use std::marker::PhantomData;
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+use windows::ApplicationModel::Activation::*;
+use windows::ApplicationModel::Core::*;
+use windows::Foundation::Collections::*;
+use windows::Foundation::*;
+use windows::UI::Core::*;
+use windows::Win32::Foundation::{E_NOINTERFACE, E_NOTIMPL, E_POINTER};
+use windows::core::*;
+
+macro_rules! wlog {
+    ($($t:tt)*) => { crate::raw_log(format_args!($($t)*)) };
+}
+
+unsafe extern "system" {
+    fn GetCurrentThreadId() -> u32;
+}
+
+unsafe extern "system" {
+    fn VirtualQuery(addr: *mut c_void, info: *mut c_void, len: usize) -> usize;
+}
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn PeekMessageW(msg: *mut [u8; 48], hwnd: *mut c_void, min: u32, max: u32, remove: u32) -> i32;
+    fn TranslateMessage(msg: *const [u8; 48]) -> i32;
+    fn DispatchMessageW(msg: *const [u8; 48]) -> isize;
+    fn MsgWaitForMultipleObjects(n: u32, handles: *const c_void, all: i32, ms: u32, mask: u32) -> u32;
+}
+
+static NEXT_TOKEN: AtomicI64 = AtomicI64::new(1);
+
+fn next_token() -> i64 {
+    NEXT_TOKEN.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Process-wide shell state. The title may call in from several threads.
+struct Shell {
+    view: *mut c_void,
+    window: ICoreWindow,
+    dispatcher: *mut c_void,
+    activated: Mutex<Vec<(i64, TypedEventHandler<CoreApplicationView, IActivatedEventArgs>)>>,
+    queue: Mutex<VecDeque<DispatchedHandler>>,
+    quit: AtomicBool,
+    ui_thread: AtomicU32,
+}
+
+unsafe impl Send for Shell {}
+unsafe impl Sync for Shell {}
+
+static SHELL: OnceLock<Shell> = OnceLock::new();
+
+fn shell() -> &'static Shell {
+    SHELL.get_or_init(|| Shell {
+        view: Com::<AppViewTag>::create(()),
+        window: Window.into(),
+        dispatcher: Com::<DispatcherTag>::create(()),
+        activated: Mutex::new(Vec::new()),
+        queue: Mutex::new(VecDeque::new()),
+        quit: AtomicBool::new(false),
+        ui_thread: AtomicU32::new(0),
+    })
+}
+
+// ---------------------------------------------------------------------------------------
+// Minimal hand-written COM objects
+// ---------------------------------------------------------------------------------------
+
+trait Iface: 'static {
+    const IID: GUID;
+    const NAME: &'static str;
+    type Vtbl: 'static;
+    type State: Send + Sync + 'static;
+    const VTBL: &'static Self::Vtbl;
+}
+
+#[repr(C)]
+struct Com<T: Iface> {
+    vtbl: *const T::Vtbl,
+    refs: AtomicU32,
+    #[allow(dead_code)]
+    state: T::State,
+    _p: PhantomData<T>,
+}
+
+impl<T: Iface> Com<T> {
+    /// Returns a new object with one reference owned by the caller.
+    fn create(state: T::State) -> *mut c_void {
+        Box::into_raw(Box::new(Com::<T> { vtbl: T::VTBL, refs: AtomicU32::new(1), state, _p: PhantomData })) as *mut c_void
+    }
+}
+
+unsafe extern "system" fn com_query_interface<T: Iface>(this: *mut c_void, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    let iid = unsafe { *iid };
+    if iid == IUnknown::IID || iid == IInspectable::IID || iid == T::IID {
+        unsafe {
+            com_add_ref::<T>(this);
+            *out = this;
+        }
+        HRESULT(0)
+    } else {
+        unsafe { *out = ptr::null_mut() };
+        wlog!("[winrt] {}::QueryInterface({iid:?}) -> E_NOINTERFACE", T::NAME);
+        E_NOINTERFACE
+    }
+}
+
+unsafe extern "system" fn com_add_ref<T: Iface>(this: *mut c_void) -> u32 {
+    unsafe { (*(this as *const Com<T>)).refs.fetch_add(1, Ordering::AcqRel) + 1 }
+}
+
+unsafe extern "system" fn com_release<T: Iface>(this: *mut c_void) -> u32 {
+    let left = unsafe { (*(this as *const Com<T>)).refs.fetch_sub(1, Ordering::AcqRel) - 1 };
+    if left == 0 {
+        drop(unsafe { Box::from_raw(this as *mut Com<T>) });
+    }
+    left
+}
+
+unsafe extern "system" fn com_get_iids(_this: *mut c_void, count: *mut u32, iids: *mut *mut GUID) -> HRESULT {
+    unsafe {
+        *count = 0;
+        *iids = ptr::null_mut();
+    }
+    HRESULT(0)
+}
+
+unsafe extern "system" fn com_get_runtime_class_name<T: Iface>(_this: *mut c_void, out: *mut *mut c_void) -> HRESULT {
+    unsafe { *out = std::mem::transmute::<HSTRING, *mut c_void>(HSTRING::from(T::NAME)) };
+    HRESULT(0)
+}
+
+unsafe extern "system" fn com_get_trust_level(_this: *mut c_void, level: *mut i32) -> HRESULT {
+    unsafe { *level = 0 };
+    HRESULT(0)
+}
+
+const fn inspectable<T: Iface>() -> IInspectable_Vtbl {
+    IInspectable_Vtbl {
+        base: IUnknown_Vtbl { QueryInterface: com_query_interface::<T>, AddRef: com_add_ref::<T>, Release: com_release::<T> },
+        GetIids: com_get_iids,
+        GetRuntimeClassName: com_get_runtime_class_name::<T>,
+        GetTrustLevel: com_get_trust_level,
+    }
+}
+
+fn to_hr(r: Result<()>) -> HRESULT {
+    match r {
+        Ok(()) => HRESULT(0),
+        Err(e) => {
+            wlog!("[winrt] call failed: {e}");
+            e.code()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// ICoreApplication (the CoreApplication statics)
+// ---------------------------------------------------------------------------------------
+
+struct CoreAppTag;
+
+impl Iface for CoreAppTag {
+    const IID: GUID = ICoreApplication::IID;
+    const NAME: &'static str = "Windows.ApplicationModel.Core.CoreApplication";
+    type Vtbl = ICoreApplication_Vtbl;
+    type State = ();
+    const VTBL: &'static Self::Vtbl = &ICoreApplication_Vtbl {
+        base__: inspectable::<CoreAppTag>(),
+        Id: app_id,
+        Suspending: app_add_event,
+        RemoveSuspending: app_remove_event,
+        Resuming: app_add_event,
+        RemoveResuming: app_remove_event,
+        Properties: app_properties,
+        GetCurrentView: app_get_current_view,
+        Run: app_run,
+        RunWithActivationFactories: app_run_with_factories,
+    };
+}
+
+unsafe extern "system" fn app_id(_this: *mut c_void, out: *mut *mut c_void) -> HRESULT {
+    wlog!("[winrt] CoreApplication::Id");
+    unsafe { *out = std::mem::transmute::<HSTRING, *mut c_void>(HSTRING::from("App")) };
+    HRESULT(0)
+}
+
+unsafe extern "system" fn app_add_event(_this: *mut c_void, _handler: *mut c_void, token: *mut i64) -> HRESULT {
+    wlog!("[winrt] CoreApplication::add_Suspending/Resuming");
+    unsafe { *token = next_token() };
+    HRESULT(0)
+}
+
+unsafe extern "system" fn app_remove_event(_this: *mut c_void, _token: i64) -> HRESULT {
+    HRESULT(0)
+}
+
+unsafe extern "system" fn app_properties(_this: *mut c_void, out: *mut *mut c_void) -> HRESULT {
+    wlog!("[winrt] CoreApplication::Properties");
+    match PropertySet::new().and_then(|p| p.cast::<IPropertySet>()) {
+        Ok(p) => {
+            unsafe { *out = p.into_raw() };
+            HRESULT(0)
+        }
+        Err(e) => e.code(),
+    }
+}
+
+unsafe extern "system" fn app_get_current_view(_this: *mut c_void, out: *mut *mut c_void) -> HRESULT {
+    wlog!("[winrt] CoreApplication::GetCurrentView");
+    unsafe { *out = add_ref_raw::<AppViewTag>(shell().view) };
+    HRESULT(0)
+}
+
+unsafe extern "system" fn app_run_with_factories(_this: *mut c_void, _f: *mut c_void) -> HRESULT {
+    wlog!("[winrt] CoreApplication::RunWithActivationFactories (not implemented)");
+    E_NOTIMPL
+}
+
+/// `CoreApplication::Run(IFrameworkViewSource)`: drives the title's `IFrameworkView`
+/// through its lifecycle.
+unsafe extern "system" fn app_run(_this: *mut c_void, source: *mut c_void) -> HRESULT {
+    wlog!("[winrt] CoreApplication::Run");
+    let Some(source) = (unsafe { IFrameworkViewSource::from_raw_borrowed(&source) }) else {
+        return E_POINTER;
+    };
+    to_hr(run_view(source))
+}
+
+fn run_view(source: &IFrameworkViewSource) -> Result<()> {
+    let sh = shell();
+    sh.ui_thread.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
+
+    let view = source.CreateView()?;
+    wlog!("[winrt] IFrameworkViewSource::CreateView ok");
+    let app_view: CoreApplicationView = unsafe { ICoreApplicationView::from_raw_borrowed(&sh.view) }.unwrap().cast()?;
+
+    wlog!("[winrt] IFrameworkView::Initialize");
+    view.Initialize(&app_view)?;
+    let window: CoreWindow = sh.window.cast()?;
+    wlog!("[winrt] IFrameworkView::SetWindow");
+    view.SetWindow(&window)?;
+    wlog!("[winrt] IFrameworkView::Load");
+    view.Load(&HSTRING::new())?;
+
+    // The real shell raises Activated once the view is loaded.
+    let args: IActivatedEventArgs = LaunchArgs.into();
+    let handlers: Vec<_> = sh.activated.lock().unwrap().iter().map(|(_, h)| h.clone()).collect();
+    wlog!("[winrt] raising CoreApplicationView::Activated to {} handler(s)", handlers.len());
+    for h in handlers {
+        h.Invoke(&app_view, &args)?;
+    }
+
+    wlog!("[winrt] IFrameworkView::Run");
+    view.Run()?;
+    wlog!("[winrt] IFrameworkView::Uninitialize");
+    view.Uninitialize()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------
+// ICoreApplicationView
+// ---------------------------------------------------------------------------------------
+
+struct AppViewTag;
+
+impl Iface for AppViewTag {
+    const IID: GUID = ICoreApplicationView::IID;
+    const NAME: &'static str = "Windows.ApplicationModel.Core.CoreApplicationView";
+    type Vtbl = ICoreApplicationView_Vtbl;
+    type State = ();
+    const VTBL: &'static Self::Vtbl = &ICoreApplicationView_Vtbl {
+        base__: inspectable::<AppViewTag>(),
+        CoreWindow: view_core_window,
+        Activated: view_add_activated,
+        RemoveActivated: view_remove_activated,
+        IsMain: view_is_main,
+        IsHosted: view_is_hosted,
+    };
+}
+
+unsafe fn add_ref_raw<T: Iface>(p: *mut c_void) -> *mut c_void {
+    unsafe { com_add_ref::<T>(p) };
+    p
+}
+
+unsafe extern "system" fn view_core_window(_this: *mut c_void, out: *mut *mut c_void) -> HRESULT {
+    wlog!("[winrt] CoreApplicationView::CoreWindow");
+    unsafe { *out = shell().window.clone().into_raw() };
+    HRESULT(0)
+}
+
+unsafe extern "system" fn view_add_activated(_this: *mut c_void, handler: *mut c_void, token: *mut i64) -> HRESULT {
+    let h = unsafe { TypedEventHandler::<CoreApplicationView, IActivatedEventArgs>::from_raw_borrowed(&handler) };
+    let Some(h) = h else { return E_POINTER };
+    let t = next_token();
+    shell().activated.lock().unwrap().push((t, h.clone()));
+    wlog!("[winrt] CoreApplicationView::add_Activated");
+    unsafe { *token = t };
+    HRESULT(0)
+}
+
+unsafe extern "system" fn view_remove_activated(_this: *mut c_void, token: i64) -> HRESULT {
+    shell().activated.lock().unwrap().retain(|(t, _)| *t != token);
+    HRESULT(0)
+}
+
+unsafe extern "system" fn view_is_main(_this: *mut c_void, out: *mut bool) -> HRESULT {
+    unsafe { *out = true };
+    HRESULT(0)
+}
+
+unsafe extern "system" fn view_is_hosted(_this: *mut c_void, out: *mut bool) -> HRESULT {
+    unsafe { *out = false };
+    HRESULT(0)
+}
+
+// ---------------------------------------------------------------------------------------
+// ICoreDispatcher
+// ---------------------------------------------------------------------------------------
+
+struct DispatcherTag;
+
+impl Iface for DispatcherTag {
+    const IID: GUID = ICoreDispatcher::IID;
+    const NAME: &'static str = "Windows.UI.Core.CoreDispatcher";
+    type Vtbl = ICoreDispatcher_Vtbl;
+    type State = ();
+    const VTBL: &'static Self::Vtbl = &ICoreDispatcher_Vtbl {
+        base__: inspectable::<DispatcherTag>(),
+        HasThreadAccess: disp_has_thread_access,
+        ProcessEvents: disp_process_events,
+        RunAsync: disp_run_async,
+        RunIdleAsync: disp_run_idle_async,
+    };
+}
+
+unsafe extern "system" fn disp_has_thread_access(_this: *mut c_void, out: *mut bool) -> HRESULT {
+    let ui = shell().ui_thread.load(Ordering::Relaxed);
+    unsafe { *out = ui == 0 || ui == GetCurrentThreadId() };
+    HRESULT(0)
+}
+
+/// Runs queued work items, then pumps Win32 messages.
+fn pump_once() -> bool {
+    let mut did = false;
+    loop {
+        let item = shell().queue.lock().unwrap().pop_front();
+        let Some(item) = item else { break };
+        did = true;
+        if let Err(e) = item.Invoke() {
+            wlog!("[winrt] dispatched work item failed: {e}");
+        }
+    }
+    let mut msg = [0u8; 48];
+    // PM_REMOVE
+    while unsafe { PeekMessageW(&mut msg, ptr::null_mut(), 0, 0, 1) } != 0 {
+        did = true;
+        unsafe {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    did
+}
+
+unsafe extern "system" fn disp_process_events(_this: *mut c_void, option: CoreProcessEventsOption) -> HRESULT {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        wlog!("[winrt] CoreDispatcher::ProcessEvents(option={})", option.0);
+    }
+    if option == CoreProcessEventsOption::ProcessUntilQuit {
+        while !shell().quit.load(Ordering::Relaxed) {
+            if !pump_once() {
+                // QS_ALLINPUT; wake on input or after a short timeout to re-check the queue.
+                unsafe { MsgWaitForMultipleObjects(0, ptr::null(), 0, 10, 0x4FF) };
+            }
+        }
+    } else {
+        pump_once();
+    }
+    HRESULT(0)
+}
+
+unsafe extern "system" fn disp_run_async(_this: *mut c_void, _priority: CoreDispatcherPriority, handler: *mut c_void, out: *mut *mut c_void) -> HRESULT {
+    let Some(h) = (unsafe { DispatchedHandler::from_raw_borrowed(&handler) }) else { return E_POINTER };
+    shell().queue.lock().unwrap().push_back(h.clone());
+    match windows_future::IAsyncAction::ready(Ok(())) {
+        action => {
+            unsafe { *out = action.into_raw() };
+            HRESULT(0)
+        }
+    }
+}
+
+unsafe extern "system" fn disp_run_idle_async(_this: *mut c_void, _handler: *mut c_void, out: *mut *mut c_void) -> HRESULT {
+    wlog!("[winrt] CoreDispatcher::RunIdleAsync (not implemented)");
+    unsafe { *out = ptr::null_mut() };
+    E_NOTIMPL
+}
+
+// ---------------------------------------------------------------------------------------
+// ICoreWindow
+// ---------------------------------------------------------------------------------------
+
+#[implement(ICoreWindow)]
+struct Window;
+
+macro_rules! window_events {
+    ($(($add:ident, $remove:ident, $arg:ty)),* $(,)?) => {
+        $(
+            fn $add(&self, _handler: Ref<TypedEventHandler<CoreWindow, $arg>>) -> Result<i64> {
+                wlog!(concat!("[winrt] CoreWindow::", stringify!($add)));
+                Ok(next_token())
+            }
+            fn $remove(&self, _cookie: i64) -> Result<()> {
+                Ok(())
+            }
+        )*
+    };
+}
+
+impl ICoreWindow_Impl for Window_Impl {
+    fn AutomationHostProvider(&self) -> Result<IInspectable> {
+        wlog!("[winrt] CoreWindow::AutomationHostProvider");
+        Err(E_NOTIMPL.into())
+    }
+    fn Bounds(&self) -> Result<Rect> {
+        wlog!("[winrt] CoreWindow::Bounds");
+        Ok(Rect { X: 0.0, Y: 0.0, Width: 1920.0, Height: 1080.0 })
+    }
+    fn CustomProperties(&self) -> Result<IPropertySet> {
+        wlog!("[winrt] CoreWindow::CustomProperties");
+        PropertySet::new()?.cast()
+    }
+    fn Dispatcher(&self) -> Result<CoreDispatcher> {
+        wlog!("[winrt] CoreWindow::Dispatcher");
+        unsafe { ICoreDispatcher::from_raw_borrowed(&shell().dispatcher) }.unwrap().cast()
+    }
+    fn FlowDirection(&self) -> Result<CoreWindowFlowDirection> {
+        Ok(CoreWindowFlowDirection::LeftToRight)
+    }
+    fn SetFlowDirection(&self, _value: CoreWindowFlowDirection) -> Result<()> {
+        Ok(())
+    }
+    fn IsInputEnabled(&self) -> Result<bool> {
+        Ok(true)
+    }
+    fn SetIsInputEnabled(&self, _value: bool) -> Result<()> {
+        Ok(())
+    }
+    fn PointerCursor(&self) -> Result<CoreCursor> {
+        wlog!("[winrt] CoreWindow::PointerCursor");
+        Err(E_NOTIMPL.into())
+    }
+    fn SetPointerCursor(&self, _value: Ref<CoreCursor>) -> Result<()> {
+        wlog!("[winrt] CoreWindow::SetPointerCursor");
+        Ok(())
+    }
+    fn PointerPosition(&self) -> Result<Point> {
+        Ok(Point { X: 0.0, Y: 0.0 })
+    }
+    fn Visible(&self) -> Result<bool> {
+        Ok(true)
+    }
+    fn Activate(&self) -> Result<()> {
+        wlog!("[winrt] CoreWindow::Activate");
+        Ok(())
+    }
+    fn Close(&self) -> Result<()> {
+        wlog!("[winrt] CoreWindow::Close");
+        shell().quit.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+    fn GetAsyncKeyState(&self, _key: windows::System::VirtualKey) -> Result<CoreVirtualKeyStates> {
+        Ok(CoreVirtualKeyStates::None)
+    }
+    fn GetKeyState(&self, _key: windows::System::VirtualKey) -> Result<CoreVirtualKeyStates> {
+        Ok(CoreVirtualKeyStates::None)
+    }
+    fn ReleasePointerCapture(&self) -> Result<()> {
+        Ok(())
+    }
+    fn SetPointerCapture(&self) -> Result<()> {
+        Ok(())
+    }
+
+    window_events!(
+        (Activated, RemoveActivated, WindowActivatedEventArgs),
+        (AutomationProviderRequested, RemoveAutomationProviderRequested, AutomationProviderRequestedEventArgs),
+        (CharacterReceived, RemoveCharacterReceived, CharacterReceivedEventArgs),
+        (Closed, RemoveClosed, CoreWindowEventArgs),
+        (InputEnabled, RemoveInputEnabled, InputEnabledEventArgs),
+        (KeyDown, RemoveKeyDown, KeyEventArgs),
+        (KeyUp, RemoveKeyUp, KeyEventArgs),
+        (PointerCaptureLost, RemovePointerCaptureLost, PointerEventArgs),
+        (PointerEntered, RemovePointerEntered, PointerEventArgs),
+        (PointerExited, RemovePointerExited, PointerEventArgs),
+        (PointerMoved, RemovePointerMoved, PointerEventArgs),
+        (PointerPressed, RemovePointerPressed, PointerEventArgs),
+        (PointerReleased, RemovePointerReleased, PointerEventArgs),
+        (TouchHitTesting, RemoveTouchHitTesting, TouchHitTestingEventArgs),
+        (PointerWheelChanged, RemovePointerWheelChanged, PointerEventArgs),
+        (SizeChanged, RemoveSizeChanged, WindowSizeChangedEventArgs),
+        (VisibilityChanged, RemoveVisibilityChanged, VisibilityChangedEventArgs),
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Activation arguments
+// ---------------------------------------------------------------------------------------
+
+#[implement(ILaunchActivatedEventArgs, IActivatedEventArgs)]
+struct LaunchArgs;
+
+impl IActivatedEventArgs_Impl for LaunchArgs_Impl {
+    fn Kind(&self) -> Result<ActivationKind> {
+        Ok(ActivationKind::Launch)
+    }
+    fn PreviousExecutionState(&self) -> Result<ApplicationExecutionState> {
+        Ok(ApplicationExecutionState::NotRunning)
+    }
+    fn SplashScreen(&self) -> Result<SplashScreen> {
+        wlog!("[winrt] LaunchActivatedEventArgs::SplashScreen");
+        Err(E_NOTIMPL.into())
+    }
+}
+
+impl ILaunchActivatedEventArgs_Impl for LaunchArgs_Impl {
+    fn Arguments(&self) -> Result<HSTRING> {
+        Ok(HSTRING::new())
+    }
+    fn TileId(&self) -> Result<HSTRING> {
+        Ok(HSTRING::new())
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Generic stand-in for console-only WinRT classes (Windows.Xbox.*)
+// ---------------------------------------------------------------------------------------
+//
+// There is no metadata for these classes here, so their interfaces are unknown. This object
+// answers QueryInterface for any IID and logs every method call by vtable slot. Methods
+// report success without writing any out-parameter (or hand back another stand-in when the
+// first argument looks like one), so this is for discovery only.
+
+const GENERIC_SLOTS: usize = 64;
+
+#[repr(C)]
+struct GenericObj {
+    vtbl: *const usize,
+    refs: AtomicU32,
+    class: String,
+    iid: GUID,
+}
+
+unsafe extern "system" fn generic_qi(this: *mut c_void, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    let o = unsafe { &*(this as *const GenericObj) };
+    wlog!("[winrt] {}::QueryInterface({:?}) -> self", o.class, unsafe { *iid });
+    o.refs.fetch_add(1, Ordering::AcqRel);
+    unsafe { *out = this };
+    HRESULT(0)
+}
+
+unsafe extern "system" fn generic_add_ref(this: *mut c_void) -> u32 {
+    unsafe { (*(this as *const GenericObj)).refs.fetch_add(1, Ordering::AcqRel) + 1 }
+}
+
+unsafe extern "system" fn generic_release(this: *mut c_void) -> u32 {
+    let left = unsafe { (*(this as *const GenericObj)).refs.fetch_sub(1, Ordering::AcqRel) - 1 };
+    if left == 0 {
+        drop(unsafe { Box::from_raw(this as *mut GenericObj) });
+    }
+    left
+}
+
+unsafe extern "system" fn generic_class_name(this: *mut c_void, out: *mut *mut c_void) -> HRESULT {
+    let o = unsafe { &*(this as *const GenericObj) };
+    unsafe { *out = std::mem::transmute::<HSTRING, *mut c_void>(HSTRING::from(o.class.as_str())) };
+    HRESULT(0)
+}
+
+/// True if `p` points into committed, writable memory (so it can plausibly be an out-parameter).
+fn is_writable(p: *mut c_void) -> bool {
+    if (p as usize) < 0x10000 {
+        return false;
+    }
+    let mut mbi = [0u64; 8];
+    if unsafe { VirtualQuery(p, mbi.as_mut_ptr() as *mut c_void, 48) } == 0 {
+        return false;
+    }
+    let (state, protect) = (mbi[4] & 0xFFFF_FFFF, mbi[4] >> 32);
+    // MEM_COMMIT; PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+    state == 0x1000 && protect & 0xCC != 0
+}
+
+/// Any method of a stand-in object. The signature is unknown, so the first argument after
+/// `this` is treated as a possible out-parameter: if it points at writable memory, a new
+/// stand-in object is stored there and the call reports success (the common shape of a
+/// property getter or factory method). Otherwise the call fails with E_NOTIMPL.
+unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: *mut c_void) -> HRESULT {
+    let o = unsafe { &*(this as *const GenericObj) };
+    if is_writable(arg1) {
+        let child = create_generic(&format!("{}#slot{N}", o.class), &o.iid);
+        unsafe { *(arg1 as *mut *mut c_void) = child };
+        wlog!("[winrt] {} (iid {:?}): slot {N} called with out-param {arg1:p} -> returned a new stand-in object", o.class, o.iid);
+        HRESULT(0)
+    } else {
+        wlog!("[winrt] {} (iid {:?}): slot {N} called (arg1={arg1:p}, not writable) -> S_OK, nothing written", o.class, o.iid);
+        HRESULT(0)
+    }
+}
+
+macro_rules! generic_slots {
+    ($($n:literal),* $(,)?) => { [$(generic_slot::<$n> as usize),*] };
+}
+
+fn generic_vtbl() -> *const usize {
+    static VTBL: OnceLock<[usize; GENERIC_SLOTS]> = OnceLock::new();
+    VTBL.get_or_init(|| {
+        let mut v = [0usize; GENERIC_SLOTS];
+        v[0] = generic_qi as usize;
+        v[1] = generic_add_ref as usize;
+        v[2] = generic_release as usize;
+        v[3] = com_get_iids as usize;
+        v[4] = generic_class_name as usize;
+        v[5] = com_get_trust_level as usize;
+        let slots = generic_slots!(
+            6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
+            35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
+        );
+        v[6..].copy_from_slice(&slots);
+        v
+    })
+    .as_ptr()
+}
+
+fn create_generic(class: &str, iid: &GUID) -> *mut c_void {
+    Box::into_raw(Box::new(GenericObj { vtbl: generic_vtbl(), refs: AtomicU32::new(1), class: class.to_owned(), iid: *iid })) as *mut c_void
+}
+
+// ---------------------------------------------------------------------------------------
+// Hook for GetActivationFactoryByPCWSTR
+// ---------------------------------------------------------------------------------------
+
+/// Called before the real activation-factory lookup. Returns `Some(hr)` when the class is
+/// one we implement ourselves.
+pub fn try_activation_factory(class: &str, iid: &GUID, out: *mut *mut c_void) -> Option<HRESULT> {
+    if class.starts_with("Windows.Xbox.") || class.starts_with("Microsoft.Xbox.") {
+        unsafe { *out = create_generic(class, iid) };
+        wlog!("[winrt] generic stand-in for console-only class {class} (iid {iid:?})");
+        return Some(HRESULT(0));
+    }
+    if class != CoreAppTag::NAME {
+        return None;
+    }
+    let obj = Com::<CoreAppTag>::create(());
+    let hr = unsafe { com_query_interface::<CoreAppTag>(obj, iid, out) };
+    unsafe { com_release::<CoreAppTag>(obj) };
+    wlog!("[winrt] activation factory for {class}: iid={iid:?} -> {:#x}", hr.0 as u32);
+    Some(hr)
+}
+

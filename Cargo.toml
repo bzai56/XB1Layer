@@ -4,3 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+windows = { version = "0.62.2", features = ["ApplicationModel_Core", "ApplicationModel_Activation", "UI_Core", "Foundation", "Foundation_Collections", "Win32_System_WinRT", "Win32_Foundation", "UI_ViewManagement", "Storage", "System"] }
+windows-core = "0.62"
+windows-future = "0.3"

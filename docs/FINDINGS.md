@@ -51,8 +51,8 @@ Calling the entry point after the process bootstrap (see [ARCHITECTURE.md](ARCHI
 3. **Static TLS on every thread.** The title uses `__declspec(thread)` and starts worker threads. Threads created through `CreateThread` now get their own TLS block via a trampoline.
 4. **`XMemSetAllocationHooks`** is the first console-only stub the title actually calls, and it returns 0.
 
-## Where it stops now
-The process ends with exit code `0xC000027B` (`STATUS_STOWED_EXCEPTION`). One earlier run ended in `0xC0000409` instead; I did not find out why, and later runs all gave `0xC000027B`. Found with the crash-proof ring trace (`--ring=`, see [ARCHITECTURE.md](ARCHITECTURE.md)):
+## Where it stopped before the shell layer
+(Historical: this is the state before our own `CoreApplication` was added; see the next section for the current state.) The process ends with exit code `0xC000027B` (`STATUS_STOWED_EXCEPTION`). One earlier run ended in `0xC0000409` instead; I did not find out why, and later runs all gave `0xC000027B`. Found with the crash-proof ring trace (`--ring=`, see [ARCHITECTURE.md](ARCHITECTURE.md)):
 
 1. The title is a **C++/CX (WinRT) app**: it imports `vccorlib140.dll` and `combase.dll`.
 2. It first looks for `g:\hash.manifest`. `G:` is the console's game-content drive, which does not exist here, so `GetFileAttributesExA` and `FindFirstFileExA("g:\*")` fail with `ERROR_PATH_NOT_FOUND`. It then falls back to `.\hash.manifest` (found because the working directory is the title folder).
@@ -64,10 +64,23 @@ The process ends with exit code `0xC000027B` (`STATUS_STOWED_EXCEPTION`). One ea
 
 **What is not established:** which WinRT call returned `E_INVALIDARG`. WinRT method calls go through COM vtables, not through imports, so the API trace cannot see them. A reasonable guess is that the title runs inside the real `CoreApplication`, whose view and window objects do not exist for an unpackaged desktop process, but that has not been verified.
 
+## Under the WinRT shell layer
+With our own `CoreApplication` in place (see [ARCHITECTURE.md](ARCHITECTURE.md#winrt-shell-layer-srcwinrtrs)), the title's startup is visible:
+
+1. `CoreApplication::Run` → `IFrameworkViewSource::CreateView` succeeds → `IFrameworkView::Initialize` is entered and runs for a long time. `SetWindow`, `Load`, the `Activated` event and `Run` have not been reached yet.
+2. Inside `Initialize` the title calls console-only imports: `DXGIXSetVLineNotification` (still a stub), `XMemAllocDefault` and `TitleMemoryStatus`. With those stubbed it wrote through a NULL pointer; after implementing the `XMem*` family it got past that.
+3. It then activates **`Windows.Xbox.Management.Deployment.PackageTransferManager`**, a class that exists only on the console, so Windows answers `REGDB_E_CLASSNOTREG` (`0x80040154`). The C++/CX runtime throws a `ClassNotRegisteredException`, the title catches it and retries 594 times in the ring trace, then reaches a NULL read in its catch path.
+4. The statics interface it asks for has IID `D6CF4CAE-9EB1-4CBE-B426-7E75D429F846`. With a generic stand-in object (below) the title calls vtable slot 6 with an out-pointer, and then slot 7 on the result with a small changing value in the first argument register (`0xa9f`, `0xa95`, `0x8b`, `0x4f`, ...). The varying values suggest slot 7 may take no arguments, or that its arguments are not in that register, but this is a guess.
+5. The run now ends with `rax = 0x80004002` (`E_NOINTERFACE`) followed by a NULL read at `title+0x1616fd1`: some `QueryInterface` the title makes fails. Which object, and which interface, is not yet known.
+
+**What is established:** the title needs the `Windows.Xbox.*` WinRT surface, starting with `PackageTransferManager`, and it activates it very early.
+
+**What is not established:** the real method names, signatures and semantics of that class. There is no metadata for it on this machine, so slot numbers are the only handle. The stand-in's behavior (success without output, or a fresh stand-in object for an out-pointer) is a heuristic to keep the title moving, not an implementation.
+
 ## Next investigation steps
-1. Provide our own WinRT layer for the UWP shell (`CoreApplication`, `CoreApplicationView`, `CoreWindow`, dispatcher) backed by a native window, so the title's `IFrameworkView` callbacks (`Initialize`, `SetWindow`, `Load`, `Run`) run under our control and failures become visible.
-2. Wrap WinRT objects the title receives so their method calls are traceable.
-3. Provide a `G:` equivalent: map the title folder as the content root instead of relying on the working directory.
-4. Implement `XMem*` and `TitleMemoryStatus`.
+1. Find the failing `QueryInterface` at `title+0x1616fd1` (log every `QueryInterface` the title makes, including on objects we hand out).
+2. Work out the real shape of the `PackageTransferManager` interfaces, from the title's own usage or from the console SDK's published API reference if available, and implement them for real.
+3. Implement `DXGIXSetVLineNotification` and the rest of the `d3d11_x` surface.
+4. Provide a `G:` equivalent: map the title folder as the content root instead of relying on the working directory.
 5. Inspect `media/` to see whether content is plain or encrypted (encrypted content is out of scope).
-6. Work out which D3D11.X-only interfaces and methods the title calls on the returned device.
+6. Back the window with a native `HWND` and raise `CoreWindow` events.
