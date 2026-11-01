@@ -55,6 +55,8 @@ fn next_token() -> i64 {
 struct Shell {
     view: *mut c_void,
     window: ICoreWindow,
+    /// The window object handed to the title: a generic object with the console's layout.
+    console_window: *mut c_void,
     dispatcher: *mut c_void,
     activated: Mutex<Vec<(i64, TypedEventHandler<CoreApplicationView, IActivatedEventArgs>)>>,
     queue: Mutex<VecDeque<DispatchedHandler>>,
@@ -71,6 +73,11 @@ fn shell() -> &'static Shell {
     SHELL.get_or_init(|| Shell {
         view: Com::<AppViewTag>::create(()),
         window: Window.into(),
+        console_window: {
+            let o = create_generic("Windows.UI.Core.CoreWindow (console layout)", &ICoreWindow::IID);
+            unsafe { (*(o as *mut GenericObj)).kind = 2 };
+            o
+        },
         dispatcher: Com::<DispatcherTag>::create(()),
         activated: Mutex::new(Vec::new()),
         queue: Mutex::new(VecDeque::new()),
@@ -246,6 +253,9 @@ unsafe extern "system" fn app_run(_this: *mut c_void, source: *mut c_void) -> HR
 
 fn run_view(source: &IFrameworkViewSource) -> Result<()> {
     let sh = shell();
+    if crate::TRACE_WINDOW.load(Ordering::Relaxed) {
+        instrument_window();
+    }
     sh.ui_thread.store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
 
     let view = source.CreateView()?;
@@ -254,7 +264,7 @@ fn run_view(source: &IFrameworkViewSource) -> Result<()> {
 
     wlog!("[winrt] IFrameworkView::Initialize");
     view.Initialize(&app_view)?;
-    let window: CoreWindow = sh.window.cast()?;
+    let window: CoreWindow = unsafe { CoreWindow::from_raw_borrowed(&sh.console_window) }.unwrap().clone();
     wlog!("[winrt] IFrameworkView::SetWindow");
     view.SetWindow(&window)?;
     wlog!("[winrt] IFrameworkView::Load");
@@ -303,7 +313,7 @@ unsafe fn add_ref_raw<T: Iface>(p: *mut c_void) -> *mut c_void {
 
 unsafe extern "system" fn view_core_window(_this: *mut c_void, out: *mut *mut c_void) -> HRESULT {
     wlog!("[winrt] CoreApplicationView::CoreWindow");
-    unsafe { *out = shell().window.clone().into_raw() };
+    unsafe { *out = generic_add_ref_ret(shell().console_window) };
     HRESULT(0)
 }
 
@@ -585,6 +595,11 @@ unsafe extern "system" fn generic_add_ref(this: *mut c_void) -> u32 {
     unsafe { (*(this as *const GenericObj)).refs.fetch_add(1, Ordering::AcqRel) + 1 }
 }
 
+unsafe fn generic_add_ref_ret(p: *mut c_void) -> *mut c_void {
+    unsafe { generic_add_ref(p) };
+    p
+}
+
 unsafe extern "system" fn generic_release(this: *mut c_void) -> u32 {
     let left = unsafe { (*(this as *const GenericObj)).refs.fetch_sub(1, Ordering::AcqRel) - 1 };
     if left == 0 {
@@ -619,6 +634,28 @@ fn is_writable(p: *mut c_void) -> bool {
 /// property getter or factory method). Otherwise the call fails with E_NOTIMPL.
 unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: *mut c_void, arg2: *mut c_void) -> HRESULT {
     let o = unsafe { &*(this as *const GenericObj) };
+    if o.kind == 2 {
+        // Console CoreWindow. The title's vtable layout differs from desktop ICoreWindow:
+        // observed calls are slots 7, 11, 15, 23, 25 and 35, and slot 7 is followed by
+        // ProcessEvents on its result, so slot 7 is taken to be the Dispatcher getter. Slot 6
+        // is assumed to be Bounds. Everything else logs and succeeds; where a second argument
+        // is writable it receives an event-registration token (the shape of `add_*Event`).
+        match N {
+            6 if is_writable(arg1) => unsafe {
+                ptr::write_unaligned(arg1 as *mut Rect, Rect { X: 0.0, Y: 0.0, Width: 1920.0, Height: 1080.0 });
+            },
+            7 if is_writable(arg1) => unsafe {
+                ptr::write_unaligned(arg1 as *mut *mut c_void, add_ref_raw::<DispatcherTag>(shell().dispatcher));
+            },
+            // Looks like add_Event(handler, &token): both arguments are 8-byte-aligned pointers.
+            _ if N > 7 && (arg1 as usize) % 8 == 0 && (arg2 as usize) % 8 == 0 && is_writable(arg1) && is_writable(arg2) => unsafe {
+                ptr::write_unaligned(arg2 as *mut i64, next_token())
+            },
+            _ => {}
+        }
+        wlog!("[winrt] console CoreWindow slot {N} called (arg1={arg1:p}, arg2={arg2:p}) -> S_OK");
+        return HRESULT(0);
+    }
     if o.kind == 1 {
         // Console audio extension: the title calls slot 9 with a pointer to its own object
         // (looks like registering a callback) and slot 8 with two out-pointers that look
@@ -751,6 +788,57 @@ fn mm_vtbl() -> *const usize {
         ]
     })
     .as_ptr()
+}
+
+/// Number of vtable entries in `ICoreWindow` (IInspectable's 6, 18 methods/properties, and
+/// 17 event add/remove pairs).
+const CORE_WINDOW_SLOTS: usize = 6 + 18 + 34;
+
+/// Debug aid (`--trace-window`): replaces the window object's vtable pointer with a copy whose
+/// entries log "CoreWindow slot N" before jumping to the real implementation, so the slots
+/// the title really calls are visible. The title may have been built against a different
+/// `ICoreWindow` layout than desktop Windows.
+pub fn instrument_window() {
+    let sh = shell();
+    let obj = Interface::as_raw(&sh.window) as *mut usize;
+    let orig = unsafe { *obj } as *const usize;
+    let mut arena = Box::new(crate::StubArena::new());
+    let mut copy: Vec<usize> = (0..CORE_WINDOW_SLOTS).map(|i| unsafe { *orig.add(i) }).collect();
+    for i in 6..CORE_WINDOW_SLOTS {
+        copy[i] = arena.make_trace(format!("CoreWindow slot {i}"), copy[i] as u64) as usize;
+    }
+    // Both the arena and the copy must outlive the process.
+    Box::leak(arena);
+    let copy: &'static [usize] = Vec::leak(copy);
+    unsafe { *obj = copy.as_ptr() as usize };
+    wlog!("[winrt] ICoreWindow vtable instrumented ({CORE_WINDOW_SLOTS} slots)");
+}
+
+/// Names the shell object whose vtable is at `vtbl`, for crash reports. Allocation-free except
+/// for reading the shell's state, so it only looks at objects that already exist.
+pub fn identify_vtable(vtbl: usize) -> Option<&'static str> {
+    if vtbl == CoreAppTag::VTBL as *const _ as usize {
+        return Some("shell ICoreApplication");
+    }
+    if vtbl == AppViewTag::VTBL as *const _ as usize {
+        return Some("shell ICoreApplicationView");
+    }
+    if vtbl == DispatcherTag::VTBL as *const _ as usize {
+        return Some("shell ICoreDispatcher");
+    }
+    if vtbl == generic_vtbl() as usize {
+        return Some("generic Xbox stand-in");
+    }
+    if vtbl == mm_vtbl() as usize {
+        return Some("MMDevice enumerator proxy");
+    }
+    if let Some(sh) = SHELL.get() {
+        let w = Interface::as_raw(&sh.window);
+        if vtbl == unsafe { *(w as *const usize) } {
+            return Some("shell ICoreWindow");
+        }
+    }
+    None
 }
 
 /// Called after a successful `CoCreateInstance`. If the object is the standard MMDevice

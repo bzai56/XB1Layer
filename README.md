@@ -11,7 +11,7 @@ An experimental compatibility layer for running Xbox One (GDK/XDK "Durango") x64
 - `kernelx.dll` forwarded to `kernel32.dll`; DLLs next to the title are searched first
 - On the FH3 demo: 701 imports resolve natively, 39 remain stubbed
 - Process bootstrap (unwind tables, PEB image base, per-thread static TLS) and console `VirtualAlloc` handling
-- The FH3 demo runs through CRT startup and static initialization and into `IFrameworkView::Initialize`, then fails after a failed `QueryInterface`; it does not reach a game loop
+- The FH3 demo runs through CRT startup, `Initialize`, `SetWindow`, `Load`, activation and into `IFrameworkView::Run`, where its main loop calls the dispatcher repeatedly. A worker thread then faults inside `ntdll`; nothing is drawn yet
 - A WinRT shell layer (`src/winrt.rs`): our own `CoreApplication`, view, window and dispatcher run the title's `IFrameworkView` lifecycle. The FH3 demo now reaches `IFrameworkView::Initialize`, then needs the console-only `Windows.Xbox.*` WinRT classes (served by a generic discovery stand-in for now)
 - `XMem*` console memory API
 - `D3D11XCreateDeviceX` backed by a real desktop D3D11 device (`xb1layer --test-d3d` to check it), and a proxy for the console audio extension of the MMDevice enumerator

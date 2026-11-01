@@ -91,9 +91,25 @@ The title calls this on a worker thread. Meanwhile the UI thread, inside `IFrame
 
 **What is established:** device creation works in isolation. **What is not:** whether the title accepts a plain desktop device (it will likely call console-only `ID3D11DeviceX` methods and `DXGIX*` functions), and what the NULL read depends on.
 
+## The CoreWindow layout is not the desktop one
+The NULL read at `title+0x156fab7` was the title calling **slot 7 of its window object** (`Platform::Agile<CoreWindow>`) expecting an interface pointer back, then calling `ProcessEvents` on it. On desktop Windows `ICoreWindow` slot 7 is `Bounds` (a 16-byte rectangle), which is why the result was NULL. A tracer on the window's vtable (`--trace-window`, which copies the vtable with logging thunks) showed the slots the title really calls: **35, 15, 23, 25, 11, 7**. On desktop those would be `RemoveKeyDown`, `SetPointerCursor`, `SetPointerCapture`, `RemoveActivated`, `SetFlowDirection` and `Bounds`, none of which fit the call patterns.
+
+What the call patterns show instead:
+- **Slot 7** returns the dispatcher: the title calls `ProcessEvents(3)` (`ProcessAllIfPresent`) on its result, over and over, once per loop iteration. This was confirmed once the window handed it a dispatcher.
+- **Slots 15, 23, 25, 35** are `add_Event(handler, &token)`: each is called with a handler object and a pointer to the same stack variable. All four are odd slot numbers, so the event registrations sit at odd slots (add/remove pairs).
+- **Slot 11** is a setter taking the boolean `1`.
+
+So the console's `ICoreWindow` has a different member list from the desktop interface, and the exact layout is not known. The shell now gives the title a stand-in window (`console layout`) with these assumptions: slot 6 is Bounds (a guess), slot 7 is Dispatcher (confirmed by behavior), every other slot logs and succeeds, writing a token where the arguments look like `add_Event`. Event objects registered through it are not kept or raised yet, so the title never receives window events.
+
+With that in place the title's main loop runs: `IFrameworkView::Run` is entered, the dispatcher is called repeatedly, and the D3D11 device call is made.
+
+## The current fault
+A worker thread then crashes inside `ntdll` (`ntdll+0x5ac00`): a write at exactly 16 bytes below the start of a committed block, with the size argument a few KB (it varies per run: `0x333c`, `0x5938`). It looks like a fill or move that starts before the block, but nothing in the title's own frames is visible in the report. The cause is not known.
+
 ## Next investigation steps
-1. Find out which object the NULL read at `title+0x156fab7` goes through (its slot-7 call returns nothing).
-2. Implement `DXGIXSetVLineNotification`, `DXGIXPresentArray` and any other `DXGIX*` the title uses.
+1. Find the thread and caller of the `ntdll+0x5ac00` write (capture the stack on that thread, not just the exception site).
+2. Pin down the console `ICoreWindow` layout: keep logging slots as the title uses more of them, and keep stand-in behavior per slot only where the call pattern justifies it.
+3. Implement `DXGIXSetVLineNotification`, `DXGIXPresentArray` and any other `DXGIX*` the title uses.
 3. Work out the real shape of the `PackageTransferManager` interfaces, from the title's own usage or from the console SDK's published API reference if available, and implement them for real.
 3. Implement `DXGIXSetVLineNotification` and the rest of the `d3d11_x` surface.
 4. Provide a `G:` equivalent: map the title folder as the content root instead of relying on the working directory.

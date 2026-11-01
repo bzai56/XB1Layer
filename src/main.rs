@@ -212,6 +212,23 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
             "  rax={:#x} rcx={:#x} rdx={:#x} rbx={:#x} rsi={:#x} rdi={:#x} r8={:#x} r9={:#x} rsp={:#x}",
             reg(0x78), reg(0x80), reg(0x88), reg(0x90), reg(0xA8), reg(0xB0), reg(0xB8), reg(0xC0), reg(0x98)
         );
+        // For each register that holds a readable pointer, show who owns the first qword it
+        // points at. For a COM object that is its vtable, which identifies the implementation.
+        for (name, off) in [("rcx", 0x80), ("rdx", 0x88), ("rbx", 0x90), ("rsi", 0xA8), ("rdi", 0xB0), ("r8", 0xB8), ("r14", 0xF0), ("r15", 0xF8)] {
+            let p = reg(off) as usize;
+            let mut first = 0usize;
+            let mut got = 0usize;
+            if p > 0x10000
+                && ReadProcessMemory(GetCurrentProcess(), p as *const c_void, &mut first as *mut usize as *mut c_void, 8, &mut got) != 0
+                && got == 8
+                && first > 0x10000
+            {
+                let mut owner = RawBuf::new();
+                describe(first, &mut owner);
+                let shell_name = winrt::identify_vtable(first).unwrap_or("");
+                rlog!("  {name}={p:#x} -> [{first:#x}] {} {shell_name}", owner.as_str());
+            }
+        }
         if code == 0xC000_0005 {
             let kind = *(rec.add(32) as *const usize);
             let target = *(rec.add(40) as *const usize);
@@ -535,6 +552,7 @@ fn ring_write(args: std::fmt::Arguments) {
 static TRACE_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static TRACE_API: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static TRACE_WINDOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Called from the trace thunks; logs each API call the title makes (capped).
 extern "system" fn trace_hit(idx: u64, ret: u64) {
@@ -1055,6 +1073,7 @@ fn main() {
             process::exit(1);
         }
     }
+    TRACE_WINDOW.store(args.iter().any(|a| a == "--trace-window"), Ordering::Relaxed);
     TRACE_API.store(ring_path.is_some() || args.iter().any(|a| a == "--trace-api"), Ordering::Relaxed);
     TRACE_HEAP.store(args.iter().any(|a| a == "--trace-heap"), Ordering::Relaxed);
     if let Some(n) = args.iter().find_map(|a| a.strip_prefix("--watch=")) {
