@@ -120,6 +120,17 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
             let thunk = forward_thunk(unsafe { thunks.add((64 + console_slot - EMBED_SHIFTED_FROM) * 16) }, console_slot + 1);
             v.push((index_of(EMBED_TABLE + console_slot * 8), thunk));
         }
+        // Draws and dispatches first mirror the placement buffers (see sync_before_draw).
+        let synced = unsafe { VirtualAlloc(ptr::null_mut(), 4096, 0x3000, 0x40) } as *mut u8;
+        assert!(!synced.is_null(), "thunk allocation failed");
+        for (n, desktop_slot) in DRAW_SLOTS.iter().enumerate() {
+            let console_slot = if *desktop_slot > EMBED_FORWARD_MAX { desktop_slot - 1 } else { *desktop_slot };
+            let target = index_of(EMBED_TABLE + console_slot * 8);
+            let thunk = synced_forward_thunk(unsafe { synced.add(n * 128) }, *desktop_slot);
+            if let Some(entry) = v.iter_mut().find(|(i, _)| *i == target) {
+                entry.1 = thunk;
+            }
+        }
         v
     });
     FORWARDED_INDEXES.get_or_init(|| entries.iter().map(|(i, _)| *i).collect());
@@ -623,6 +634,97 @@ unsafe extern "system" fn device_ext_65(this: *mut c_void, desc: *const u8, tile
     unsafe { create_placement_texture(65, this, desc, tile_mode, pitch, memory, out, 6) }
 }
 
+// ---------------------------------------------------------------------------------------
+// Placement memory mirroring
+// ---------------------------------------------------------------------------------------
+//
+// A placement resource lives in memory the title chose, and the title writes into that memory
+// directly because the console GPU reads it there. The desktop resource is separate, so before
+// every draw or dispatch the contents of each placed buffer are compared with the last copy
+// uploaded and, if they changed, uploaded again.
+
+struct PlacedBuffer {
+    resource: usize,
+    memory: usize,
+    shadow: Vec<u8>,
+    scratch: Vec<u8>,
+}
+
+static PLACED_BUFFERS: std::sync::Mutex<Vec<PlacedBuffer>> = std::sync::Mutex::new(Vec::new());
+static SYNC_UPLOADS: AtomicU32 = AtomicU32::new(0);
+
+/// Registers a buffer created at `memory`. The reference the caller holds is kept alive for
+/// the life of the process (the registry stores a raw pointer).
+fn register_placed_buffer(resource: *mut c_void, memory: usize, size: usize) {
+    // Keep the resource alive: AddRef through its own vtable.
+    let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { std::mem::transmute(*((*(resource as *const *const usize)).add(1))) };
+    unsafe { add_ref(resource) };
+    PLACED_BUFFERS.lock().unwrap().push(PlacedBuffer { resource: resource as usize, memory, shadow: vec![0u8; size], scratch: vec![0u8; size] });
+}
+
+/// Called in front of every draw and dispatch. `this` is the context proxy.
+extern "system" fn sync_before_draw(this: *mut c_void) {
+    let real = unsafe { (*(this as *const Proxy)).real };
+    let Ok(mut placed) = PLACED_BUFFERS.try_lock() else { return };
+    // ID3D11DeviceContext::UpdateSubresource is slot 48.
+    let update: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *const c_void, *const c_void, u32, u32) =
+        unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(48))) };
+    for b in placed.iter_mut() {
+        let mut got = 0usize;
+        let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), b.memory as *const c_void, b.scratch.as_mut_ptr() as *mut c_void, b.scratch.len(), &mut got) } != 0;
+        if !ok || got != b.scratch.len() || b.scratch == b.shadow {
+            continue;
+        }
+        unsafe { update(real, b.resource as *mut c_void, 0, ptr::null(), b.scratch.as_ptr() as *const c_void, 0, 0) };
+        std::mem::swap(&mut b.shadow, &mut b.scratch);
+        let n = SYNC_UPLOADS.fetch_add(1, Ordering::Relaxed);
+        if n < 4 {
+            glog!("[gpu] placement mirror: uploaded {} bytes from {:#x} to buffer {:#x}", b.shadow.len(), b.memory, b.resource);
+        }
+    }
+}
+
+/// A thunk that calls `sync_before_draw(this)` and then forwards to desktop context slot `slot`,
+/// with every argument register and stack argument preserved.
+fn synced_forward_thunk(mem: *mut u8, slot: usize) -> usize {
+    let mut c: Vec<u8> = vec![
+        0x51, // push rcx
+        0x52, // push rdx
+        0x41, 0x50, // push r8
+        0x41, 0x51, // push r9
+        0x48, 0x83, 0xEC, 0x68, // sub rsp, 0x68
+        0xF3, 0x0F, 0x7F, 0x44, 0x24, 0x20, // movdqu [rsp+20h], xmm0
+        0xF3, 0x0F, 0x7F, 0x4C, 0x24, 0x30,
+        0xF3, 0x0F, 0x7F, 0x54, 0x24, 0x40,
+        0xF3, 0x0F, 0x7F, 0x5C, 0x24, 0x50,
+        0x48, 0xB8, // mov rax, sync_before_draw
+    ];
+    c.extend_from_slice(&(sync_before_draw as usize as u64).to_le_bytes());
+    c.extend_from_slice(&[0xFF, 0xD0]); // call rax (rcx still holds `this`)
+    c.extend_from_slice(&[
+        0xF3, 0x0F, 0x6F, 0x44, 0x24, 0x20,
+        0xF3, 0x0F, 0x6F, 0x4C, 0x24, 0x30,
+        0xF3, 0x0F, 0x6F, 0x54, 0x24, 0x40,
+        0xF3, 0x0F, 0x6F, 0x5C, 0x24, 0x50,
+        0x48, 0x83, 0xC4, 0x68, // add rsp, 0x68
+        0x41, 0x59, // pop r9
+        0x41, 0x58, // pop r8
+        0x5A, // pop rdx
+        0x59, // pop rcx
+        // forward: mov rax,[rcx+8]; mov rcx,rax; mov rax,[rax]; jmp [rax+slot*8]
+        0x48, 0x8B, 0x41, 0x08, 0x48, 0x89, 0xC1, 0x48, 0x8B, 0x00, 0xFF, 0xA0,
+    ]);
+    c.extend_from_slice(&((slot * 8) as u32).to_le_bytes());
+    assert!(c.len() <= 128, "thunk is {} bytes", c.len());
+    unsafe { ptr::copy_nonoverlapping(c.as_ptr(), mem, c.len()) };
+    mem as usize
+}
+
+/// Desktop context slots that read resources: `DrawIndexed`, `Draw`, `DrawIndexedInstanced`,
+/// `DrawInstanced`, `DrawAuto`, `DrawIndexedInstancedIndirect`, `DrawInstancedIndirect`,
+/// `Dispatch`, `DispatchIndirect`, and the copies `CopySubresourceRegion` and `CopyResource`.
+const DRAW_SLOTS: [usize; 11] = [12, 13, 20, 21, 38, 39, 40, 41, 42, 46, 47];
+
 /// Device extension slot 62: `(device, desc*, placementMemory*, Buffer** out)`, the shape of the
 /// console SDK's `CreatePlacementBuffer`. The description is a `D3D11_BUFFER_DESC`:
 /// `{ByteWidth, Usage, BindFlags, CPUAccessFlags, MiscFlags, StructureByteStride}`; the observed
@@ -650,6 +752,9 @@ unsafe extern "system" fn device_ext_62(this: *mut c_void, desc: *const u32, mem
         );
     }
     if hr.0 >= 0 && !buffer.is_null() {
+        if !memory.is_null() {
+            register_placed_buffer(buffer, memory as usize, d[0] as usize);
+        }
         if !out.is_null() {
             unsafe { *out = buffer };
         }

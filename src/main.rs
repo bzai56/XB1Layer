@@ -1410,7 +1410,67 @@ fn main() {
         let vtbl = unsafe { *(ctx as *const *const usize) };
         let ext: extern "system" fn(*mut c_void, u32) -> usize = unsafe { std::mem::transmute(*vtbl.add(321)) };
         println!("extension slot 321 call returned {}", ext(ctx, 1));
-        process::exit(0);
+
+        // Baseline for the readback technique: an ordinary buffer, no placement involved.
+        {
+            let data: Vec<u8> = (0..256u32).map(|i| i as u8).collect();
+            let plain_desc = D3D11_BUFFER_DESC { ByteWidth: 256, Usage: D3D11_USAGE_DEFAULT, BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32, ..Default::default() };
+            let init = D3D11_SUBRESOURCE_DATA { pSysMem: data.as_ptr() as *const c_void, ..Default::default() };
+            let mut plain = None;
+            unsafe { device.CreateBuffer(&plain_desc, Some(&init), Some(&mut plain)) }.expect("plain buffer");
+            let plain = plain.unwrap();
+            let st_desc = D3D11_BUFFER_DESC { ByteWidth: 256, Usage: D3D11_USAGE_STAGING, CPUAccessFlags: 0x20000, ..Default::default() };
+            let mut st = None;
+            unsafe { device.CreateBuffer(&st_desc, None, Some(&mut st)) }.expect("staging");
+            let st = st.unwrap();
+            if std::env::var("XB_TEST_BARE_DRAW").is_ok() {
+                unsafe { context.Draw(3, 0) };
+                println!("baseline: issued a bare Draw with no pipeline bound");
+            }
+            unsafe { context.CopyResource(&st, &plain) };
+            let mut m = D3D11_MAPPED_SUBRESOURCE::default();
+            match unsafe { context.Map(&st, 0, D3D11_MAP_READ, 0, Some(&mut m)) } {
+                Ok(()) => {
+                    let ok = unsafe { std::slice::from_raw_parts(m.pData as *const u8, 256) } == data.as_slice();
+                    unsafe { context.Unmap(&st, 0) };
+                    println!("baseline readback of an ordinary buffer matches: {ok}");
+                }
+                Err(e) => println!("baseline readback FAILED: {e}"),
+            }
+        }
+
+        // Placement mirroring: a buffer placed in memory the "title" writes directly.
+        let mut placement = vec![0u8; 256];
+        let desc_words: [u32; 6] = [256, 0, 4, 0, 0, 0]; // ByteWidth, Usage=DEFAULT, BIND_CONSTANT_BUFFER
+        let dev_vtbl = unsafe { *(dev as *const *const usize) };
+        let create_placed: extern "system" fn(*mut c_void, *const u32, *mut u8, *mut *mut c_void) -> i32 = unsafe { std::mem::transmute(*dev_vtbl.add(62)) };
+        let mut placed: *mut c_void = ptr::null_mut();
+        let hr = create_placed(dev, desc_words.as_ptr(), placement.as_mut_ptr(), &mut placed);
+        println!("placement buffer created: hr={hr:#x} buffer={placed:p}");
+        // The title writes constants straight into the placement memory.
+        for (i, b) in placement.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(3);
+        }
+        // Read the buffer back through a staging copy. The copy goes through the context's
+        // embedded function table (console index 46 = desktop `CopyResource`, at object offset
+        // 0x3E0 + 8 * 46), which must first upload the changed placement memory. (A bare Draw
+        // with no pipeline bound would remove the device on this GPU, so no draw is issued.)
+        let buffer: ID3D11Buffer = unsafe { Interface::from_raw(placed) };
+        let staging_desc = D3D11_BUFFER_DESC { ByteWidth: 256, Usage: D3D11_USAGE_STAGING, CPUAccessFlags: 0x20000, ..Default::default() };
+        let mut staging = None;
+        unsafe { device.CreateBuffer(&staging_desc, None, Some(&mut staging)) }.expect("staging buffer");
+        let staging = staging.unwrap();
+        let embedded_copy: usize = unsafe { *((ctx as usize + 0x3E0 + 8 * 46) as *const usize) };
+        let copy: extern "system" fn(*mut c_void, *mut c_void, *mut c_void) = unsafe { std::mem::transmute(embedded_copy) };
+        copy(ctx, staging.as_raw(), buffer.as_raw());
+        println!("device status after the embedded CopyResource: {:?}", unsafe { device.GetDeviceRemovedReason() });
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe { context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }.expect("map staging");
+        let back = unsafe { std::slice::from_raw_parts(mapped.pData as *const u8, 256) };
+        let same = back == placement.as_slice();
+        unsafe { context.Unmap(&staging, 0) };
+        println!("placement mirror: buffer contents match the placement memory after a draw: {same}");
+        process::exit(if same { 0 } else { 1 });
     }
     let Some(path) = args.iter().find(|a| !a.starts_with("--")) else {
         eprintln!("usage: xb1layer <file.exe> [--run] [--imports]");
