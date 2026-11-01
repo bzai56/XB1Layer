@@ -2,7 +2,9 @@
 
 An experimental compatibility layer for running Xbox One (GDK/XDK "Durango") x64 titles on Windows x64.
 
-**Status: early prototype. Nothing is drawn yet.** It loads and starts an unpacked Xbox One title (the Forza Horizon 3 kiosk demo is the test case), runs it through startup into its main loop, and gives it a desktop Direct3D 11 device. The title writes its GPU work as console command packets that are not decoded yet, and there is no swap chain or window, so there is no picture. The goal is a layer that runs titles without graphical glitches; it is not there.
+**The aim is to be compatible with a wide range of Xbox One games**, not one title. The Forza Horizon 3 kiosk demo is only the first test case, used to find out what the console APIs need; anything specific to it is a stand-in to be replaced by a general implementation.
+
+**Status: early prototype. Nothing is drawn yet.** It loads and starts an unpacked Xbox One title (the Forza Horizon 3 kiosk demo is the current test case), runs it through startup into its main loop, and gives it a desktop Direct3D 11 device. The title writes its GPU work as console command packets that are not decoded yet, and there is no swap chain or window, so there is no picture. The goal is a layer that runs titles without graphical glitches; it is not there.
 
 ## What works
 - Manual PE64 mapping (headers, sections, base relocations)
@@ -39,6 +41,14 @@ Run a title from its own folder so relative paths resolve.
 - Works only with content you own and have already unpacked/decrypted by legitimate means.
 - This project does not include, and will not include, code for breaking package encryption, extracting keys, or bypassing DRM.
 - No Microsoft binaries or game assets are included in this repository.
+- Not affiliated with or endorsed by Microsoft. Xbox, Xbox One, Durango and Forza Horizon are trademarks of Microsoft; they are used here only to say what the software is compatible with.
+- This project does not help obtain titles.
+
+## License
+[MIT](LICENSE).
+
+## Contributing
+Contributions are welcome. The biggest open problem is decoding the console GPU command packets (see the [Roadmap](docs/ROADMAP.md)); reports of what other titles need are useful too.
 
 ## Docs
 - [Architecture](docs/ARCHITECTURE.md)

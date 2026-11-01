@@ -2,6 +2,8 @@
 name = "xb1layer"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Experimental Xbox One compatibility layer for Windows x64"
 
 [dependencies]
 windows = { version = "0.62.2", features = ["ApplicationModel_Core", "ApplicationModel_Activation", "UI_Core", "Foundation", "Foundation_Collections", "Win32_System_WinRT", "Win32_Foundation", "UI_ViewManagement", "Storage", "System", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common"] }
