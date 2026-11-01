@@ -145,9 +145,16 @@ unsafe extern "system" fn com_release<T: Iface>(this: *mut c_void) -> u32 {
 }
 
 unsafe extern "system" fn com_get_iids(_this: *mut c_void, count: *mut u32, iids: *mut *mut GUID) -> HRESULT {
+    // The title also reaches this slot through `GetWeakReference` (an IWeakReferenceSource query
+    // answered with this object), passing one out-pointer and garbage; only well-formed arguments
+    // are written.
     unsafe {
-        *count = 0;
-        *iids = ptr::null_mut();
+        if (count as usize) % 4 == 0 && !count.is_null() {
+            ptr::write_unaligned(count, 0);
+        }
+        if (iids as usize) % 8 == 0 && !iids.is_null() {
+            ptr::write_unaligned(iids, ptr::null_mut());
+        }
     }
     HRESULT(0)
 }
@@ -722,6 +729,21 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         wlog!("[winrt] {} slot 9 (Users) -> a vector view with 1 user", o.class);
         return HRESULT(0);
     }
+    // `XboxLiveConfiguration` slot 8 is read as a string by the title (wstring constructor at
+    // 0x16f2420); taken to be the service configuration id, with a placeholder value.
+    if o.class == "Windows.Xbox.Services.XboxLiveConfiguration" && N >= 6 && (arg1 as usize) % 8 == 0 && is_writable(arg1) {
+        unsafe { *(arg1 as *mut *mut c_void) = std::mem::transmute::<HSTRING, *mut c_void>(HSTRING::from("00000000-0000-0000-0000-000000000000")) };
+        wlog!("[winrt] {} slot {N} -> placeholder HSTRING", o.class);
+        return HRESULT(0);
+    }
+    // `Controller` statics slot 6 is the controller list, an IVectorView<IController> (the title
+    // calls `get_Size` and `GetAt(index, &out)` on it). Empty for now: no controllers connected.
+    if o.class == "Windows.Xbox.Input.Controller" && N == 6 && is_writable(arg1) {
+        let list = create_vector_view("Windows.Xbox.Input.Controller.Controllers", &o.iid, 0);
+        unsafe { *(arg1 as *mut *mut c_void) = list };
+        wlog!("[winrt] {} slot 6 (Controllers) -> an empty vector view", o.class);
+        return HRESULT(0);
+    }
     // Statics slot 10 is an event subscription, `add_Event(handler, &token)`: arg1 is the title's
     // own delegate object, so it must not be treated as an out-parameter (that overwrote its vtable).
     if o.class == "Windows.Xbox.System.User" && N >= 10 {
@@ -743,6 +765,20 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
     if o.class.starts_with("Windows.Xbox.System.User.Users (element") && !o.class.contains('#') && N == 15 && is_writable(arg1) {
         unsafe { *(arg1 as *mut *mut c_void) = std::mem::transmute::<HSTRING, *mut c_void>(HSTRING::from("2535400000000001")) };
         wlog!("[winrt] {}: slot 15 -> HSTRING user id", o.class);
+        return HRESULT(0);
+    }
+    // `PackageTransferWatcher` slot 7 is `(object, Object** out)`: the second argument is an object
+    // out-parameter even though the first is a COM object (title call site 0x18c2a02).
+    if o.class == "Windows.Xbox.Management.Deployment.PackageTransferWatcher" && N == 7 && (arg2 as usize) % 8 == 0 && is_writable(arg2) {
+        unsafe { *(arg2 as *mut *mut c_void) = create_generic("PackageTransferWatcher#slot7", &o.iid) };
+        wlog!("[winrt] {} slot 7 -> a stand-in object through the second argument", o.class);
+        return HRESULT(0);
+    }
+    // Xbox Live services classes are factories: `(object, Object** out)` creates something from
+    // the object (e.g. an XboxLiveContext from a user; title call site 0x1947b12), not an event add.
+    if o.class.starts_with("Microsoft.Xbox.") && looks_like_com_object(arg1) && (arg2 as usize) % 8 == 0 && is_writable(arg2) {
+        unsafe { *(arg2 as *mut *mut c_void) = create_generic(&format!("{}#slot{N}", o.class), &o.iid) };
+        wlog!("[winrt] {} slot {N}: (object, out) -> a stand-in object", o.class);
         return HRESULT(0);
     }
     // A delegate in arg1 means `add_Event(handler, &token)`: leave the handler alone.
@@ -1048,6 +1084,13 @@ pub fn try_activation_factory(class: &str, iid: &GUID, out: *mut *mut c_void) ->
     if class.starts_with("Windows.Xbox.") || class.starts_with("Microsoft.Xbox.") {
         unsafe { *out = create_generic(class, iid) };
         wlog!("[winrt] generic stand-in for console-only class {class} (iid {iid:?})");
+        return Some(HRESULT(0));
+    }
+    // `Package.Current` fails in a process without package identity (this one), but the title
+    // reads it at startup (IPackageStatics slot 6), so it gets a logging stand-in.
+    if class == "Windows.ApplicationModel.Package" {
+        unsafe { *out = create_generic(class, iid) };
+        wlog!("[winrt] generic stand-in for {class} (iid {iid:?})");
         return Some(HRESULT(0));
     }
     if class != CoreAppTag::NAME {

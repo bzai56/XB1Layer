@@ -1139,6 +1139,12 @@ fn override_for(dll: &str, func: &str) -> Option<usize> {
     if dll.eq_ignore_ascii_case("d3d11_x.dll") && func == "D3D11XCreateDeviceX" {
         return Some(gpu::create_device_x as usize);
     }
+    if dll.eq_ignore_ascii_case("d3d11_x.dll") && func == "DXGIXPresentArray" {
+        return Some(gpu::present_array as usize);
+    }
+    if dll.eq_ignore_ascii_case("d3d11_x.dll") && func == "DXGIXSetVLineNotification" {
+        return Some(gpu::set_vline_notification as usize);
+    }
     if func == "CoCreateInstance" {
         return Some(xb_co_create_instance as usize);
     }

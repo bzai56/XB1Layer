@@ -110,6 +110,9 @@ unsafe extern "system" fn context_grow_command_buffer(this: *mut c_void) -> usiz
 /// and 23). All four agree with a table base of `0x3E0`.
 const EMBED_TABLE: usize = 0x3E0;
 
+/// Embedded indices below 24 whose desktop meaning is backed by logged calls.
+const EMBED_VERIFIED: [usize; 5] = [7, 11, 14, 15, 23];
+
 /// Highest desktop slot forwarded through the embedded table (`GSSetShader`).
 const EMBED_FORWARD_MAX: usize = 23;
 
@@ -122,7 +125,7 @@ const EMBED_FORWARD_MAX: usize = 23;
 const EMBED_SHIFTED_FROM: usize = 34;
 /// Last console index forwarded (desktop `FinishCommandList` is 114, so console 113).
 /// Only indexes up to 63 have direct evidence; the rest is extrapolated.
-const EMBED_SHIFTED_TO: usize = 113;
+const EMBED_SHIFTED_TO: usize = 63;
 
 /// `(embedded index, entry)` pairs that forward to the real context. Built once.
 fn forwarded_entries() -> &'static Vec<(usize, usize)> {
@@ -133,11 +136,18 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
         let mut v = Vec::new();
         let index_of = |offset: usize| (offset - EMBED_BASE) / 8;
         for slot in 0..=EMBED_FORWARD_MAX {
+            // Only indices with direct evidence forward: 11 and 23 (SetShader with NULL), 14 and 15
+            // (Map/Unmap). Index 8 was assumed to be PSSetShaderResources and is called as
+            // (pointer, 0, 0x76b40), so the console table is not a plain copy of the desktop one.
+            if slot > 3 && !EMBED_VERIFIED.contains(&slot) {
+                continue;
+            }
             let entry = match slot {
                 0 => proxy_qi as usize,
                 1 => proxy_add_ref as usize,
                 2 => proxy_release as usize,
                 3 => context_get_device as usize,
+                8 => ps_set_shader_resources as usize,
                 s => forward_context_thunk(unsafe { thunks.add(s * 32) }, s),
             };
             v.push((index_of(EMBED_TABLE + slot * 8), entry));
@@ -735,6 +745,9 @@ fn register_placed_buffer(resource: *mut c_void, memory: usize, size: usize) {
 /// Called in front of every draw and dispatch. `this` is the context proxy.
 extern "system" fn sync_before_draw(this: *mut c_void) {
     let real = unsafe { (*(this as *const Proxy)).real };
+    if env_flag("XB1_NO_MIRROR") {
+        return;
+    }
     let Ok(mut placed) = PLACED_BUFFERS.try_lock() else { return };
     // ID3D11DeviceContext::UpdateSubresource is slot 48.
     let update: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *const c_void, *const c_void, u32, u32) =
@@ -874,8 +887,14 @@ unsafe extern "system" fn texture_slot_13(this: *mut c_void, out: *mut u32) -> u
 }
 
 /// Gives the real resource `obj` an extended vtable. `is_texture2d` selects the slot-13 behavior.
+/// Diagnostic switches: `XB1_NO_EXTEND=1` leaves resource vtables alone, `XB1_NO_MIRROR=1` skips
+/// the placement-buffer mirroring.
+fn env_flag(name: &str) -> bool {
+    std::env::var_os(name).is_some()
+}
+
 fn extend_resource(obj: *mut c_void, is_texture2d: bool) {
-    if obj.is_null() {
+    if obj.is_null() || env_flag("XB1_NO_EXTEND") {
         return;
     }
     let orig = unsafe { *(obj as *const usize) };
@@ -1060,6 +1079,12 @@ unsafe extern "system" fn device_ext_62(this: *mut c_void, desc: *const u32, mem
     unsafe { ptr::copy_nonoverlapping(desc, d.as_mut_ptr(), 6) };
     // Keep the desktop-valid MiscFlags (DRAWINDIRECT_ARGS 0x10, RAW_VIEWS 0x20, STRUCTURED 0x40).
     d[4] &= 0x10 | 0x20 | 0x40;
+    // DYNAMIC needs CPU write access on the desktop and cannot be filled by UpdateSubresource (which
+    // the placement mirror uses), so it becomes a DEFAULT buffer.
+    if d[1] == 1 {
+        d[1] = 0;
+        d[3] = 0;
+    }
     let mut buffer: *mut c_void = ptr::null_mut();
     let f: unsafe extern "system" fn(*mut c_void, *const u32, *const c_void, *mut *mut c_void) -> HRESULT =
         unsafe { std::mem::transmute(*((*(p.real as *const *const usize)).add(3))) };
@@ -1099,6 +1124,34 @@ fn safe_dump(p: u64, n: usize) -> String {
         return format!("{p:#x} (unreadable)");
     }
     format!("{p:#x}: {}", hex_dump(buf.as_ptr(), got.min(n)))
+}
+
+// ---------------------------------------------------------------------------------------
+// Display path (DXGIX*)
+// ---------------------------------------------------------------------------------------
+
+/// `DXGIXPresentArray`. The documented console shape is `(SyncInterval, PresentImmediateThreshold,
+/// Flags, NumPlanes, ppPlanes, pParameters)`; this is assumed, so the first calls log the raw
+/// arguments and what the plane pointers point at.
+pub unsafe extern "system" fn present_array(a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> i32 {
+    static COUNT: AtomicU32 = AtomicU32::new(0);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 6 {
+        glog!("[gpu] DXGIXPresentArray #{n}: a1={a1:#x} a2={a2:#x} a3={a3:#x} a4={a4:#x} a5={} a6={}", safe_dump(a5, 48), safe_dump(a6, 64));
+        if a4 > 0 && a4 <= 4 && a5 > 0x10000 {
+            for i in 0..a4 as usize {
+                let plane = unsafe { *((a5 as *const u64).add(i)) };
+                glog!("[gpu]   plane {i}: {}", safe_dump(plane, 64));
+            }
+        }
+    }
+    0
+}
+
+/// `DXGIXSetVLineNotification(...)`: logged, reports success.
+pub unsafe extern "system" fn set_vline_notification(a1: u64, a2: u64, a3: u64, a4: u64) -> i32 {
+    glog!("[gpu] DXGIXSetVLineNotification({a1:#x}, {a2:#x}, {a3:#x}, {a4:#x})");
+    0
 }
 
 /// Device extension slot 73: `(device, desc*, Object** out)`. The title zeroes `*out` (a COM-pointer
@@ -1152,6 +1205,24 @@ fn forward_thunk(mem: *mut u8, slot: usize) -> usize {
     code.extend_from_slice(&((slot * 8) as u32).to_le_bytes());
     unsafe { ptr::copy_nonoverlapping(code.as_ptr(), mem, code.len()) };
     mem as usize
+}
+
+/// Embedded/standard slot 8, `PSSetShaderResources(start, count, views)`. The debug layer reported
+/// an out-of-range start slot, so a call with bad arguments is logged with its caller and dropped.
+unsafe extern "system" fn ps_set_shader_resources(this: *mut c_void, start: u32, count: u32, views: *const c_void) {
+    static BAD: AtomicU32 = AtomicU32::new(0);
+    let real = unsafe { (*(this as *const Proxy)).real };
+    if start >= 128 || count > 128 || start + count > 128 {
+        let n = BAD.fetch_add(1, Ordering::Relaxed);
+        if n < 6 {
+            let mut frames = [ptr::null_mut::<c_void>(); 8];
+            let got = unsafe { crate::RtlCaptureStackBackTrace(1, 8, frames.as_mut_ptr(), ptr::null_mut()) } as usize;
+            glog!("[gpu] PSSetShaderResources with bad arguments (start {start:#x}, count {count:#x}, views {views:p}) from {:x?}; dropped", &frames[..got]);
+        }
+        return;
+    }
+    let f: unsafe extern "system" fn(*mut c_void, u32, u32, *const c_void) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(8))) };
+    unsafe { f(real, start, count, views) };
 }
 
 /// Desktop context slots of the `XSSetShader` methods: `(shader, class instances, count)` on the

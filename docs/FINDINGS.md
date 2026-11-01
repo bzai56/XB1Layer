@@ -252,6 +252,21 @@ Open: with the debug layer on, the run ends by itself with exit code `0x87D` wit
 
 **Hooking pitfalls.** An inline hook of an `ntdll` syscall stub must copy whole instructions: the stub is `mov r10, rcx; mov eax, n; test byte ptr [7FFE0308h], 1; ...`, so 12 bytes of patch need a 16-byte trampoline (an 8-byte one resumed mid-instruction and crashed with `0xC000001D`). Hooking `NtCreateThreadEx` and logging inside it hung the run, so that hook is disabled.
 
+## The driver fault: unverified context forwarding
+The NVIDIA worker-thread fault (`nvwgf2umx.dll`, same offset across runs) was **caused by my embedded context table**, not by resource vtables or the placement mirror (switches `XB1_NO_EXTEND` and `XB1_NO_MIRROR` showed neither removes it). I had forwarded every console index from 4 to 23 and from 34 to 113 to the desktop method of the same position, but only a handful were backed by logged calls. The debug layer's one corruption-severity message gave it away: `PSSetShaderResources` was being reached with `(0x288345b0, 0, 0x76b40)`, which is a pointer, zero and a size, not a slot range. So **console index 8 is not `PSSetShaderResources`**: the console table is not a plain copy of the desktop one. Only these are forwarded now: 7 (`VSSetConstantBuffers`: called as `(1, 1, &buffer)`), 11 and 23 (`SetShader` with NULL), 14 and 15 (`Map`/`Unmap`), and shifted 34 to 63. Everything else logs and returns, and with that the driver fault is gone in repeated runs. The cost is that unforwarded calls (a hot loop at `+0x418` before index 7 was added) do nothing, so each console index has to be identified from its calls before it is forwarded.
+
+Also: a console `DYNAMIC` constant buffer (usage 1) failed `CreateBuffer` with `E_INVALIDARG` (needs CPU write access on the desktop, and `UpdateSubresource` is not allowed on it), so it is now created as `DEFAULT`.
+
+## More shell-layer shapes
+The title's startup keeps hitting methods whose shape my generic stand-in guessed wrong:
+- `Windows.ApplicationModel.Package.Current` fails in a process without package identity, so the class is served by a stand-in.
+- `PackageTransferWatcher` slot 7 and `Microsoft.Xbox.Services` factories take `(object, Object** out)`: an object first argument is not always a delegate.
+- `Controller` statics slot 6 is the controller list (an `IVectorView`); it is empty for now, so no gamepad input yet.
+- `XboxLiveConfiguration` slots return strings (placeholder service configuration ID).
+- The weak-reference query on a stand-in reaches `GetIids` with unrelated arguments; it now only writes well-formed ones.
+
+`DXGIXSetVLineNotification(0, 0, 0x2d4, 0)` is logged: the third argument looks like a scanline number. `DXGIXPresentArray` is now implemented as a logging stub (assumed shape `(SyncInterval, Threshold, Flags, NumPlanes, ppPlanes, pParameters)`) but has not been reached yet, so there is **no swap chain**: nothing is shown. The title still stops in the shell layer before its first present, with different faults in different runs.
+
 ## Tools added
 `--watch-sites=0x...,0x...` plants one-shot breakpoints at title RVAs (report registers, text pointed at by the argument registers, and the title's call chain, then continue); `--watch-repeat` keeps them armed (re-arming by single-step) and prints one compact line per hit for the title's logger; `--patch-fastfail` was added earlier. The device's standard creation methods now log failures with a dump of the description and, for views, the resource's own type and description.
 
