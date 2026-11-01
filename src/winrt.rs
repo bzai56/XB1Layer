@@ -45,6 +45,59 @@ unsafe extern "system" {
     fn MsgWaitForMultipleObjects(n: u32, handles: *const c_void, all: i32, ms: u32, mask: u32) -> u32;
 }
 
+/// Delegates the title registers on the console window through its event-add slots: `(slot, handler)`.
+static WINDOW_HANDLERS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// Event-args object for the window events raised by `raise_window_events`: every getter writes
+/// `WINDOW_EVENT_VALUE` (a small integer: `bool Visible`, an activation-state enum, ...) through its
+/// out-pointer. What each of the console window's events is, is unknown, so this is an experiment.
+#[repr(C)]
+struct WindowArgs {
+    vtbl: *const usize,
+    refs: AtomicU32,
+}
+
+unsafe extern "system" fn wargs_qi(this: *mut c_void, _iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    unsafe { *out = this };
+    HRESULT(0)
+}
+unsafe extern "system" fn wargs_ref(_this: *mut c_void) -> u32 {
+    2
+}
+unsafe extern "system" fn wargs_get(_this: *mut c_void, out: *mut u32) -> HRESULT {
+    let v = std::env::var("XB1_WINDOW_EVENT_VALUE").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
+    if !out.is_null() && (out as usize) % 4 == 0 {
+        unsafe { *out = v };
+    }
+    HRESULT(0)
+}
+
+fn window_args() -> *mut c_void {
+    static OBJ: OnceLock<usize> = OnceLock::new();
+    *OBJ.get_or_init(|| {
+        let mut v = vec![wargs_get as usize; 32];
+        v[0] = wargs_qi as usize;
+        v[1] = wargs_ref as usize;
+        v[2] = wargs_ref as usize;
+        let vtbl = Vec::leak(v).as_ptr();
+        Box::into_raw(Box::new(WindowArgs { vtbl, refs: AtomicU32::new(2) })) as usize
+    }) as *mut c_void
+}
+
+/// Raises every delegate the title registered on the console window: `Invoke(sender, args)` is slot 3
+/// of a delegate. Only done when `XB1_WINDOW_EVENTS` is set (an experiment).
+pub fn raise_window_events() {
+    let handlers: Vec<(usize, usize)> = WINDOW_HANDLERS.lock().unwrap().clone();
+    wlog!("[winrt] raising {} window event handler(s)", handlers.len());
+    let sender = shell().console_window;
+    for (slot, h) in handlers {
+        let vtbl = unsafe { *(h as *const *const usize) };
+        let invoke: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT = unsafe { std::mem::transmute(*vtbl.add(3)) };
+        let hr = unsafe { invoke(h as *mut c_void, sender, window_args()) };
+        wlog!("[winrt]   window event (add slot {slot}): Invoke -> {:#x}", hr.0 as u32);
+    }
+}
+
 static NEXT_TOKEN: AtomicI64 = AtomicI64::new(1);
 
 fn next_token() -> i64 {
@@ -301,6 +354,9 @@ fn run_view(source: &IFrameworkViewSource) -> Result<()> {
         h.Invoke(&app_view, &args)?;
     }
 
+    if std::env::var_os("XB1_WINDOW_EVENTS").is_some() {
+        raise_window_events();
+    }
     wlog!("[winrt] IFrameworkView::Run");
     view.Run()?;
     wlog!("[winrt] IFrameworkView::Uninitialize");
@@ -725,6 +781,13 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
             },
             // Looks like add_Event(handler, &token): both arguments are 8-byte-aligned pointers.
             _ if N > 7 && (arg1 as usize) % 8 == 0 && (arg2 as usize) % 8 == 0 && is_writable(arg1) && is_writable(arg2) => unsafe {
+                if looks_like_com_object(arg1) {
+                    // Keep the delegate (AddRef) so it can be raised later.
+                    let vt = *(arg1 as *const *const usize);
+                    let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(1));
+                    add_ref(arg1);
+                    WINDOW_HANDLERS.lock().unwrap().push((N, arg1 as usize));
+                }
                 ptr::write_unaligned(arg2 as *mut i64, next_token())
             },
             _ => {}
