@@ -1314,7 +1314,31 @@ fn main() {
         let (mut dev, mut ctx) = (ptr::null_mut(), ptr::null_mut());
         let hr = gpu::create_device_x(ptr::null(), &mut dev, &mut ctx);
         println!("D3D11XCreateDeviceX -> hr={:#x} device={dev:p} context={ctx:p}", hr as u32);
-        process::exit(if hr == 0 && !dev.is_null() && !ctx.is_null() { 0 } else { 1 });
+        if hr != 0 || dev.is_null() || ctx.is_null() {
+            process::exit(1);
+        }
+        // Exercise the proxies through ordinary D3D11 calls: each goes through a forwarding thunk.
+        use windows::Win32::Graphics::Direct3D11::*;
+        use windows::core::Interface;
+        let device: ID3D11Device = unsafe { Interface::from_raw(dev) };
+        let context: ID3D11DeviceContext = unsafe { Interface::from_raw(ctx) };
+        println!("GetFeatureLevel via proxy -> {:#x}", unsafe { device.GetFeatureLevel().0 });
+        let imm = unsafe { device.GetImmediateContext() }.ok();
+        println!("GetImmediateContext returns the context proxy: {}", imm.as_ref().map(|c| c.as_raw() == ctx).unwrap_or(false));
+        let desc = D3D11_BUFFER_DESC { ByteWidth: 256, Usage: D3D11_USAGE_DEFAULT, BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32, ..Default::default() };
+        let mut buffer = None;
+        let created = unsafe { device.CreateBuffer(&desc, None, Some(&mut buffer)) };
+        println!("CreateBuffer via proxy -> {:?}, buffer {}", created.is_ok(), buffer.is_some());
+        unsafe { context.ClearState() };
+        unsafe { context.Flush() };
+        println!("ClearState and Flush via proxy: ok");
+        let ctx_device = unsafe { context.GetDevice() };
+        println!("context.GetDevice returns the device proxy: {}", ctx_device.map(|d| d.as_raw() == dev).unwrap_or(false));
+        // A console-only slot on the context: must log and return 0, not read past the vtable.
+        let vtbl = unsafe { *(ctx as *const *const usize) };
+        let ext: extern "system" fn(*mut c_void, u32) -> usize = unsafe { std::mem::transmute(*vtbl.add(321)) };
+        println!("extension slot 321 call returned {}", ext(ctx, 1));
+        process::exit(0);
     }
     let Some(path) = args.iter().find(|a| !a.starts_with("--")) else {
         eprintln!("usage: xb1layer <file.exe> [--run] [--imports]");

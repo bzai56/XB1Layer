@@ -15,7 +15,9 @@
 3j. ~~**Worker-thread fault at `ntdll+0x5ac00`**~~ Done: the TLS pointer array was allocated with `VirtualAlloc` and `ntdll` freed it as a heap block when the title loaded `WindowsCodecs.dll`. Now allocated from the process heap.
 3j2. ~~NULL write at `title+0x1960158`~~ Done: the title's own allocator crash after a `VirtualAlloc` with console-only protection bits (`0x10000`) failed; the shim now masks protection.
 3j4. ~~**Static TLS owned by `ntdll`**~~ Done: a toolchain-built helper DLL, patched so the loader's block starts at the title's template. The hand-built vector remains as `--legacy-tls`.
-3j5. **Extended D3D11 device and context** (`ID3D11DeviceX`, `ID3D11DeviceContextX`): the title's last fault calls vtable slot 321 of the context, far past the desktop vtable. Needs proxy objects with the console layout, and the reason `[r14+0x40]` is NULL.
+3j5. ~~**Extended D3D11 device and context**~~ First version done: proxy objects forwarding the standard slots, with logging stubs for console-only vtable slots and for the function pointers embedded in the context object. The title's real use of these is not understood yet.
+3j6. **What the console context's embedded functions and the device extension slots do** (observed: context `+0x438/+0x450/+0x458/+0x498/+0x5b8/+0x5d8/+0xa08`, device slots 59 and 64). Probably GPU command-buffer writes; deciding how to map them is the central question for rendering.
+3j7. **Faults at `title+0x17741b0` and `title+0x17b75fb`**, after the title uses values the stubs return.
 3j3. **Decode the two `CoreApplication` console extension interfaces** (`42A6A529`, `9FF3799E`).
 3k. **Console `ICoreWindow` layout**: pin down the member list, then raise window events (activation, size, visibility, input).
 4. **`kernelx` shim**: real implementations of the most-called functions, driven by stub-hit logs.

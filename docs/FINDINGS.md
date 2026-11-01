@@ -130,12 +130,26 @@ With this in place the TLS-loss faults and the intermittent `title+0x3366d5` cra
 After the TLS and allocator fixes the title survives loading `WindowsCodecs.dll` and continues, and the end of the run changed several times:
 1. **Fast-fail from `terminate()`.** The title requests `CoreApplication`'s second console-only interface, `42A6A529-3CC6-4867-B5B7-6D1FAF5325F9`, gets `E_NOINTERFACE`, C++/CX throws `InvalidCastException`, nothing catches it, and the C runtime calls `terminate()`. (The other extension interface, `9FF3799E-...`, is tolerated by the title, and serving it with the generic stand-in breaks things, so it stays unimplemented.) The factory now serves `42A6A529` with the generic stand-in. The title then calls **slot 7 with the value `1`** on it; the stand-in reports success and writes nothing.
 2. ~~A NULL write at `title+0x1960158`~~ Explained above (console protection bits), fixed.
-3. **The one remaining fault, at `title+0x17cdbe0`**, now the end of every run. A render-side thread (started through the title's own `CreateThread`) loads a graphics object from `[r14+0x40]`, which is NULL, and calls **vtable slot 321** on it (`call [rax+0xA08]`, argument `1`). Desktop `ID3D11DeviceContext` has around 115 methods, so slot 321 can only be a console-only method of the extended context (`ID3D11DeviceContextX`). So even with the pointer set, the desktop context handed out by `D3D11XCreateDeviceX` would be read past the end of its vtable. The graphics shim has to provide an extended device and context.
+3. ~~The one remaining fault, at `title+0x17cdbe0`~~ Analysed in the next section; the proxies below moved the run past it.
+
+## Graphics: the console context is not a plain COM object
+**Correction.** I first read the call at `title+0x17cdbe0` (`call [rax+0xA08]`) as "vtable slot 321" of the device context. That was wrong. The title loads a function pointer from **offset `0xA08` inside the context object itself** (`rcx = rax = context`, `call [rax+0xA08]`), not through the object's vtable. Further call sites confirmed it: the title calls embedded function pointers at `+0x438`, `+0x450`, `+0x458`, `+0x498`, `+0x5B8`, `+0x5D8` and `+0xA08`, and also reads and writes state fields in the same object (`+0x168`, `+0x180`, `+0x390`). This is how the console's low-overhead ("fast semantics") immediate context works: the title's compiled code reaches into the context's memory, and some methods are function pointers stored there. It is not something a desktop `ID3D11DeviceContext` can imitate with a longer vtable.
+
+**What was built (`src/gpu.rs`).**
+- `D3D11XCreateDeviceX` returns **proxy** device and context objects around the real desktop ones.
+- The standard vtable slots (`ID3D11Device` 3 to 42, `ID3D11DeviceContext` 3 to 114) forward to the real object through a tail-call thunk (swap `this`, jump), which preserves every argument register and stack argument. Verified with `--test-d3d` through the normal D3D11 bindings: `GetFeatureLevel` returns `0xb100`, a real constant buffer is created through the proxy, `ClearState`/`Flush` work, and `GetImmediateContext`/`GetDevice` return the proxies.
+- `QueryInterface` on a proxy returns the real object for standard non-D3D11 interfaces and the proxy itself for interfaces the real object does not know, which the title then treats as the console interface. The title asks for three such IIDs: `88671610-712E-4F1E-84AB-01B5948BD373` (device) and `9458FE06-C78D-47F7-96A0-EC7B727BE1E9` and `48800095-7134-4BE7-9186-B86BECB26477` (context).
+- The context proxy is a 16 KB object. Its embedded region (offset `0x18` upward) is filled with logging stubs that return 0, so calls to embedded functions are visible by offset. The device proxy's vtable beyond slot 42 also holds logging stubs.
+
+**What the title does with them.** Device extension slots 59 and 64 are called twice each. Embedded context functions at `+0x450`, `+0x458`, `+0x498`, `+0x5b8`, `+0x5d8` and `+0xa08` are called. The run then faults again, now at `title+0x17741b0` and `title+0x17b75fb`, after the title uses values the stubs cannot supply.
+
+**What is established:** the title's graphics layer calls into embedded function pointers and state fields of the console context, and into console-only device methods. **What is not:** what any of those functions do. A reasonable expectation, not verified, is that the real ones write GPU command packets for the console's AMD GPU into command buffers; if so, a working layer has to either interpret those packets or reimplement each function at a high level, and the second requires knowing what each one does. This is where the project's scope grows sharply.
 
 ## Next investigation steps
-1. Provide an extended `ID3D11DeviceX` / `ID3D11DeviceContextX` (proxy objects with the console vtable layout forwarding the standard methods to desktop D3D11), and find out why `[r14+0x40]` is NULL.
-2. Work out what slot 7 of `42A6A529` is (it takes a small value `1`).
-3. Pin down the console `ICoreWindow` layout: keep logging slots as the title uses more of them, and keep stand-in behavior per slot only where the call pattern justifies it.
+1. Find out what the embedded context functions and the device extension slots do: their arguments (the stubs log only the offset), and what the title reads back from the context's fields.
+2. Look at the two new faults (`title+0x17741b0`, `title+0x17b75fb`).
+3. Work out what slot 7 of `42A6A529` is (it takes a small value `1`).
+4. Pin down the console `ICoreWindow` layout: keep logging slots as the title uses more of them, and keep stand-in behavior per slot only where the call pattern justifies it.
 3. Implement `DXGIXSetVLineNotification`, `DXGIXPresentArray` and any other `DXGIX*` the title uses.
 3. Work out the real shape of the `PackageTransferManager` interfaces, from the title's own usage or from the console SDK's published API reference if available, and implement them for real.
 3. Implement `DXGIXSetVLineNotification` and the rest of the `d3d11_x` surface.
