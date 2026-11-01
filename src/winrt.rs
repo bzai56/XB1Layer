@@ -98,6 +98,45 @@ pub fn raise_window_events() {
     }
 }
 
+/// Delegates the title registers on `Windows.Xbox.System.User` statics: `(slot, handler)`.
+static USER_HANDLERS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// Raises every user-event delegate (`Invoke(sender, args)`): `args` is a generic object that hands
+/// out stand-ins (the signed-in user element for any getter). Only when `XB1_USER_EVENTS` is set.
+pub fn raise_user_events() {
+    // The title registers these during `Run`, so a helper thread waits for them to appear and raises
+    // each handler once, a moment after it is registered.
+    std::thread::spawn(|| {
+        let mut raised = 0usize;
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let (total, pending): (usize, Vec<(usize, usize)>) = {
+                let all = USER_HANDLERS.lock().unwrap();
+                (all.len(), all[raised..].to_vec())
+            };
+            if pending.is_empty() {
+                continue;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+            raise_user_handlers(&pending);
+            raised = total;
+        }
+    });
+}
+
+fn raise_user_handlers(handlers: &[(usize, usize)]) {
+    wlog!("[winrt] raising {} user event handler(s)", handlers.len());
+    for &(slot, h) in handlers {
+        let vtbl = unsafe { *(h as *const *const usize) };
+        let invoke: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT = unsafe { std::mem::transmute(*vtbl.add(3)) };
+        let iid = GUID::from_u128(0xB4F23A93_7FC6_4A50_B153_950016389E50);
+        let sender = create_generic("Windows.Xbox.System.User.Users (element 0)", &iid);
+        let args = create_generic("UserEventArgs", &iid);
+        let hr = unsafe { invoke(h as *mut c_void, sender, args) };
+        wlog!("[winrt]   user event (add slot {slot}): Invoke -> {:#x}", hr.0 as u32);
+    }
+}
+
 static NEXT_TOKEN: AtomicI64 = AtomicI64::new(1);
 
 fn next_token() -> i64 {
@@ -354,6 +393,9 @@ fn run_view(source: &IFrameworkViewSource) -> Result<()> {
         h.Invoke(&app_view, &args)?;
     }
 
+    if std::env::var_os("XB1_USER_EVENTS").is_some() {
+        raise_user_events();
+    }
     if std::env::var_os("XB1_WINDOW_EVENTS").is_some() {
         raise_window_events();
     }
@@ -832,6 +874,13 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         wlog!("[winrt] {} slot 6 -> an empty package list through the second argument", o.class);
         return HRESULT(0);
     }
+    // The user-event args object: its first getter (slot 6) returns the signed-in user, which the
+    // title then reads like a `Users` list element.
+    if o.class == "UserEventArgs" && N == 6 && (arg1 as usize) % 8 == 0 && is_writable(arg1) {
+        unsafe { *(arg1 as *mut *mut c_void) = create_generic("Windows.Xbox.System.User.Users (element 0)", &o.iid) };
+        wlog!("[winrt] UserEventArgs slot 6 -> the user element");
+        return HRESULT(0);
+    }
     // `SpeechRecognizerFactory` slot 6 is `(locale id, Recognizer** out)`: a scalar first argument,
     // the object comes back through the second.
     if o.class == "Windows.Xbox.Speech.Recognition.SpeechRecognizerFactory" && N == 6 && (arg1 as usize) < 0x10000 && (arg2 as usize) % 8 == 0 && is_writable(arg2) {
@@ -874,6 +923,12 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
     // own delegate object, so it must not be treated as an out-parameter (that overwrote its vtable).
     if o.class == "Windows.Xbox.System.User" && N >= 10 {
         if N % 2 == 0 && is_writable(arg2) {
+            if looks_like_com_object(arg1) {
+                let vt = unsafe { *(arg1 as *const *const usize) };
+                let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { std::mem::transmute(*vt.add(1)) };
+                unsafe { add_ref(arg1) };
+                USER_HANDLERS.lock().unwrap().push((N, arg1 as usize));
+            }
             unsafe { ptr::write_unaligned(arg2 as *mut i64, next_token()) };
         }
         wlog!("[winrt] {} slot 10 (event add) -> token", o.class);
