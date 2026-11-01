@@ -1,4 +1,4 @@
-﻿# Findings: Forza Horizon 3 kiosk demo
+# Findings: Forza Horizon 3 kiosk demo
 
 Package: `Kiosk-Opus_1.0.0.0_x64__8wekyb3d8bbwe` (unpacked Xbox One app, tested locally; not distributed here).
 
@@ -225,8 +225,8 @@ It also showed a mistake in my earlier stub fill. Only the context object's offs
 ## The `Users` list
 With the above, the run stayed up for 40 seconds, producing 150,000 lines. The title was polling `Windows.Xbox.System.User`: the statics' slot 9 returns the `Users` list, an `IVectorView<User>` (`GetAt` at slot 6, `get_Size` at slot 7). My generic stand-in treated slot 7's output as a pointer and wrote an object address into the size, so the title believed it had about 20,000 users and looped over them. A vector-view stand-in now returns size 1 with a generic element for each index. The loop is gone. The single user element has none of a user's real methods, and the title faults calling it (`title+0x16f244f`, `rcx` is a generic stand-in).
 
-## Where the run ends now
-The title runs and its state is mostly set up, then it faults either in the user stand-in (above) or occasionally inside the GPU driver's own worker thread (`nvwgf2umx.dll`), which means something handed to Direct3D is corrupting driver state. That second fault is not understood.
+## Where the run ended at this point
+The title ran and then faulted in the user stand-in or the GPU driver's worker thread. Both were resolved later (see the sections below).
 
 ## The user object, and a Direct3D debug layer
 The `Users` element faults were all the same mistake in my stand-in: it answered every call by writing a new stand-in object through the first argument. Three shapes turned up.
@@ -271,13 +271,14 @@ The title's startup keeps hitting methods whose shape my generic stand-in guesse
 `--watch-sites=0x...,0x...` plants one-shot breakpoints at title RVAs (report registers, text pointed at by the argument registers, and the title's call chain, then continue); `--watch-repeat` keeps them armed (re-arming by single-step) and prints one compact line per hit for the title's logger; `--patch-fastfail` was added earlier. The device's standard creation methods now log failures with a dump of the description and, for views, the resource's own type and description.
 
 ## Next investigation steps
+0. Keep removing the startup stand-in gaps (each run stops in a different one now) until the first present, then build the swap chain.
 1. Decode the command packet stream (the flush dumps), starting with the packet header layout and the common opcodes.
 2. ~~Give the Xbox `User` element real methods~~ Shell-layer faults fixed (strings, events); the meaning of the user slots is still inferred.
-3. Find what corrupts the GPU driver's thread, and what ends the run with `0x87D` under the debug layer. Use `XB1_D3D_DEBUG=1` and fix each message.
+3. ~~Find what corrupts the GPU driver's thread~~ Done (unverified context forwarding). Open: the `0x87D` exit under the debug layer.
 4. Texture data: decode the console tiling and mirror placement textures.
 5. The remaining decoding tasks listed earlier (`+0xA08`, `+0x4e0`, which context slot the console table lacks).
 6. Pin down the console `ICoreWindow` layout: keep logging slots as the title uses more of them, and give stand-in behavior to a slot only where the call pattern justifies it.
-7. Implement `DXGIXSetVLineNotification`, `DXGIXPresentArray` and the display/swap-chain path (the title's render-target view creation still fails once on a NULL back buffer).
+7. Build the swap chain: `DXGIXPresentArray` and `DXGIXSetVLineNotification` exist as logging stubs, but the title never reaches a present, and its render-target view for the back buffer is still created with a NULL resource.
 8. Work out the real shape of the `PackageTransferManager` interfaces and the `42A6A529` / `9FF3799E` `CoreApplication` extensions.
 9. Provide a `G:` equivalent and inspect `media/` (encrypted content is out of scope).
 10. Back the window with a native `HWND` and raise `CoreWindow` events.

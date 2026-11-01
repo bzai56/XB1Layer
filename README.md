@@ -1,18 +1,21 @@
-﻿# XB1Layer
+# XB1Layer
 
 An experimental compatibility layer for running Xbox One (GDK/XDK "Durango") x64 titles on Windows x64.
 
-**Status: early prototype.** Today it is a PE64 loader that maps a title's executable and reports which console-only APIs it needs. It does not run games yet.
+**Status: early prototype. Nothing is drawn yet.** It loads and starts an unpacked Xbox One title (the Forza Horizon 3 kiosk demo is the test case), runs it through startup into its main loop, and gives it a desktop Direct3D 11 device. The title writes its GPU work as console command packets that are not decoded yet, and there is no swap chain or window, so there is no picture. The goal is a layer that runs titles without graphical glitches; it is not there.
 
 ## What works
 - Manual PE64 mapping (headers, sections, base relocations)
 - Import resolution against real Windows DLLs
 - Logging stubs for unresolved imports (console-only DLLs such as `d3d11_x.dll`, `xg_x.dll`)
 - `kernelx.dll` forwarded to `kernel32.dll`; DLLs next to the title are searched first
-- On the FH3 demo: 701 imports resolve natively, 39 remain stubbed
+- On the FH3 demo: 708 imports resolve natively, 32 remain stubbed
 - Process bootstrap (unwind tables, PEB image base, per-thread static TLS) and console `VirtualAlloc` handling
-- The FH3 demo runs through CRT startup, `Initialize`, `SetWindow`, `Load`, activation and into `IFrameworkView::Run`, where its main loop calls the dispatcher repeatedly. It loads `WindowsCodecs.dll`, asks for a console-only `CoreApplication` interface, and gets proxy D3D11 device and context objects. Standard methods and the part of the context's embedded method table that has been decoded (slots 0 to 23, for example `Map`, `Unmap`, `VSSetShader`) reach real desktop D3D11; the rest is logged. The device's console-only texture creation methods (slots 64 and 65) are implemented on top of desktop D3D11, and the title now creates 17 textures and drives the real context. The title's main loop runs, then a thread reads a NULL pointer. Device slot 62 (constant buffers) is implemented; slot 73 is not decoded, and placed buffers are mirrored (data the title writes into their memory reaches the GPU buffer; verified), while placed textures are not yet (their data is in the console tiling). The title's render targets now create successfully and its main loop runs without a stuck polling loop; it writes GPU command packets into a buffer each context owns, which the layer does not interpret yet, so nothing is drawn. The title's thread-local storage is owned by `ntdll` through a generated helper DLL, so it survives any DLL load on any thread
-- A WinRT shell layer (`src/winrt.rs`): our own `CoreApplication`, view, window and dispatcher run the title's `IFrameworkView` lifecycle. The FH3 demo now reaches `IFrameworkView::Initialize`, then needs the console-only `Windows.Xbox.*` WinRT classes (served by a generic discovery stand-in for now)
+- The FH3 demo runs through CRT startup, `Initialize`, `SetWindow`, `Load`, activation and into `IFrameworkView::Run`, where its main loop runs. Its thread-local storage is owned by `ntdll` through a generated helper DLL.
+- Graphics: `D3D11XCreateDeviceX` returns proxy device and context objects over a real desktop D3D11 device. The console-only device methods for textures and buffers (slots 59, 62, 64, 65) are implemented on top of it; the title's render targets create successfully; placed buffers are mirrored to the GPU (verified), placed textures are not (console tiling is not decoded). Only the context-table entries backed by logged calls forward to the driver (indices 7, 11, 14, 15, 23 and 34 to 63); the rest log and do nothing. `XB1_D3D_DEBUG=1` turns on the D3D11 debug layer and logs its messages.
+- The title writes GPU command packets into a 4 MB buffer each context owns; they are logged and discarded. Decoding them is the main missing piece. `DXGIXPresentArray` and `DXGIXSetVLineNotification` are logging stubs, so there is no swap chain.
+- A WinRT shell layer (`src/winrt.rs`): our own `CoreApplication`, view, window and dispatcher run the title's lifecycle. Console-only `Windows.Xbox.*` and `Microsoft.Xbox.*` classes are served by logging stand-ins whose method shapes are guessed from call sites, with specific handling for the user list (one user), the controller list (empty), strings and event subscriptions.
+- **Where it stops:** a run now fails in the shell layer, on a different stand-in gap from run to run (for example `title+0xcb6764` or `title+0x1948d59`), before its first present. See [Findings](docs/FINDINGS.md).
 - `XMem*` console memory API
 - `D3D11XCreateDeviceX` backed by a real desktop D3D11 device (`xb1layer --test-d3d` to check it), and a proxy for the console audio extension of the MMDevice enumerator
 - `--ring=<path>` crash-proof trace and `tools\read-ring.ps1` to read it
@@ -28,7 +31,7 @@ cargo run -- path\to\title.exe --imports  # also list every stubbed import, grou
 cargo run -- path\to\title.exe --run    # also run the entry point (real titles do not get far yet)
 ```
 
-Debug flags for `--run`: `--watch=N`, `--trace-api`, `--trace-heap`, `--iat`. See [Architecture](docs/ARCHITECTURE.md#debugging-aids).
+Debug flags for `--run`: `--watch=N`, `--trace-api`, `--trace-heap`, `--iat`, `--ring=`, `--watch-sites=`. Environment: `XB1_D3D_DEBUG=1` (D3D11 debug layer), `XB1_NO_EXTEND=1`, `XB1_NO_MIRROR=1`. See [Architecture](docs/ARCHITECTURE.md#debugging-aids).
 
 Run a title from its own folder so relative paths resolve.
 

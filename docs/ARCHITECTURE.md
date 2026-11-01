@@ -1,4 +1,4 @@
-﻿# Architecture
+# Architecture
 
 ## Premise
 Xbox One titles are x64 PE binaries built for a customized Windows kernel ("Durango"/GameOS) on an x86-64 Jaguar CPU. No CPU emulation is needed. The work is replacing the console's system layer, so the design is closer to Wine than to a CPU emulator.
@@ -55,11 +55,12 @@ Objects behind that lifecycle: a `CoreApplicationView` (`ICoreApplicationView`),
 - The embedded region holds a copy of the desktop context method table starting at offset `0x3E0` (slot *n* at `0x3E0 + 8n`; see [FINDINGS.md](FINDINGS.md#decoding-the-embedded-context-functions)). Console indexes 0 to 23 forward to the same desktop slot (`QueryInterface`, `AddRef`, `Release` and `GetDevice` are the proxy's own), and indexes 34 to 113 forward to desktop index + 1: the console table lacks one method among desktop slots 24 to 34. Indexes 24 to 33 are logging stubs.
 - Device extension slots implemented: 59 (a logging stand-in COM object), 64 (`CreatePlacementTexture2D` shape: an ordinary desktop 2D texture is created from the description; console-only `MiscFlags` bits are dropped, tile mode and placement memory are ignored) 65 (same, 3D) and 62 (`CreatePlacementBuffer` shape: a desktop constant buffer). Slot 73 is a dumping stub. Placed buffers are mirrored: draws, dispatches and copies go through a pre-sync thunk that uploads changed placement memory (`UpdateSubresource`) before forwarding. Placed textures are not mirrored yet.
 - The device's standard `CreateBuffer`, `CreateTexture2D` and `CreateTexture3D` are sanitizing wrappers (console-only `MiscFlags` bits dropped, failures logged with the description); the four view creators retry with no description when the given one is rejected with `E_INVALIDARG`; created resources get an extended vtable (11 real slots, logging stubs, slot 13 on 2D textures returns width and height) by redirecting the object's vtable pointer.
-- Each context proxy owns a 4 MB command buffer: the title writes GPU command packets at the cursor in `[ctx+0x50]` (end `[ctx+0x58]`) and calls `+0xA68` when full. Today the packets are logged and discarded; interpreting them is the main missing piece. Only context offsets from `0x3E0` are function-pointer stubs; lower offsets are data fields. See [FINDINGS.md](FINDINGS.md#device-creation-methods-decoded-and-implemented).
+- Each context proxy owns a 4 MB command buffer: the title writes GPU command packets at the cursor in `[ctx+0x50]` (end `[ctx+0x58]`) and calls `+0xA68` when full. Today the packets are logged and discarded; interpreting them is the main missing piece.
+- **Context table forwarding is evidence-based.** The embedded table is not a plain copy of the desktop one (console index 8 is not `PSSetShaderResources`). Forwarded to the desktop context: 7 (`VSSetConstantBuffers`), 11 and 23 (`SetShader`, with `r8`/`r9` zeroed because the console takes only the shader), 14 and 15 (`Map`/`Unmap`), and shifted indices 34 to 63. Every other index logs and returns; forwarding unverified ones corrupted the NVIDIA driver thread. Device slots 41 and 42 (`SetExceptionMode` on the desktop) are logging stubs; a console `DYNAMIC` constant buffer is created as `DEFAULT`. Only context offsets from `0x3E0` are function-pointer stubs; lower offsets are data fields. See [FINDINGS.md](FINDINGS.md#device-creation-methods-decoded-and-implemented).
 - The logging stubs capture `this` and the next three arguments, show what each pointer points at, name the call site in the title, and log only the first six calls of each stub and then powers of two.
 - On a crash, the logger lists which embedded fields differ from their original stub pointers, i.e. the state the title has written.
 
-The `DXGIX*` functions are not provided (`DXGIXPresentArray` and `DXGIXSetVLineNotification` are still stubs). `xb1layer --test-d3d` creates a device and exercises the proxies without loading a title.
+`DXGIXPresentArray` and `DXGIXSetVLineNotification` are logging stubs (the latter is called as `(0, 0, 0x2d4, 0)`); there is no swap chain or window. `xb1layer --test-d3d` creates a device and exercises the proxies without loading a title.
 
 ### MMDevice enumerator proxy
 `CoCreateInstance` is overridden. When the title creates `CLSID_MMDeviceEnumerator`, the result is wrapped in a forwarding proxy (`IMMDeviceEnumerator`, 5 methods) that answers the console-only IID `8B557ADC-555E-47A0-B223-43477E481DAD` with a stand-in: slot 8 reports two zero 32-bit values, slot 9 accepts a pointer to the caller's own object. Anything else is forwarded to the real object.
@@ -77,7 +78,9 @@ Some imports are implemented by us instead of forwarded to Windows:
 | `CreateThread`, `CreateThreadpoolIo` | Install static TLS on new threads and on thread-pool I/O callback threads |
 | `VirtualAlloc` | Also masks the protection argument to `0x7FF` (console-only bit `0x10000` otherwise fails with `ERROR_NOT_SUPPORTED`) |
 | `XMem*`, `TitleMemoryStatus` | Console memory API (see below) |
-| `GetActivationFactoryByPCWSTR` (vccorlib140) | Routes WinRT class lookups to the shell layer |
+| `GetActivationFactoryByPCWSTR` (vccorlib140) | Routes WinRT class lookups to the shell layer (`Windows.Xbox.*`, `Microsoft.Xbox.*` and `Windows.ApplicationModel.Package`, which fails without package identity, get stand-ins) |
+| `DXGIXPresentArray`, `DXGIXSetVLineNotification` (d3d11_x) | Logging stubs |
+| `ExitProcess`, `TerminateProcess` | Log the caller, then forward |
 
 ### Debugging aids
 | Flag | Effect |
@@ -95,7 +98,11 @@ Some imports are implemented by us instead of forwarded to Windows:
 | `--no-peb-patch` | Leaves `PEB.ImageBaseAddress` pointing at the host (used to rule the patch out as a cause) |
 | `--trace-window` | Replaces the `windows`-crate window's vtable with a logging copy (`CoreWindow slot N`). Only useful for the desktop-layout window object |
 | `--test-d3d` | Creates the desktop D3D11 device through the `D3D11XCreateDeviceX` path without loading a title |
+| `XB1_D3D_DEBUG=1` (environment) | Creates the desktop device with the debug layer and logs its messages as `[d3d-debug]` (it found the `SetShader`, slot 41 and bad-index problems) |
+| `XB1_NO_EXTEND=1`, `XB1_NO_MIRROR=1` (environment) | Disable resource vtable extension / placement-buffer mirroring, to rule them out |
 | `--heapcheck` | With `--watch`, polls `HeapValidate`. Experimental: it takes the heap lock and can stall a title that is itself stuck in the heap |
+
+`ntdll!NtTerminateProcess` is hooked (16-byte trampoline) so every process exit logs its status and callers, and `CreateThread` routines and returns are logged. Hooking `NtCreateThreadEx` hung the run and is disabled.
 
 `tools\run-title.ps1 -Title <exe> -Seconds N -Ring` builds the command line, runs the title from its own folder with a timeout, and prints the exit code and stderr. The crash logger also reports MSVC C++ throws (`0xE06D7363`, first 30), which shows where a title throws.
 

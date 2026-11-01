@@ -1,4 +1,4 @@
-﻿# Roadmap
+# Roadmap
 
 1. ~~**Import report**: `--imports` flag that prints every stubbed `dll!name`, grouped by DLL.~~ Done.
 2. ~~**DLL search path**: let the loader resolve bundled DLLs from the title's own folder.~~ Done.
@@ -21,8 +21,11 @@
 3j8. ~~Device slot 62~~ Done: a 1,168-byte constant buffer, created as a desktop buffer. **Slot 73** (probably a texture view) and context `+0x4e0`, `+0xA08` remain. Placement memory is mirrored for buffers (verified); textures still need the console tiling decoded and de-tiled.
 3j9. ~~**NULL read at `title+0xe6319c`**~~ Done: the title was using a render-target resource whose creation failed (console-only `MiscFlags` bits rejected by desktop D3D11). Fixed in the standard creation wrappers.
 3j11. **Decode the GPU command packet stream** the title writes into its context (the core of rendering): header layout, opcodes for draws, state, binding, clears, copies. Each context has a 4 MB buffer; flushes are logged.
-3j12. **Windows.Xbox.System.User element** methods (the `Users` list now has one stand-in user; the title calls into it).
-3j13. **A fault inside the GPU driver's worker thread** (`nvwgf2umx.dll`) seen in some runs: something handed to D3D11 corrupts state.
+3j12. ~~**Windows.Xbox.System.User element**~~ Shell-layer faults fixed (strings, event subscriptions); slot meanings are inferred. **Ongoing:** each run still stops on another stand-in gap (`Store.Product`, `Controller`, `XboxLiveConfiguration`, `Package` fixed so far).
+3j13. ~~**GPU driver worker-thread fault**~~ Done: unverified context-table indices were forwarded to the desktop driver; only evidenced ones are now. Remaining: identify the other console indices from their calls (24 to 33, 64+).
+3j14. **Swap chain and window** for `DXGIXPresentArray` (a logging stub today); the title never reaches a present yet.
+3j15. **The `0x87D` exit under the debug layer** (a NULL-execute in a thread, then termination): unexplained.
+3j16. **Gamepad input**: the controller list is empty.
 3j10. **Which desktop context slot (24 to 34) the console table lacks.**
 3j3. **Decode the two `CoreApplication` console extension interfaces** (`42A6A529`, `9FF3799E`).
 3k. **Console `ICoreWindow` layout**: pin down the member list, then raise window events (activation, size, visibility, input).
