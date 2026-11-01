@@ -128,7 +128,7 @@ const EMBED_SHIFTED_TO: usize = 113;
 fn forwarded_entries() -> &'static Vec<(usize, usize)> {
     static ENTRIES: OnceLock<Vec<(usize, usize)>> = OnceLock::new();
     let entries = ENTRIES.get_or_init(|| {
-        let thunks = unsafe { VirtualAlloc(ptr::null_mut(), 4096, 0x3000, 0x40) } as *mut u8;
+        let thunks = unsafe { VirtualAlloc(ptr::null_mut(), 16384, 0x3000, 0x40) } as *mut u8;
         assert!(!thunks.is_null(), "thunk allocation failed");
         let mut v = Vec::new();
         let index_of = |offset: usize| (offset - EMBED_BASE) / 8;
@@ -138,12 +138,12 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
                 1 => proxy_add_ref as usize,
                 2 => proxy_release as usize,
                 3 => context_get_device as usize,
-                s => forward_thunk(unsafe { thunks.add(s * 16) }, s),
+                s => forward_context_thunk(unsafe { thunks.add(s * 32) }, s),
             };
             v.push((index_of(EMBED_TABLE + slot * 8), entry));
         }
         for console_slot in EMBED_SHIFTED_FROM..=EMBED_SHIFTED_TO {
-            let thunk = forward_thunk(unsafe { thunks.add((64 + console_slot - EMBED_SHIFTED_FROM) * 16) }, console_slot + 1);
+            let thunk = forward_context_thunk(unsafe { thunks.add((64 + console_slot - EMBED_SHIFTED_FROM) * 32) }, console_slot + 1);
             v.push((index_of(EMBED_TABLE + console_slot * 8), thunk));
         }
         // Draws and dispatches first mirror the placement buffers (see sync_before_draw).
@@ -495,6 +495,41 @@ unsafe extern "system" fn device_get_immediate_context(this: *mut c_void, out: *
     if !out.is_null() && unsafe { !(*out).is_null() } {
         unsafe { *out = wrap(*out, Kind::Context) };
     }
+}
+
+/// Drains the debug layer's message queue into the log (the layer otherwise writes to a debugger).
+fn spawn_debug_message_pump(device: ID3D11Device) {
+    use windows::core::Interface;
+    struct SendDevice(ID3D11Device);
+    unsafe impl Send for SendDevice {}
+    let device = SendDevice(device);
+    std::thread::spawn(move || {
+        let device = device;
+        let Ok(queue) = device.0.cast::<ID3D11InfoQueue>() else {
+            glog!("[gpu] debug layer: no info queue (is the Graphics Tools feature installed?)");
+            return;
+        };
+        loop {
+            let count = unsafe { queue.GetNumStoredMessages() };
+            for i in 0..count {
+                let mut len = 0usize;
+                unsafe {
+                    if queue.GetMessage(i, None, &mut len).is_err() {
+                        continue;
+                    }
+                }
+                let mut buf = vec![0u8; len];
+                let msg = buf.as_mut_ptr() as *mut D3D11_MESSAGE;
+                if unsafe { queue.GetMessage(i, Some(msg), &mut len) }.is_ok() {
+                    let m = unsafe { &*msg };
+                    let text = unsafe { std::slice::from_raw_parts(m.pDescription as *const u8, m.DescriptionByteLength.saturating_sub(1)) };
+                    glog!("[d3d-debug] severity {} id {}: {}", m.Severity.0, m.ID.0, String::from_utf8_lossy(text));
+                }
+            }
+            unsafe { queue.ClearStoredMessages() };
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
 }
 
 /// `ID3D11Device::CreateDeferredContext(UINT flags, ID3D11DeviceContext**)`
@@ -927,6 +962,15 @@ unsafe extern "system" fn device_create_texture3d(this: *mut c_void, desc: *cons
 unsafe fn create_view(this: *mut c_void, slot: usize, name: &str, resource: *mut c_void, desc: *const c_void, out: *mut *mut c_void) -> HRESULT {
     static FALLBACKS: AtomicU32 = AtomicU32::new(0);
     let p = unsafe { &*(this as *const Proxy) };
+    if resource.is_null() {
+        // The title has no display back buffer yet (no swap chain), so it asks for a view of NULL.
+        // The debug layer crashes on this; the runtime would return E_INVALIDARG.
+        let n = FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        if n < 8 {
+            glog!("[gpu] {name}: NULL resource (display back buffer?) -> E_INVALIDARG");
+        }
+        return HRESULT(0x80070057u32 as i32);
+    }
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, *mut *mut c_void) -> HRESULT =
         unsafe { std::mem::transmute(*((*(p.real as *const *const usize)).add(slot))) };
     let hr = unsafe { f(p.real, resource, desc, out) };
@@ -1110,6 +1154,25 @@ fn forward_thunk(mem: *mut u8, slot: usize) -> usize {
     mem as usize
 }
 
+/// Desktop context slots of the `XSSetShader` methods: `(shader, class instances, count)` on the
+/// desktop but just the shader on the console (no class linkage), so the title leaves garbage in
+/// the two extra arguments (the debug layer reported an out-of-range `NumClassInstances`).
+const SET_SHADER_SLOTS: [usize; 6] = [9, 11, 23, 60, 64, 69];
+
+/// Like `forward_thunk`, but for a context method that is a `SetShader`: zeroes `r8` and `r9`
+/// (class instance array and count) first.
+fn forward_context_thunk(mem: *mut u8, slot: usize) -> usize {
+    if !SET_SHADER_SLOTS.contains(&slot) {
+        return forward_thunk(mem, slot);
+    }
+    // xor r8d, r8d ; xor r9d, r9d ; then the usual forward
+    let mut code = vec![0x45, 0x31, 0xC0, 0x45, 0x31, 0xC9];
+    code.extend_from_slice(&[0x48, 0x8B, 0x41, 0x08, 0x48, 0x89, 0xC1, 0x48, 0x8B, 0x00, 0xFF, 0xA0]);
+    code.extend_from_slice(&((slot * 8) as u32).to_le_bytes());
+    unsafe { ptr::copy_nonoverlapping(code.as_ptr(), mem, code.len()) };
+    mem as usize
+}
+
 fn build_vtable(kind: Kind) -> Vec<usize> {
     let standard = match kind {
         Kind::Device => DEVICE_STANDARD_SLOTS,
@@ -1125,7 +1188,11 @@ fn build_vtable(kind: Kind) -> Vec<usize> {
     v[1] = proxy_add_ref as usize;
     v[2] = proxy_release as usize;
     for i in 3..standard {
-        v[i] = forward_thunk(unsafe { thunks.add(i * 16) }, i);
+        v[i] = if kind == Kind::Context {
+            forward_context_thunk(unsafe { thunks.add(i * 32) }, i)
+        } else {
+            forward_thunk(unsafe { thunks.add(i * 32) }, i)
+        };
     }
     match kind {
         Kind::Device => {
@@ -1150,6 +1217,13 @@ fn build_vtable(kind: Kind) -> Vec<usize> {
         for (n, (slot, _)) in LOGGED_CREATE_NAMES.iter().enumerate() {
             v[*slot] = logged_create_thunk(unsafe { logged.add(n * 128) }, *slot);
         }
+        // Slots 41 and 42 are SetExceptionMode/GetExceptionMode on the desktop, but the title calls
+        // slot 41 with a pointer (the debug layer: "Unrecognized RaiseFlags"), so they are
+        // something else on the console. Log and succeed instead of forwarding.
+        let mut arena = ArgArena::new();
+        v[41] = arena.make("[gpu] device slot 41 (SetExceptionMode on the desktop)".to_string(), ret_zero as usize as u64);
+        v[42] = arena.make("[gpu] device slot 42 (GetExceptionMode on the desktop)".to_string(), ret_zero as usize as u64);
+        std::mem::forget(arena);
         // Buffers and textures also need their console-only MiscFlags bits removed.
         v[3] = device_create_buffer as usize;
         v[5] = device_create_texture2d as usize;
@@ -1203,12 +1277,15 @@ pub extern "system" fn create_device_x(params: *const u8, out_device: *mut *mut 
     let mut device: Option<ID3D11Device> = None;
     let mut context: Option<ID3D11DeviceContext> = None;
     let mut got = D3D_FEATURE_LEVEL_11_0;
+    // XB1_D3D_DEBUG=1 turns on the desktop debug layer and logs its validation messages.
+    let debug = std::env::var_os("XB1_D3D_DEBUG").is_some();
+    let create_flags = if debug { D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_DEBUG } else { D3D11_CREATE_DEVICE_BGRA_SUPPORT };
     let result = unsafe {
         D3D11CreateDevice(
             None,
             D3D_DRIVER_TYPE_HARDWARE,
             HMODULE::default(),
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            create_flags,
             Some(&levels),
             D3D11_SDK_VERSION,
             Some(&mut device),
@@ -1219,6 +1296,11 @@ pub extern "system" fn create_device_x(params: *const u8, out_device: *mut *mut 
     match result {
         Ok(()) => {
             glog!("[gpu] created a desktop D3D11 device (feature level {:#x}); returning proxies", got.0);
+            if debug {
+                if let Some(d) = device.clone() {
+                    spawn_debug_message_pump(d);
+                }
+            }
             unsafe {
                 if !out_device.is_null() {
                     *out_device = device.map_or(ptr::null_mut(), |d| wrap(d.into_raw(), Kind::Device));

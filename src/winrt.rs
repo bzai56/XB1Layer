@@ -631,6 +631,39 @@ fn is_writable(p: *mut c_void) -> bool {
     state == 0x1000 && protect & 0xCC != 0
 }
 
+/// True if `p` looks like a COM object: its first word points at a vtable whose first entry is
+/// executable code. A delegate passed to an `add_Event` method looks like this; an out-parameter
+/// slot does not.
+fn looks_like_com_object(p: *mut c_void) -> bool {
+    if !is_readable_ptr(p) {
+        return false;
+    }
+    let vtbl = unsafe { *(p as *const usize) };
+    if !is_readable_ptr(vtbl as *mut c_void) {
+        return false;
+    }
+    let entry = unsafe { *(vtbl as *const usize) };
+    let mut mbi = [0u64; 8];
+    if unsafe { VirtualQuery(entry as *mut c_void, mbi.as_mut_ptr() as *mut c_void, 48) } == 0 {
+        return false;
+    }
+    let (state, protect) = (mbi[4] & 0xFFFF_FFFF, mbi[4] >> 32);
+    // MEM_COMMIT; PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+    state == 0x1000 && protect & 0xF0 != 0
+}
+
+fn is_readable_ptr(p: *mut c_void) -> bool {
+    if (p as usize) < 0x10000 || (p as usize) % 8 != 0 {
+        return false;
+    }
+    let mut mbi = [0u64; 8];
+    if unsafe { VirtualQuery(p, mbi.as_mut_ptr() as *mut c_void, 48) } == 0 {
+        return false;
+    }
+    let (state, protect) = (mbi[4] & 0xFFFF_FFFF, mbi[4] >> 32);
+    state == 0x1000 && protect & 0xFF != 0 && protect & 0x101 == 0
+}
+
 /// Any method of a stand-in object. The signature is unknown, so the first argument after
 /// `this` is treated as a possible out-parameter: if it points at writable memory, a new
 /// stand-in object is stored there and the call reports success (the common shape of a
@@ -679,6 +712,37 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         let list = create_vector_view("Windows.Xbox.System.User.Users", &o.iid, 1);
         unsafe { *(arg1 as *mut *mut c_void) = list };
         wlog!("[winrt] {} slot 9 (Users) -> a vector view with 1 user", o.class);
+        return HRESULT(0);
+    }
+    // Statics slot 10 is an event subscription, `add_Event(handler, &token)`: arg1 is the title's
+    // own delegate object, so it must not be treated as an out-parameter (that overwrote its vtable).
+    if o.class == "Windows.Xbox.System.User" && N >= 10 {
+        if N % 2 == 0 && is_writable(arg2) {
+            unsafe { ptr::write_unaligned(arg2 as *mut i64, next_token()) };
+        }
+        wlog!("[winrt] {} slot 10 (event add) -> token", o.class);
+        return HRESULT(0);
+    }
+    // The title reads a string (a Platform::String it hands to a wstring constructor) from slot 6
+    // of the object that slot 9 of a signed-in user returns; a stand-in object there faults in
+    // `Data()`. Taken to be the gamertag, so it gets a real HSTRING.
+    if o.class.starts_with("Windows.Xbox.System.User.Users (element") && o.class.ends_with("#slot9") && N >= 6 && is_writable(arg1) {
+        unsafe { *(arg1 as *mut *mut c_void) = std::mem::transmute::<HSTRING, *mut c_void>(HSTRING::from("XB1Layer Player")) };
+        wlog!("[winrt] {}: slot {N} -> HSTRING \"XB1Layer Player\"", o.class);
+        return HRESULT(0);
+    }
+    // Slot 15 of a user is parsed by the title with base-10 `wcstoull`: the Xbox user id as a string.
+    if o.class.starts_with("Windows.Xbox.System.User.Users (element") && !o.class.contains('#') && N == 15 && is_writable(arg1) {
+        unsafe { *(arg1 as *mut *mut c_void) = std::mem::transmute::<HSTRING, *mut c_void>(HSTRING::from("2535400000000001")) };
+        wlog!("[winrt] {}: slot 15 -> HSTRING user id", o.class);
+        return HRESULT(0);
+    }
+    // A delegate in arg1 means `add_Event(handler, &token)`: leave the handler alone.
+    if looks_like_com_object(arg1) {
+        if is_writable(arg2) {
+            unsafe { ptr::write_unaligned(arg2 as *mut i64, next_token()) };
+        }
+        wlog!("[winrt] {} slot {N}: arg1 is a COM object -> treated as an event subscription", o.class);
         return HRESULT(0);
     }
     if is_writable(arg1) {

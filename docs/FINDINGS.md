@@ -228,13 +228,28 @@ With the above, the run stayed up for 40 seconds, producing 150,000 lines. The t
 ## Where the run ends now
 The title runs and its state is mostly set up, then it faults either in the user stand-in (above) or occasionally inside the GPU driver's own worker thread (`nvwgf2umx.dll`), which means something handed to Direct3D is corrupting driver state. That second fault is not understood.
 
+## The user object, and a Direct3D debug layer
+The `Users` element faults were all the same mistake in my stand-in: it answered every call by writing a new stand-in object through the first argument. Three shapes turned up.
+- A getter that returns a **string**. The title passes the result to `Platform::String::Data()` (the fault at `title+0x16f244f` is the `wstring` constructor reading it). Slot 6 of the object returned by user slot 9 now returns an `HSTRING`, as does slot 15 of the user (parsed with base-10 `wcstoull`, so it is a decimal user ID). Both values are made up (`XB1Layer Player`, `2535400000000001`); what each slot means is inferred from use, not known.
+- An **event subscription**, `add_Event(handler, &token)`. The first argument is the title's own delegate, and writing a stand-in pointer through it overwrote its vtable, which is why execution jumped to `0x1f`. `User` statics slots 10 and up are treated as add/remove pairs. More generally, when the first argument looks like a COM object (a vtable whose first entry is executable code), the call is taken as an event add and only the token is written.
+
+With these the run no longer faults in the shell layer. The `Windows.Xbox.Input.Controller` calls hit the same pattern and are now covered by the general rule.
+
+Setting `XB1_D3D_DEBUG=1` creates the desktop device with the **debug layer** and logs its messages (`[d3d-debug]`). It found two real signature mismatches in my forwarding:
+- **`SetShader` calls.** The desktop methods take `(shader, class instances, count)`; the console ones take only the shader, so the title left garbage in the other two arguments (`NumClassInstances is out of range`, a corruption-severity message). Context `SetShader` thunks now zero `r8` and `r9`.
+- **Device slot 41.** It is `SetExceptionMode(UINT)` on the desktop, but the title calls it with a pointer. Slots 41 and 42 now log and succeed instead of being forwarded. What they are on the console is not known.
+
+It also reported many invalid shader-resource-view descriptions (view dimension not matching the resource, multisample resources viewed as non-multisample, mip ranges, typed formats that are not castable). The views are retried with no description, which works for the common case, but a view created that way may not match what the title meant. Creating the render-target view for a NULL resource crashes the debug layer itself, so that call now returns `E_INVALIDARG` with a log line.
+
+Open: with the debug layer on, the run ends by itself with exit code `0x87D` without going through `ExitProcess` or `TerminateProcess` (both are now logged). Without it, the NVIDIA worker thread fault still happens, so the corruption is not explained yet; the `SetShader` fix removes one known cause but is not shown to be the one.
+
 ## Tools added
 `--watch-sites=0x...,0x...` plants one-shot breakpoints at title RVAs (report registers, text pointed at by the argument registers, and the title's call chain, then continue); `--watch-repeat` keeps them armed (re-arming by single-step) and prints one compact line per hit for the title's logger; `--patch-fastfail` was added earlier. The device's standard creation methods now log failures with a dump of the description and, for views, the resource's own type and description.
 
 ## Next investigation steps
 1. Decode the command packet stream (the flush dumps), starting with the packet header layout and the common opcodes.
-2. Give the Xbox `User` element real methods (gamertag, user ID, signed-in state), decoded from the title's use.
-3. Find what corrupts the GPU driver's thread.
+2. ~~Give the Xbox `User` element real methods~~ Shell-layer faults fixed (strings, events); the meaning of the user slots is still inferred.
+3. Find what corrupts the GPU driver's thread, and what ends the run with `0x87D` under the debug layer. Use `XB1_D3D_DEBUG=1` and fix each message.
 4. Texture data: decode the console tiling and mirror placement textures.
 5. The remaining decoding tasks listed earlier (`+0xA08`, `+0x4e0`, which context slot the console table lacks).
 6. Pin down the console `ICoreWindow` layout: keep logging slots as the title uses more of them, and give stand-in behavior to a slot only where the call pattern justifies it.

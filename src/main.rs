@@ -35,6 +35,7 @@ unsafe extern "system" {
     fn CreateThread(attrs: *mut c_void, stack: usize, routine: usize, param: *mut c_void, flags: u32, tid: *mut u32) -> *mut c_void;
     fn VirtualFree(addr: *mut c_void, size: usize, ty: u32) -> i32;
     fn TerminateProcess(process: *mut c_void, code: u32) -> i32;
+    fn ExitProcess(code: u32) -> !;
     fn HeapCreate(options: u32, initial: usize, max: usize) -> *mut c_void;
     fn HeapValidate(heap: *mut c_void, flags: u32, mem: *const c_void) -> i32;
     fn GetProcessHeap() -> *mut c_void;
@@ -958,6 +959,29 @@ extern "system" fn xb_get_process_heap() -> *mut c_void {
     GUEST_HEAP.load(Ordering::Relaxed) as *mut c_void
 }
 
+/// Logs who ends the process, then does it.
+fn log_exit_request(what: &str, code: u32) {
+    let (base, size) = (IMG_BASE.load(Ordering::Relaxed), IMG_SIZE.load(Ordering::Relaxed));
+    rlog!("[exit] {what}({code:#x})");
+    let mut frames = [ptr::null_mut::<c_void>(); 32];
+    let n = unsafe { RtlCaptureStackBackTrace(0, 32, frames.as_mut_ptr(), ptr::null_mut()) } as usize;
+    for f in frames[..n].iter().map(|f| *f as usize).filter(|f| *f >= base && *f < base + size).take(10) {
+        rlog!("  caller title+{:#x}", f - base);
+    }
+}
+
+extern "system" fn xb_exit_process(code: u32) {
+    log_exit_request("ExitProcess", code);
+    unsafe { ExitProcess(code) }
+}
+
+extern "system" fn xb_terminate_process(process: *mut c_void, code: u32) -> i32 {
+    if process as isize == -1 {
+        log_exit_request("TerminateProcess", code);
+    }
+    unsafe { TerminateProcess(process, code) }
+}
+
 /// Imports we implement ourselves instead of forwarding to Windows.
 fn override_for(dll: &str, func: &str) -> Option<usize> {
     if dll.eq_ignore_ascii_case("vccorlib140.dll") && func.starts_with("?GetActivationFactoryByPCWSTR") {
@@ -974,6 +998,8 @@ fn override_for(dll: &str, func: &str) -> Option<usize> {
     }
     match func {
         "GetProcessHeap" => Some(xb_get_process_heap as usize),
+        "ExitProcess" => Some(xb_exit_process as usize),
+        "TerminateProcess" => Some(xb_terminate_process as usize),
         "HeapAlloc" if TRACE_HEAP.load(Ordering::Relaxed) => Some(xb_heap_alloc as usize),
         "HeapFree" => Some(xb_heap_free as usize),
         "VirtualAlloc" => Some(xb_virtual_alloc as usize),
