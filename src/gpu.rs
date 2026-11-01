@@ -623,6 +623,76 @@ unsafe extern "system" fn device_ext_65(this: *mut c_void, desc: *const u8, tile
     unsafe { create_placement_texture(65, this, desc, tile_mode, pitch, memory, out, 6) }
 }
 
+/// Device extension slot 62: `(device, desc*, placementMemory*, Buffer** out)`, the shape of the
+/// console SDK's `CreatePlacementBuffer`. The description is a `D3D11_BUFFER_DESC`:
+/// `{ByteWidth, Usage, BindFlags, CPUAccessFlags, MiscFlags, StructureByteStride}`; the observed
+/// calls are 1,168-byte constant buffers (`BindFlags = 4`) at addresses 0x700 apart.
+///
+/// An ordinary desktop buffer is created. The placement memory is NOT mirrored: a title that
+/// writes constants straight into that memory (as the console GPU reads it) will not have those
+/// writes reach this buffer. Keeping the two in sync is future work.
+unsafe extern "system" fn device_ext_62(this: *mut c_void, desc: *const u32, memory: *mut c_void, out: *mut *mut c_void) -> HRESULT {
+    static COUNT: AtomicU32 = AtomicU32::new(0);
+    let p = unsafe { &*(this as *const Proxy) };
+    let mut d = [0u32; 6];
+    unsafe { ptr::copy_nonoverlapping(desc, d.as_mut_ptr(), 6) };
+    // Keep the desktop-valid MiscFlags (DRAWINDIRECT_ARGS 0x10, RAW_VIEWS 0x20, STRUCTURED 0x40).
+    d[4] &= 0x10 | 0x20 | 0x40;
+    let mut buffer: *mut c_void = ptr::null_mut();
+    let f: unsafe extern "system" fn(*mut c_void, *const u32, *const c_void, *mut *mut c_void) -> HRESULT =
+        unsafe { std::mem::transmute(*((*(p.real as *const *const usize)).add(3))) };
+    let hr = unsafe { f(p.real, d.as_ptr(), ptr::null(), &mut buffer) };
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 6 || hr.0 < 0 {
+        glog!(
+            "[gpu] device slot 62: buffer {} bytes, usage {}, bind {:#x}, misc {:#x}, placed at {memory:p} -> {:#x} {buffer:p}",
+            d[0], d[1], d[2], d[4], hr.0 as u32
+        );
+    }
+    if hr.0 >= 0 && !buffer.is_null() {
+        if !out.is_null() {
+            unsafe { *out = buffer };
+        }
+        return HRESULT(0);
+    }
+    if !out.is_null() {
+        unsafe { *out = new_stand_in() };
+    }
+    HRESULT(0)
+}
+
+/// Safe hex dump of `n` bytes at `p`, or a note if the memory is not readable.
+fn safe_dump(p: u64, n: usize) -> String {
+    if p < 0x10000 {
+        return format!("{p:#x}");
+    }
+    let mut buf = vec![0u8; n];
+    let mut got = 0usize;
+    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), p as *const c_void, buf.as_mut_ptr() as *mut c_void, n, &mut got) } != 0;
+    if !ok && got == 0 {
+        return format!("{p:#x} (unreadable)");
+    }
+    format!("{p:#x}: {}", hex_dump(buf.as_ptr(), got.min(n)))
+}
+
+/// Device slots 62 and 73: arguments unknown, so each call dumps what its pointer arguments
+/// point at (64 bytes each) and returns 0. `(device, a2, a3, a4, a5, a6)`.
+unsafe extern "system" fn device_ext_dump<const N: usize>(_this: *mut c_void, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> usize {
+    static COUNT: AtomicU32 = AtomicU32::new(0);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 24 {
+        glog!(
+            "[gpu] device slot {N} call: a2 = {} | a3 = {} | a4 = {} | a5 = {} | a6 = {}",
+            safe_dump(a2, 64),
+            safe_dump(a3, 64),
+            safe_dump(a4, 32),
+            safe_dump(a5, 32),
+            safe_dump(a6, 32)
+        );
+    }
+    0
+}
+
 // ---------------------------------------------------------------------------------------
 // vtable construction
 // ---------------------------------------------------------------------------------------
@@ -677,6 +747,8 @@ fn build_vtable(kind: Kind) -> Vec<usize> {
         v[59] = device_ext_59 as usize;
         v[64] = device_ext_64 as usize;
         v[65] = device_ext_65 as usize;
+        v[62] = device_ext_62 as usize;
+        v[73] = device_ext_dump::<73> as usize;
     }
     v
 }

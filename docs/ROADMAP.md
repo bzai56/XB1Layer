@@ -1,4 +1,4 @@
-# Roadmap
+﻿# Roadmap
 
 1. ~~**Import report**: `--imports` flag that prints every stubbed `dll!name`, grouped by DLL.~~ Done.
 2. ~~**DLL search path**: let the loader resolve bundled DLLs from the title's own folder.~~ Done.
@@ -18,8 +18,8 @@
 3j5. ~~**Extended D3D11 device and context**~~ First version done: proxy objects forwarding the standard slots, with logging stubs for console-only vtable slots and for the function pointers embedded in the context object. The title's real use of these is not understood yet.
 3j6. ~~**Decode the context's embedded functions**~~ Partly done: the embedded region is a copy of the desktop context method table at `+0x3E0`; slots 0 to 23 and two shader slots now forward to the real context. Remaining: the rest of the table, and `+0xA08`.
 3j7. ~~**Device extension slots 59, 64, 65**~~ Done: 64 and 65 create real desktop textures (17 per run); 59 returns a logging stand-in. The context table mapping is exact from index 34 on.
-3j8. **Device slots 62 and 73** (probably shader creation from code blobs in memory, which would need a translator for the console GPU's shader format), and context `+0x4e0`, `+0xA08`.
-3j9. **NULL read at `title+0xe6319c`** (`[rdi+0x50]`, `rdi=0`) on a non-graphics thread.
+3j8. ~~Device slot 62~~ Done: a 1,168-byte constant buffer, created as a desktop buffer. **Slot 73** (probably a texture view) and context `+0x4e0`, `+0xA08` remain. Placement memory is not mirrored into the desktop resources, for buffers or textures.
+3j9. **NULL read at `title+0xe6319c`**: a helper queries console-only IID `DFDBA067-0B8D-4865-875B-D7B4516CC164` on a member of a NULL object.
 3j10. **Which desktop context slot (24 to 34) the console table lacks.**
 3j3. **Decode the two `CoreApplication` console extension interfaces** (`42A6A529`, `9FF3799E`).
 3k. **Console `ICoreWindow` layout**: pin down the member list, then raise window events (activation, size, visibility, input).

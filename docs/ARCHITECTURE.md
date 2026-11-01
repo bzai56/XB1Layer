@@ -1,4 +1,4 @@
-# Architecture
+﻿# Architecture
 
 ## Premise
 Xbox One titles are x64 PE binaries built for a customized Windows kernel ("Durango"/GameOS) on an x86-64 Jaguar CPU. No CPU emulation is needed. The work is replacing the console's system layer, so the design is closer to Wine than to a CPU emulator.
@@ -53,7 +53,7 @@ Objects behind that lifecycle: a `CoreApplicationView` (`ICoreApplicationView`),
 - `QueryInterface`: standard non-D3D11 interfaces are answered by the real object; D3D11 device/context interfaces by the proxy; interfaces the real object rejects (console-only IIDs) by the proxy itself.
 - Vtable slots beyond the standard range, and every 8-byte slot of the context proxy's embedded region (offsets `0x18` to `0x4018`), are logging stubs that return 0. The embedded region exists because the title calls function pointers stored inside the context object (`call [obj+0xA08]`), not through its vtable.
 - The embedded region holds a copy of the desktop context method table starting at offset `0x3E0` (slot *n* at `0x3E0 + 8n`; see [FINDINGS.md](FINDINGS.md#decoding-the-embedded-context-functions)). Console indexes 0 to 23 forward to the same desktop slot (`QueryInterface`, `AddRef`, `Release` and `GetDevice` are the proxy's own), and indexes 34 to 113 forward to desktop index + 1: the console table lacks one method among desktop slots 24 to 34. Indexes 24 to 33 are logging stubs.
-- Device extension slots implemented: 59 (a logging stand-in COM object), 64 (`CreatePlacementTexture2D` shape: an ordinary desktop 2D texture is created from the description; console-only `MiscFlags` bits are dropped, tile mode and placement memory are ignored) and 65 (same, 3D). See [FINDINGS.md](FINDINGS.md#device-creation-methods-decoded-and-implemented).
+- Device extension slots implemented: 59 (a logging stand-in COM object), 64 (`CreatePlacementTexture2D` shape: an ordinary desktop 2D texture is created from the description; console-only `MiscFlags` bits are dropped, tile mode and placement memory are ignored) 65 (same, 3D) and 62 (`CreatePlacementBuffer` shape: a desktop constant buffer). Slot 73 is a dumping stub. Placement memory is not mirrored. See [FINDINGS.md](FINDINGS.md#device-creation-methods-decoded-and-implemented).
 - The logging stubs capture `this` and the next three arguments, show what each pointer points at, name the call site in the title, and log only the first six calls of each stub and then powers of two.
 - On a crash, the logger lists which embedded fields differ from their original stub pointers, i.e. the state the title has written.
 

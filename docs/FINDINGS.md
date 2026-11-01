@@ -183,9 +183,17 @@ More logged calls fixed the mapping of the embedded context table:
 
 So from console index 34 on, the console table is exactly one slot behind the desktop one, while indexes 11, 14, 15 and 23 match the desktop numbers. The method the console lacks is therefore one of desktop slots 24 to 34 (candidates: `IASetPrimitiveTopology`, `Begin`, `End`, `GetData`, `SetPredication`, `GSSetShaderResources`, ...); which one is not known. The proxy now forwards console indexes 0 to 23 as-is and 34 to 113 to desktop index + 1 (only indexes up to 63 have direct evidence; the rest is extrapolation, for example 109 would be `ClearState`). Indexes 24 to 33 stay logging stubs. With this, essentially all the context calls the title makes reach the real context; the remaining stub hits are `+0x4e0` (index 32) and `+0xA08`.
 
-## What is probably next: shaders
-Device slots **62** and **73** are the remaining unimplemented calls. Slot 62 is called 7 times with `(device, {size 0x490...}* , address, out*)`, where the address steps by 0x700 (`0x80dba0100`, `0x80dba0800`, `0x80dba0f00`, ...), which looks like creating shader objects from code blobs laid out in memory. If these are shaders, they are compiled for the console's GPU and cannot run on desktop hardware as they are. The layer would need to translate them (to DXBC or SPIR-V), which is a large component of its own. This is a reading of the argument pattern, not something checked against the data.
+## Slots 62 and 73
+**Correction:** I first read device slot 62 as shader creation from code blobs. Dumping its arguments showed it is not. Its descriptor is a `D3D11_BUFFER_DESC`: `{ByteWidth = 0x490, Usage = 0, BindFlags = 4, CPUAccessFlags = 0, MiscFlags = 0, StructureByteStride = 0}`, i.e. a **1,168-byte constant buffer** (`D3D11_BIND_CONSTANT_BUFFER`). The call has the shape of the console SDK's `CreatePlacementBuffer(desc*, placementMemory*, Buffer** out)`: the second argument is the memory the buffer is placed in (`0x80dba0100`, `0x80dba0800`, ..., 0x700 bytes apart, inside the title's reserved GPU-visible range, all zeros at creation) and the third is a stack slot for the output. It is implemented as an ordinary desktop `CreateBuffer` (misc flags masked to the desktop-valid ones); 15 such buffers are created per run.
 
+**Known gap:** the placement memory is not mirrored. A title that writes its constants straight into that memory, which is how the console GPU reads them, will not have those writes reach the desktop buffer. The same applies to textures placed with slots 64 and 65 (their pixel data is written by the title into placement memory, in the console's tiled layout). Closing this needs the layer to copy placement memory into the real resources before use, and de-tile texture data. Nothing like that exists yet.
+
+**Slot 73** is only partly decoded. It takes two ~64-byte structures plus a NULL fourth argument and is called three times. The values `5`, `8` and `0xb` in them match the mip counts of three of the textures created just before (the 16x16x16 volume has 5 mips, the 1024x1024 textures have 11), so it is most likely a texture-related call such as creating a view of a texture. Its signature is not known, so it is still a dumping stub that returns 0.
+
+**Not shaders (yet):** no shader creation has been seen. Shaders may appear later, and if they are in the console GPU's binary format they would need translating; that is still an open question, but this data does not show it.
+
+## The NULL read, narrowed
+The NULL read at `title+0xe6319c` is in a small helper that queries an interface of an object that is itself reached through a NULL pointer (`rcx = 0x50`, the address of a member at offset `0x50` of a NULL object). The helper queries the IID **`DFDBA067-0B8D-4865-875B-D7B4516CC164`**, which is not a standard DXGI/D3D11 IID I could identify, so it is probably a console-only interface. Which object is NULL is not known.
 ## Two bugs found along the way (mine, not the title's)
 - The console CoreWindow stand-in treated vtable slot 3 as `IInspectable::GetIids` and wrote through its arguments. The title calls slot 3 with non-pointers, a misaligned write panicked in the debug build, and the abort showed up as exit code `0xC0000409` (identical to a real fast-fail). The console window now has its own vtable where slots 3 to 5 are logging slots. Some earlier "fast-fail" endings may have been this.
 - A tool for real fast-fails: `--patch-fastfail` replaces the compiler's `mov ecx, code; int 0x29` sequences with a breakpoint, so the crash logger reports the site and the code. Only one such site exists in the image, and it was not reached in the runs checked.
@@ -195,7 +203,7 @@ The title creates its textures and drives the real context (copies, clears, blen
 
 ## Next investigation steps
 1. Find out what the NULL read at `title+0xe6319c` depends on.
-2. Decode device extension slots 62 and 73 (probably shader creation), and context `+0x4e0` and `+0xA08`.
+2. Decode device extension slot 73 (probably a texture view) and context `+0x4e0` and `+0xA08`; find the console-only interface `DFDBA067-...` and the NULL object behind the NULL read.
 3. Find which of desktop context slots 24 to 34 the console table lacks.
 4. Work out what slot 7 of `42A6A529` is (it takes a small value `1`).
 5. Pin down the console `ICoreWindow` layout: keep logging slots as the title uses more of them, and keep stand-in behavior per slot only where the call pattern justifies it.
