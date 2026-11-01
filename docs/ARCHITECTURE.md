@@ -48,6 +48,7 @@ Some imports are implemented by us instead of forwarded to Windows:
 | `--watch=N` | After N seconds, briefly suspends the title thread and prints RIP plus title return addresses on its stack |
 | `--trace-api` | Logs every natively resolved import call through a register-preserving thunk (noisy calls are filtered, capped at 20,000 lines) |
 | `--trace-heap` | Logs `HeapAlloc`, `HeapFree` and `VirtualAlloc` arguments and results |
+| `--ring=<path>` | Crash-proof trace: every native import call, with the title address that made it, goes into a 64 MB memory-mapped circular buffer that survives the process dying (fast-fails included). Also logs arguments and results for file calls (`CreateFile2`, `CreateFileW`, `ReadFile`, `GetFileInformationByHandleEx`, `FindFirstFileExA`, `GetFileAttributesExA`) and `GetActivationFactoryByPCWSTR`. Read it with `tools\read-ring.ps1` |
 | `--heapcheck` | With `--watch`, polls `HeapValidate`. Experimental: it takes the heap lock and can stall a title that is itself stuck in the heap |
 
 The crash logger is a vectored exception handler that reports `title+RVA`, registers, access-violation target, memory-region state and return-address-looking stack values. It allocates nothing, because the title may have crashed inside the heap. It cannot see fast-fails (`int 0x29`), which bypass exception dispatch.

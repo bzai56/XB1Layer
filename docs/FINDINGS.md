@@ -52,10 +52,22 @@ Calling the entry point after the process bootstrap (see [ARCHITECTURE.md](ARCHI
 4. **`XMemSetAllocationHooks`** is the first console-only stub the title actually calls, and it returns 0.
 
 ## Where it stops now
-The process ends with `0xC0000409` (fast-fail), which bypasses exception handlers, so the crash logger prints nothing. The last traced activity is heavy string processing (`isalpha`, `tolower`, `strcpy_s`) after thousands of `memcpy` calls, so the title is still in initialization, not in a game loop. Finding the fast-fail site needs either a debugger or a ring buffer of the last API calls that survives process death.
+The process ends with exit code `0xC000027B` (`STATUS_STOWED_EXCEPTION`). One earlier run ended in `0xC0000409` instead; I did not find out why, and later runs all gave `0xC000027B`. Found with the crash-proof ring trace (`--ring=`, see [ARCHITECTURE.md](ARCHITECTURE.md)):
+
+1. The title is a **C++/CX (WinRT) app**: it imports `vccorlib140.dll` and `combase.dll`.
+2. It first looks for `g:\hash.manifest`. `G:` is the console's game-content drive, which does not exist here, so `GetFileAttributesExA` and `FindFirstFileExA("g:\*")` fail with `ERROR_PATH_NOT_FOUND`. It then falls back to `.\hash.manifest` (found because the working directory is the title folder).
+3. It activates `Windows.ApplicationModel.Core.CoreApplication` (`ICoreApplication`, IID `0AACF7A4-5E1D-49DF-8034-FB6A68BC5ED1`) successfully through the real Windows runtime.
+4. It then reads `hash.manifest` as 12-byte records (an 8-byte hash and a `0xFFFFFFFF` marker) and stops after about 100 of the file's roughly 2,260 records.
+5. A WinRT call returns `E_INVALIDARG`. The C++/CX HRESULT-to-exception mapper at `title+0x227454` raises `Platform::InvalidArgumentException`, nothing catches it, and the title calls `RoFailFastWithErrorContext` from `title+0x2859bcf`.
+
+**What is established:** the title fail-fasts on an uncaught `E_INVALIDARG` WinRT exception, after activating `CoreApplication` and while reading `hash.manifest`.
+
+**What is not established:** which WinRT call returned `E_INVALIDARG`. WinRT method calls go through COM vtables, not through imports, so the API trace cannot see them. A reasonable guess is that the title runs inside the real `CoreApplication`, whose view and window objects do not exist for an unpackaged desktop process, but that has not been verified.
 
 ## Next investigation steps
-1. Locate the fast-fail (ring buffer or debugger), then implement whatever it was waiting for.
-2. Implement `XMem*` and `TitleMemoryStatus`.
-3. Inspect `media/` to see whether content is plain or encrypted (encrypted content is out of scope).
-4. Work out which D3D11.X-only interfaces and methods the title calls on the returned device.
+1. Provide our own WinRT layer for the UWP shell (`CoreApplication`, `CoreApplicationView`, `CoreWindow`, dispatcher) backed by a native window, so the title's `IFrameworkView` callbacks (`Initialize`, `SetWindow`, `Load`, `Run`) run under our control and failures become visible.
+2. Wrap WinRT objects the title receives so their method calls are traceable.
+3. Provide a `G:` equivalent: map the title folder as the content root instead of relying on the working directory.
+4. Implement `XMem*` and `TitleMemoryStatus`.
+5. Inspect `media/` to see whether content is plain or encrypted (encrypted content is out of scope).
+6. Work out which D3D11.X-only interfaces and methods the title calls on the returned device.

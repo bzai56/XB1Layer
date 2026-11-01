@@ -16,6 +16,15 @@ use std::{env, fs, process, ptr};
 
 unsafe extern "system" {
     fn VirtualAlloc(addr: *mut c_void, size: usize, ty: u32, prot: u32) -> *mut c_void;
+    fn CreateFileA(name: *const i8, access: u32, share: u32, sec: *mut c_void, disp: u32, flags: u32, template: *mut c_void) -> *mut c_void;
+    fn CreateFileMappingA(file: *mut c_void, sec: *mut c_void, prot: u32, hi: u32, lo: u32, name: *const i8) -> *mut c_void;
+    fn MapViewOfFile(map: *mut c_void, access: u32, hi: u32, lo: u32, bytes: usize) -> *mut c_void;
+    fn CreateFileW(name: *const u16, access: u32, share: u32, sec: *mut c_void, disp: u32, flags: u32, tmpl: *mut c_void) -> *mut c_void;
+    fn CreateFile2(name: *const u16, access: u32, share: u32, disp: u32, params: *mut c_void) -> *mut c_void;
+    fn FindFirstFileExA(name: *const i8, level: u32, data: *mut c_void, op: u32, filter: *mut c_void, flags: u32) -> *mut c_void;
+    fn GetFileAttributesExA(name: *const i8, level: u32, data: *mut c_void) -> i32;
+    fn ReadFile(h: *mut c_void, buf: *mut c_void, n: u32, read: *mut u32, ov: *mut c_void) -> i32;
+    fn GetFileInformationByHandleEx(h: *mut c_void, class: u32, buf: *mut c_void, size: u32) -> i32;
     fn GetLastError() -> u32;
     fn CreateThread(attrs: *mut c_void, stack: usize, routine: usize, param: *mut c_void, flags: u32, tid: *mut u32) -> *mut c_void;
     fn HeapCreate(options: u32, initial: usize, max: usize) -> *mut c_void;
@@ -444,6 +453,7 @@ impl StubArena {
             0xF3, 0x0F, 0x7F, 0x4C, 0x24, 0x30, // xmm1
             0xF3, 0x0F, 0x7F, 0x54, 0x24, 0x40, // xmm2
             0xF3, 0x0F, 0x7F, 0x5C, 0x24, 0x50, // xmm3
+            0x48, 0x8B, 0x94, 0x24, 0x88, 0x00, 0x00, 0x00, // mov rdx, [rsp+88h] (caller's return address)
             0x48, 0xB9, // mov rcx, idx
         ];
         c.extend_from_slice(&(idx as u64).to_le_bytes());
@@ -470,12 +480,68 @@ impl StubArena {
     }
 }
 
+/// Crash-proof trace: a memory-mapped file used as a circular text buffer. The OS keeps
+/// the pages after the process dies, so the last calls survive even a fast-fail.
+/// Layout: u64 total bytes written, then RING_SIZE bytes of text.
+const RING_SIZE: usize = 64 << 20;
+static RING: AtomicUsize = AtomicUsize::new(0);
+
+fn ring_init(path: &str) -> Result<(), String> {
+    let cpath = CString::new(path).map_err(|e| e.to_string())?;
+    unsafe {
+        // GENERIC_READ|GENERIC_WRITE, share read/write, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL
+        let f = CreateFileA(cpath.as_ptr(), 0xC000_0000, 3, ptr::null_mut(), 2, 0x80, ptr::null_mut());
+        if f as isize == -1 {
+            return Err(format!("cannot create {path}"));
+        }
+        let m = CreateFileMappingA(f, ptr::null_mut(), 0x04, 0, (RING_SIZE + 8) as u32, ptr::null());
+        if m.is_null() {
+            return Err("CreateFileMapping failed".into());
+        }
+        let v = MapViewOfFile(m, 0x2, 0, 0, 0);
+        if v.is_null() {
+            return Err("MapViewOfFile failed".into());
+        }
+        RING.store(v as usize, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+fn ring_write(args: std::fmt::Arguments) {
+    let ring = RING.load(Ordering::Relaxed);
+    if ring == 0 {
+        return;
+    }
+    let mut w = RawBuf::new();
+    let _ = std::fmt::write(&mut w, args);
+    unsafe {
+        let total = &*(ring as *const std::sync::atomic::AtomicU64);
+        let start = total.fetch_add(w.n as u64, Ordering::Relaxed) as usize;
+        let data = (ring + 8) as *mut u8;
+        for (i, &b) in w.b[..w.n].iter().enumerate() {
+            *data.add((start + i) % RING_SIZE) = b;
+        }
+    }
+}
+
 static TRACE_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static TRACE_API: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Called from the trace thunks; logs each API call the title makes (capped).
-extern "system" fn trace_hit(idx: u64) {
+extern "system" fn trace_hit(idx: u64, ret: u64) {
+    if RING.load(Ordering::Relaxed) != 0 {
+        if let Ok(names) = TRACE_NAMES.try_lock() {
+            let (base, size) = (IMG_BASE.load(Ordering::Relaxed), IMG_SIZE.load(Ordering::Relaxed));
+            let ret = ret as usize;
+            if ret >= base && ret < base + size {
+                ring_write(format_args!("{} <- title+{:#x}\n", names[idx as usize], ret - base));
+            } else {
+                ring_write(format_args!("{} <- {ret:#x}\n", names[idx as usize]));
+            }
+        }
+        return;
+    }
     if let Ok(names) = TRACE_NAMES.try_lock() {
         let name = &names[idx as usize];
         // High-volume calls that only drown out the interesting ones.
@@ -499,6 +565,12 @@ extern "system" fn xb_get_process_heap() -> *mut c_void {
 
 /// Imports we implement ourselves instead of forwarding to Windows.
 fn override_for(dll: &str, func: &str) -> Option<usize> {
+    if dll.eq_ignore_ascii_case("vccorlib140.dll")
+        && func.starts_with("?GetActivationFactoryByPCWSTR")
+        && RING.load(Ordering::Relaxed) != 0
+    {
+        return Some(xb_get_activation_factory as usize);
+    }
     if !dll.eq_ignore_ascii_case("kernelx.dll") && !dll.eq_ignore_ascii_case("kernel32.dll") {
         return None;
     }
@@ -508,6 +580,12 @@ fn override_for(dll: &str, func: &str) -> Option<usize> {
         "HeapFree" if TRACE_HEAP.load(Ordering::Relaxed) => Some(xb_heap_free as usize),
         "VirtualAlloc" => Some(xb_virtual_alloc as usize),
         "CreateThread" => Some(xb_create_thread as usize),
+        "CreateFile2" if RING.load(Ordering::Relaxed) != 0 => Some(xb_create_file2 as usize),
+        "FindFirstFileExA" if RING.load(Ordering::Relaxed) != 0 => Some(xb_find_first_file_ex_a as usize),
+        "GetFileAttributesExA" if RING.load(Ordering::Relaxed) != 0 => Some(xb_get_file_attributes_ex_a as usize),
+        "CreateFileW" if RING.load(Ordering::Relaxed) != 0 => Some(xb_create_file_w as usize),
+        "ReadFile" if RING.load(Ordering::Relaxed) != 0 => Some(xb_read_file as usize),
+        "GetFileInformationByHandleEx" if RING.load(Ordering::Relaxed) != 0 => Some(xb_get_file_info as usize),
         _ => None,
     }
 }
@@ -547,6 +625,92 @@ extern "system" fn xb_virtual_alloc(addr: *mut c_void, size: usize, ty: u32, pro
         rlog!("VirtualAlloc(addr={addr:p}, size={size:#x}, type={ty:#x}->{clean:#x}, protect={prot:#x}) -> {p:p} err={err}{note}");
     }
     p
+}
+
+// File call tracing (ring mode only): passes straight through to Windows and records
+// arguments and results, so a stuck file loop can be diagnosed from the ring.
+extern "system" fn xb_create_file_w(name: *const u16, access: u32, share: u32, sec: *mut c_void, disp: u32, flags: u32, tmpl: *mut c_void) -> *mut c_void {
+    let h = unsafe { CreateFileW(name, access, share, sec, disp, flags, tmpl) };
+    let err = if h as isize == -1 { unsafe { GetLastError() } } else { 0 };
+    let mut units = Vec::new();
+    unsafe {
+        let mut i = 0;
+        while *name.add(i) != 0 && i < 260 {
+            units.push(*name.add(i));
+            i += 1;
+        }
+    }
+    ring_write(format_args!("  CreateFileW({:?}, access={access:#x}, disp={disp}) -> {h:p} err={err}\n", String::from_utf16_lossy(&units)));
+    h
+}
+
+/// C++/CX `GetActivationFactoryByPCWSTR(class_name, guid, out)`: looks up a WinRT class factory.
+/// Passed through to the real vccorlib140; logs the class name and the HRESULT.
+extern "system" fn xb_get_activation_factory(name: *const u16, guid: *const u8, out: *mut *mut c_void) -> i32 {
+    let real: extern "system" fn(*const u16, *const u8, *mut *mut c_void) -> i32 = unsafe {
+        let m = LoadLibraryA(c"vccorlib140.dll".as_ptr());
+        std::mem::transmute(GetProcAddress(m, c"?GetActivationFactoryByPCWSTR@@YAJPEAXAEAVGuid@Platform@@PEAPEAX@Z".as_ptr()))
+    };
+    let hr = real(name, guid, out);
+    let g = if guid.is_null() { [0u8; 16] } else { unsafe { *(guid as *const [u8; 16]) } };
+    ring_write(format_args!(
+        "  GetActivationFactoryByPCWSTR({:?}, iid={:02x?}) -> hr={:#x}\n",
+        wide_to_string(name), g, hr as u32
+    ));
+    hr
+}
+
+fn wide_to_string(p: *const u16) -> String {
+    let mut units = Vec::new();
+    unsafe {
+        while !p.is_null() && *p.add(units.len()) != 0 && units.len() < 260 {
+            units.push(*p.add(units.len()));
+        }
+    }
+    String::from_utf16_lossy(&units)
+}
+
+fn ansi_to_string(p: *const i8) -> String {
+    if p.is_null() {
+        return String::new();
+    }
+    unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned()
+}
+
+extern "system" fn xb_create_file2(name: *const u16, access: u32, share: u32, disp: u32, params: *mut c_void) -> *mut c_void {
+    let h = unsafe { CreateFile2(name, access, share, disp, params) };
+    let err = if h as isize == -1 { unsafe { GetLastError() } } else { 0 };
+    ring_write(format_args!("  CreateFile2({:?}, access={access:#x}, disp={disp}) -> {h:p} err={err}\n", wide_to_string(name)));
+    h
+}
+
+extern "system" fn xb_find_first_file_ex_a(name: *const i8, level: u32, data: *mut c_void, op: u32, filter: *mut c_void, flags: u32) -> *mut c_void {
+    let h = unsafe { FindFirstFileExA(name, level, data, op, filter, flags) };
+    let err = if h as isize == -1 { unsafe { GetLastError() } } else { 0 };
+    ring_write(format_args!("  FindFirstFileExA({:?}) -> {h:p} err={err}\n", ansi_to_string(name)));
+    h
+}
+
+extern "system" fn xb_get_file_attributes_ex_a(name: *const i8, level: u32, data: *mut c_void) -> i32 {
+    let ok = unsafe { GetFileAttributesExA(name, level, data) };
+    let err = if ok == 0 { unsafe { GetLastError() } } else { 0 };
+    ring_write(format_args!("  GetFileAttributesExA({:?}) -> ok={ok} err={err}\n", ansi_to_string(name)));
+    ok
+}
+
+extern "system" fn xb_read_file(h: *mut c_void, buf: *mut c_void, n: u32, read: *mut u32, ov: *mut c_void) -> i32 {
+    let ok = unsafe { ReadFile(h, buf, n, read, ov) };
+    let got = if read.is_null() { 0 } else { unsafe { *read } };
+    let err = if ok == 0 { unsafe { GetLastError() } } else { 0 };
+    ring_write(format_args!("  ReadFile({h:p}, want={n}) -> ok={ok} got={got} err={err}\n"));
+    ok
+}
+
+extern "system" fn xb_get_file_info(h: *mut c_void, class: u32, buf: *mut c_void, size: u32) -> i32 {
+    let ok = unsafe { GetFileInformationByHandleEx(h, class, buf, size) };
+    let err = if ok == 0 { unsafe { GetLastError() } } else { 0 };
+    ring_write(format_args!("  GetFileInformationByHandleEx({h:p}, class={class}, size={size}) -> ok={ok} err={err}\n"));
+    ok
 }
 
 extern "system" fn xb_heap_free(heap: *mut c_void, flags: u32, p: *mut c_void) -> i32 {
@@ -797,7 +961,14 @@ fn main() {
     let report = args.iter().any(|a| a == "--imports");
     let dump_iat = args.iter().any(|a| a == "--iat");
     HEAPCHECK.store(args.iter().any(|a| a == "--heapcheck"), Ordering::Relaxed);
-    TRACE_API.store(args.iter().any(|a| a == "--trace-api"), Ordering::Relaxed);
+    let ring_path = args.iter().find_map(|a| a.strip_prefix("--ring="));
+    if let Some(p) = ring_path {
+        if let Err(e) = ring_init(p) {
+            eprintln!("ring trace: {e}");
+            process::exit(1);
+        }
+    }
+    TRACE_API.store(ring_path.is_some() || args.iter().any(|a| a == "--trace-api"), Ordering::Relaxed);
     TRACE_HEAP.store(args.iter().any(|a| a == "--trace-heap"), Ordering::Relaxed);
     if let Some(n) = args.iter().find_map(|a| a.strip_prefix("--watch=")) {
         WATCH_SECS.store(n.parse().unwrap_or(5), Ordering::Relaxed);
