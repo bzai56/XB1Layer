@@ -1163,8 +1163,46 @@ fn register_placed_buffer(resource: *mut c_void, memory: usize, size: usize) {
 }
 
 /// Called in front of every draw and dispatch. `this` is the context proxy.
+/// The title's inlined state cache writes the vertex shader, pixel shader and input layout straight
+/// into the context object (`+0x178`, `+0x180`, `+0x188`, with dirty bits in `+0x168`) instead of
+/// calling a bind method; applying them is the draw's job. Binds whichever of those fields holds an
+/// object we created, by creating slot, and uses a triangle list.
+fn apply_inlined_state(this: *mut c_void, real: *mut c_void) {
+    static LOGS: AtomicU32 = AtomicU32::new(0);
+    let vt = unsafe { *(real as *const *const usize) };
+    let mut bound = [0usize; 3];
+    for (i, off) in [0x178usize, 0x180, 0x188].iter().enumerate() {
+        let obj = unsafe { *((this as usize + off) as *const usize) };
+        if obj < 0x10000 || obj % 8 != 0 {
+            continue;
+        }
+        let kind = CREATED_KINDS.lock().unwrap().iter().rev().find(|(o, _)| *o == obj).map(|(_, k)| *k);
+        let Some(kind) = kind else { continue };
+        restore_object_vtable(obj as *mut c_void);
+        bound[i] = kind;
+        match kind {
+            11 => {
+                let f: unsafe extern "system" fn(*mut c_void, *mut c_void) = unsafe { std::mem::transmute(*vt.add(17)) };
+                unsafe { f(real, obj as *mut c_void) };
+            }
+            12 | 15 => {
+                let slot = if kind == 12 { 11 } else { 9 };
+                let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, u32) = unsafe { std::mem::transmute(*vt.add(slot)) };
+                unsafe { f(real, obj as *mut c_void, ptr::null(), 0) };
+            }
+            _ => {}
+        }
+    }
+    let t: unsafe extern "system" fn(*mut c_void, u32) = unsafe { std::mem::transmute(*vt.add(24)) };
+    unsafe { t(real, 4) };
+    if LOGS.fetch_add(1, Ordering::Relaxed) < 6 {
+        glog!("[gpu] draw: inlined state kinds (+0x178,+0x180,+0x188) = {bound:?}");
+    }
+}
+
 extern "system" fn sync_before_draw(this: *mut c_void) {
     let real = unsafe { (*(this as *const Proxy)).real };
+    apply_inlined_state(this, real);
     if env_flag("XB1_NO_MIRROR") {
         return;
     }
