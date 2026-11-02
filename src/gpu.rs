@@ -965,6 +965,14 @@ unsafe extern "system" fn ctx_probe<const IDX: usize, const DESK: usize>(this: *
     if LOGS.fetch_add(1, Ordering::Relaxed) < 3 {
         glog!("[gpu] probe console {IDX}: a2={a2:#x} a3={a3:#x}: {} a4={a4:#x}: {}", safe_dump(a3 as u64, 32), safe_dump(a4 as u64, 16));
     }
+    if IDX == 23 && a3 > 0x10000 && a3 % 8 == 0 && LOGS.load(Ordering::Relaxed) <= 8 {
+        let pair = unsafe { [*(a3 as *const usize), *((a3 + 8) as *const usize)] };
+        let kinds = CREATED_KINDS.lock().unwrap();
+        for o in pair {
+            let k = kinds.iter().rev().find(|(x, _)| *x == o).map(|(_, k)| *k);
+            glog!("[gpu] probe 23 object {o:#x} created by device slot {k:?}");
+        }
+    }
     if DESK == 0 {
         return;
     }

@@ -6,7 +6,7 @@ The goal is a layer that runs many Xbox One titles on Windows x64 without graphi
 
 ## Next up: Sonic Mania (in order)
 
-1. **Explicit console-to-desktop context call table.** Replace range-based forwarding of the embedded context functions with a per-index `(console, desktop)` list built from observed call arguments (indices 8, 10, 12, 16, 18, 19, 32, 35, 42, 43, 53 are evidenced so far).
+1. **Decode the PM4 shader and topology binds for Sonic Mania.** The context call table is done (state, views, buffers, clears, viewports, draw count); shaders, input layout and topology travel as PM4 register writes in the command buffer (see FINDINGS). Parse them with `XB1_DUMP_CMD` and bind the matching desktop objects before each draw.
 2. **First picture.** Run Sonic Mania and get the title's 2D scene into the window.
 3. **Hunt glitches.** Compare with the expected output, fix formats, blending, sampling and de-tiling that look wrong.
 4. **Input.** Gamepad and keyboard so the game can be played.
