@@ -184,6 +184,9 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
                     v.push((index_of(EMBED_TABLE + console_slot * 8), thunk));
                 }
                 v.push((index_of(EMBED_TABLE + 13 * 8), ctx_map_old as usize));
+                v.push((index_of(EMBED_TABLE + 10 * 8), ctx_draw_indexed as usize));
+                v.push((index_of(EMBED_TABLE + 18 * 8), ctx_bind_object as usize));
+                v.push((index_of(EMBED_TABLE + 11 * 8), ctx_draw_old as usize));
                 v.push((index_of(EMBED_TABLE + 31 * 8), ctx_om_set_render_targets_old as usize));
                 v.push((index_of(EMBED_TABLE + 87 * 8), ctx_om_get_render_targets_old as usize));
             }
@@ -2231,8 +2234,9 @@ pub fn unwrap_object(p: *mut c_void) -> *mut c_void {
 /// calls: 31 is called as (1, &rtv, dsv) = `OMSetRenderTargets` (desktop 33); 42 as (1, &viewport) =
 /// `RSSetViewports` (desktop 44); 33 `OMSetBlendState(state, factor, mask)` (35), 34 `OMSetDepthStencilState(state, ref)` (36),
 /// 41 `RSSetState` (43), 43 `RSSetScissorRects` (45), 46 `UpdateSubresource` with the subresource counting 0 to 4 (48),
-/// 51 `ClearDepthStencilView(dsv, 3, ..)` (53), all two behind the desktop; 13 is `Map` (see `ctx_map_old`, desktop 14) and 14 `Unmap(res, 0)` (desktop 15).
-const OLD_SDK_EXTRA: [(usize, usize); 8] = [(42, 44), (14, 15), (33, 35), (34, 36), (41, 43), (43, 45), (46, 48), (51, 53)];
+/// 51 `ClearDepthStencilView(dsv, 3, ..)` (53), all two behind the desktop; 17 `IASetVertexBuffers` (18), 6 and 15 the VS and PS `SetConstantBuffers` (7, 16), 19 and 20 the PS `SetShaderResources`/`SetSamplers` (8, 10) and 7 the VS resources (25; a guess), 18 the Sonic-shaped `IASetIndexBuffer(format, buffer, offset)`, 10 a packed `DrawIndexed`, 11 `Draw`; 13 is `Map` (see `ctx_map_old`, desktop 14) and 14 `Unmap(res, 0)` (desktop 15).
+const OLD_SDK_EXTRA: [(usize, usize); 14] =
+    [(42, 44), (14, 15), (33, 35), (34, 36), (41, 43), (43, 45), (46, 48), (51, 53), (17, 18), (6, 7), (15, 16), (19, 8), (20, 10), (7, 25)];
 
 /// Older-XDK embedded index 13 (+0x448): `Map(resource, subresource, map type, flags, void** data)`. The
 /// console returns the data pointer itself; the desktop fills a `D3D11_MAPPED_SUBRESOURCE`
@@ -2333,6 +2337,22 @@ unsafe extern "system" fn dxgi_present_wrapped(this: *mut c_void, sync: u32, fla
     if LOGS.fetch_add(1, Ordering::Relaxed) < 5 {
         glog!("[gpu] Present(sync {sync}, flags {flags:#x}) -> {:#x}", hr.0 as u32);
     }
+    static FRAMES: AtomicU32 = AtomicU32::new(0);
+    if FRAMES.fetch_add(1, Ordering::Relaxed) == 150 {
+        report_context_changes();
+    }
     crate::display::limit_frame_rate();
     hr
+}
+
+/// Older-XDK embedded index 11 (+0x440): `Draw(vertex count, first vertex)` (desktop 13), seen as (4, 0, ..).
+unsafe extern "system" fn ctx_draw_old(this: *mut c_void, count: u32, start: u32) {
+    static LOGS: AtomicU32 = AtomicU32::new(0);
+    if LOGS.fetch_add(1, Ordering::Relaxed) < 4 {
+        glog!("[gpu] Draw({count}, {start})");
+    }
+    sync_before_draw(this);
+    let real = unsafe { real_context(this) };
+    let f: unsafe extern "system" fn(*mut c_void, u32, u32) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(13))) };
+    unsafe { f(real, count, start) };
 }
