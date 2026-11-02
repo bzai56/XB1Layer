@@ -162,8 +162,8 @@ const EMBED_VERIFIED_SHIFTED: [usize; 5] = [34, 46, 49, 59, 63];
 /// one behind: 32 `OMSetRenderTargets(1,&rtv,dsv)`, 35 `OMSetDepthStencilState(state,1)`,
 /// 42 `RSSetState`, 43 `RSSetViewports(1,&vp)`; console 52 (offset +0x580) is
 /// `ClearDepthStencilView(dsv,3,..)` = desktop 53, so the shift is a constant one from 32 on.
-const EMBED_EXTRA: [(usize, usize); 11] =
-    [(8, 8), (19, 19), (10, 10), (12, 12), (16, 16), (18, 18), (32, 33), (35, 36), (42, 43), (43, 44), (52, 53)];
+const EMBED_EXTRA: [(usize, usize); 12] =
+    [(8, 8), (19, 19), (23, 23), (10, 10), (12, 12), (16, 16), (18, 18), (32, 33), (35, 36), (42, 43), (43, 44), (52, 53)];
 
 /// `(embedded index, entry)` pairs that forward to the real context. Built once.
 fn forwarded_entries() -> &'static Vec<(usize, usize)> {
@@ -207,6 +207,7 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
                 continue;
             }
             let probe = match console_slot {
+                23 => Some(ctx_probe::<23, 0> as usize),
                 _ => None::<usize>,
             };
             if let Some(p) = probe {
@@ -961,9 +962,8 @@ fn qi_kind(obj: *mut c_void) -> &'static str {
 /// (0 = do not forward).
 unsafe extern "system" fn ctx_probe<const IDX: usize, const DESK: usize>(this: *mut c_void, a2: usize, a3: usize, a4: usize) {
     static LOGS: AtomicU32 = AtomicU32::new(0);
-    let deref = |p: usize| if p > 0x10000 && p % 8 == 0 { unsafe { *(p as *const *mut c_void) } } else { ptr::null_mut() };
     if LOGS.fetch_add(1, Ordering::Relaxed) < 3 {
-        glog!("[gpu] probe console {IDX}: *a3 is {}, *a4 is {}", qi_kind(deref(a3)), qi_kind(deref(a4)));
+        glog!("[gpu] probe console {IDX}: a2={a2:#x} a3={a3:#x}: {} a4={a4:#x}: {}", safe_dump(a3 as u64, 32), safe_dump(a4 as u64, 16));
     }
     if DESK == 0 {
         return;
