@@ -455,3 +455,9 @@ The two objects console 23 receives are not shaders or layouts (no creator recor
 
 - A crash-time context dump shows `context field +0x50` (the command cursor) moving from 0 to `0x244ae2d0000` and `+0x58` to `0x244ae6d0000`: Sonic does write packets into the context's command buffer, which confirms the PM4 theory. `XB1_DUMP_CMD=<dir>` wrote nothing because `dump_all_contexts` only covers contexts in `CONTEXT_PROXIES` (the D3D11X path), not the contexts `wrap_created_device` wraps. Fix: register those contexts too, then run `tools/analyze-cmdbuf.py` on the dumps.
 - After a few frames `Present1` returns `0x887a0005` (`DXGI_ERROR_DEVICE_REMOVED`; the debug layer says `DXGI_ERROR_DEVICE_HUNG`) following a caught C++ exception inside `d3d11.dll`/`nvwgf2umx.dll`. After that nothing can draw, which is why the window stays white or black. Something we forward (the first suspect is the SRV or index buffer bound with no vertex shader, or `DrawIndexed` with an invalid state) hangs the GPU; bisect by disabling forwards one by one.
+
+### Correction: Sonic Mania writes no PM4 packets
+
+The two sections above that say the command buffer fills (and that shaders are therefore bound by PM4 writes) are wrong. The `context field +0x50` value in the crash dump is the cursor our own `new_proxy` sets, equal to the buffer start. A real dump (after fixing `dump_all_contexts` to measure from the current buffer end) reports `cursor 0x24b49040000 end 0x24b49440000 cmd_base 0x24b49040000 used 0`: **no packets are written**. So the `0x76b40` constant is not evidence of PM4, and how Sonic Mania binds its vertex shader, input layout and topology is still unknown (candidates: the inlined bind goes through memory the title writes directly, e.g. into the objects we returned from `CreateVertexShader`, or through a device-level extension slot).
+
+The device removal (`Present1` = `0x887a0005`) is still the immediate blocker and is unexplained.

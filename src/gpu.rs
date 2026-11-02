@@ -286,11 +286,15 @@ pub fn dump_all_contexts(dir: &std::path::Path, tag: &str) {
     for (i, p) in list.iter().enumerate() {
         let p = unsafe { &*(*p as *const Proxy) };
         let cursor = p.embedded[(CMD_CURSOR - EMBED_BASE) / 8];
-        let used = cursor.saturating_sub(p.cmd_base);
+        // The title swaps in new buffers through the grow function, so measure from the current end.
+        let end = p.embedded[(CMD_END - EMBED_BASE) / 8];
+        let start = end.saturating_sub(CMD_BUFFER_BYTES);
+        let used = cursor.saturating_sub(start);
+        glog!("[gpu] context {i}: cursor {cursor:#x} end {end:#x} cmd_base {:#x} used {used}", p.cmd_base);
         if used == 0 || used > CMD_BUFFER_BYTES {
             continue;
         }
-        let bytes = unsafe { std::slice::from_raw_parts(p.cmd_base as *const u8, used) };
+        let bytes = unsafe { std::slice::from_raw_parts(start as *const u8, used) };
         let _ = std::fs::write(dir.join(format!("ctx{i}_{tag}.bin")), bytes);
         glog!("[gpu] context {i}: {used} bytes of commands dumped ({tag})");
     }
