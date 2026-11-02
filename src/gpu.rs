@@ -884,6 +884,10 @@ unsafe extern "system" fn device_create_extended<const SLOT: usize>(this: *mut c
     let f: unsafe extern "system" fn(*mut c_void, usize, usize, usize, usize, usize) -> HRESULT =
         unsafe { std::mem::transmute(*((*(p.real as *const *const usize)).add(SLOT))) };
     let hr = unsafe { f(p.real, a1, a2, a3, a4, a5) };
+    static SHADER_LOGS: AtomicU32 = AtomicU32::new(0);
+    if (12..=17).contains(&SLOT) && SHADER_LOGS.fetch_add(1, Ordering::Relaxed) < 12 {
+        glog!("[gpu] device slot {SLOT} create shader/layout: hr={:#x} bytecode={}", hr.0 as u32, safe_dump(a1 as u64, 16));
+    }
     if hr.0 >= 0 {
         if let Some((_, out_index, real_slots)) = EXTENDED_CREATORS.iter().find(|(s, _, _)| *s == SLOT) {
             let args = [a1, a2, a3, a4, a5];

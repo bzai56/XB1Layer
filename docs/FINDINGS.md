@@ -405,3 +405,7 @@ With `XB1_D3D_DEBUG=1`: forwarding console 8 as `PSSetShader` gives "First param
 - Console 19 (`+0x478`) is called as `(NULL, ptr, 0)` from `title+0x214b47`, every frame. Not `IASetIndexBuffer`.
 - Consequence to verify: if the shaders handed to `CreateVertexShader`/`CreatePixelShader` are GCN binaries rather than DXBC, the desktop cannot run them and a GCN-to-DXBC translator (or recognising the title's small fixed shader set) is needed for any picture. Check the bytecode header of the first `CreatePixelShader` call (DXBC starts with `DXBC`).
 - Indices 8 and 19 now log instead of forwarding.
+
+### Sonic Mania: the shaders are plain DXBC
+
+The first bytes of every `CreateVertexShader`/`CreatePixelShader` bytecode are `DXBC`, and the desktop device creates them (`hr=0`). No GCN translator is needed for this title; the problem is only how the console binds them. Experiment: treating console 8 as `PSSetShader(*(a2))` made the debug layer accept a shader but report garbage class-instance counts, and the following draws had no vertex shader bound and primitive topology 0, then the title crashed (read of 0, execute of 0). So the shader/topology binding calls (console 8, 11 with real arguments, the topology call near 23 to 25) take arguments shaped differently from the desktop ones. The next step is to log the raw arguments of every index from 0 to 63 during the first frame (not only the unmapped ones) and decode them against the title's disassembly around `title+0x214b47` and `title+0x214cbd`.
