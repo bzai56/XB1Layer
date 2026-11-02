@@ -1033,7 +1033,10 @@ unsafe extern "system" fn ctx_ia_vb(this: *mut c_void, start: u32, count: u32, b
 
 /// Console index 12: `DrawIndexed(count, start)`. The console method has no base-vertex argument, so
 /// `r9` still holds whatever the title left there (`0x76b40`); pass 0.
-unsafe extern "system" fn ctx_draw_indexed(this: *mut c_void, count: u32, start: u32) {
+unsafe extern "system" fn ctx_draw_indexed(this: *mut c_void, packed: u64) {
+    // The console packs both numbers into one register: index count in the high half, first index
+    // in the low half (`0x600000000` = 6 indices from 0, `0x60000001e` = 6 indices from 30).
+    let (count, start) = ((packed >> 32) as u32, packed as u32);
     sync_before_draw(this);
     let real = unsafe { real_context(this) };
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, i32) =
@@ -1509,6 +1512,16 @@ unsafe extern "system" fn device_create_buffer(this: *mut c_void, desc: *const u
     if LOGS.fetch_add(1, Ordering::Relaxed) < 40 && !desc.is_null() {
         let d = unsafe { std::slice::from_raw_parts(desc, 6) };
         glog!("[gpu] CreateBuffer desc {:x?} initial data {:p}", d, init);
+        if !init.is_null() && d[1] == 1 {
+            let mem = unsafe { *(init as *const *const f32) };
+            let n = (d[0] as usize / 4).min(100);
+            if !mem.is_null() && d[2] == 1 {
+                let f = unsafe { std::slice::from_raw_parts(mem, n) };
+                for (i, v) in f.chunks(5).take(16).enumerate() {
+                    glog!("[gpu]   vertex {i}: {v:?}");
+                }
+            }
+        }
     }
     unsafe { create_sanitized(this, 3, "CreateBuffer", desc, 6, 4, 0x10 | 0x20 | 0x40, init, out) }
 }
