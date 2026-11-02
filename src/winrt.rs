@@ -821,6 +821,13 @@ unsafe extern "system" fn generic_qi(this: *mut c_void, iid: *const GUID, out: *
             return HRESULT(0);
         }
     }
+    if o.class.starts_with("DownloadableContentPackageManager.Packages") && unsafe { (*iid).data1 } == 0x356E4A78 {
+        // The package list as `IIterable`: slot 6 is `First(IIterator** out)`.
+        let it = create_generic("DownloadableContentPackageManager.Packages (iterable)", unsafe { &*iid });
+        unsafe { (*(it as *mut GenericObj)).vtbl = iterable_vtbl() };
+        unsafe { *out = it };
+        return HRESULT(0);
+    }
     wlog_rare!("[winrt] {}::QueryInterface({:?}) -> self", o.class, unsafe { *iid });
     o.refs.fetch_add(1, Ordering::AcqRel);
     unsafe { *out = this };
@@ -1061,6 +1068,13 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
     if o.class == "Windows.Xbox.Services.XboxLiveConfiguration" && N >= 6 && (arg1 as usize) % 8 == 0 && is_writable(arg1) {
         unsafe { *(arg1 as *mut *mut c_void) = std::mem::transmute::<HSTRING, *mut c_void>(HSTRING::from("1d220100-a389-45d9-ab7a-fd1a3bc8d4d5")) };
         wlog!("[winrt] {} slot {N} -> placeholder HSTRING", o.class);
+        return HRESULT(0);
+    }
+    // The result of an Xbox Live asynchronous operation is a collection (title loop at 0x30ec99:
+    // slot 7 is `get_Size(uint*)`, slot 6 `GetAt`); there is no Xbox Live data, so it is empty.
+    if o.class.starts_with("Microsoft.Xbox.Services.XboxLiveContext#") && o.class.ends_with("#slot8") && N == 7 && (arg1 as usize) % 4 == 0 && is_writable(arg1) {
+        unsafe { *(arg1 as *mut u32) = 0 };
+        wlog!("[winrt] {} slot 7 (get_Size) -> 0", o.class);
         return HRESULT(0);
     }
     // `DownloadableContentPackageManager` slot 6 is `(filter, IVectorView** out)` (title call site
@@ -1540,6 +1554,55 @@ fn shared_user() -> *mut c_void {
     }
     unsafe { (*(u as *const GenericObj)).refs.fetch_add(1, Ordering::AcqRel) };
     u as *mut c_void
+}
+
+/// `IIterable<T>::First(IIterator<T>** out)` of an empty collection.
+unsafe extern "system" fn iterable_first(_this: *mut c_void, out: *mut *mut c_void) -> HRESULT {
+    let it = create_generic("empty iterator", &GUID::from_u128(0));
+    unsafe { (*(it as *mut GenericObj)).vtbl = iterator_vtbl() };
+    unsafe { *out = it };
+    HRESULT(0)
+}
+
+/// `IIterator<T>::get_Current` (slot 6): nothing to return.
+unsafe extern "system" fn iterator_current(_this: *mut c_void, out: *mut *mut c_void) -> HRESULT {
+    unsafe { *out = std::ptr::null_mut() };
+    HRESULT(0x8000000Bu32 as i32)
+}
+
+/// `IIterator<T>::get_HasCurrent` (slot 7) and `MoveNext` (slot 8): both false.
+unsafe extern "system" fn iterator_false(_this: *mut c_void, out: *mut u8) -> HRESULT {
+    unsafe { *out = 0 };
+    HRESULT(0)
+}
+
+fn stand_in_vtbl(set: &[(usize, usize)]) -> [usize; GENERIC_SLOTS] {
+    let mut v = [0usize; GENERIC_SLOTS];
+    v[0] = generic_qi as usize;
+    v[1] = generic_add_ref as usize;
+    v[2] = generic_release as usize;
+    v[3] = com_get_iids as usize;
+    v[4] = generic_class_name as usize;
+    v[5] = com_get_trust_level as usize;
+    let slots = generic_slots!(
+        6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
+        35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
+    );
+    v[6..].copy_from_slice(&slots);
+    for &(i, f) in set {
+        v[i] = f;
+    }
+    v
+}
+
+fn iterable_vtbl() -> *const usize {
+    static VTBL: OnceLock<[usize; GENERIC_SLOTS]> = OnceLock::new();
+    VTBL.get_or_init(|| stand_in_vtbl(&[(6, iterable_first as usize)])).as_ptr()
+}
+
+fn iterator_vtbl() -> *const usize {
+    static VTBL: OnceLock<[usize; GENERIC_SLOTS]> = OnceLock::new();
+    VTBL.get_or_init(|| stand_in_vtbl(&[(6, iterator_current as usize), (7, iterator_false as usize), (8, iterator_false as usize)])).as_ptr()
 }
 
 fn create_vector_view(class: &str, iid: &GUID, size: u8) -> *mut c_void {

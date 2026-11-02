@@ -466,7 +466,7 @@ fn show(v: u64, out: &mut crate::RawBuf) {
 
 /// Names a real D3D11 object (by asking it which interface it supports) for the call trace. Only
 /// objects whose vtable lies inside `d3d11.dll` are asked; anything else is "-".
-fn d3d_object_name(v: u64) -> &'static str {
+pub fn d3d_object_name(v: u64) -> &'static str {
     use windows::core::Interface;
     unsafe extern "system" {
         fn GetModuleHandleA(name: *const i8) -> *mut u8;
@@ -981,6 +981,19 @@ unsafe extern "system" fn context_ext_212(this: *mut c_void, count: usize, a: *m
 
 static EXTENDED_OBJECT_VTABLES: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
 
+/// Older XDK: the console's state objects have one more slot before `GetDesc` (8), so the extended
+/// vtable's slot 8 is the desktop `GetDesc` (7).
+fn older_sdk_state_get_desc(obj: *mut c_void) {
+    if obj.is_null() {
+        return;
+    }
+    let ext = unsafe { *(obj as *const usize) } as *mut usize;
+    let orig = EXTENDED_OBJECT_VTABLES.lock().unwrap().iter().find(|(_, e)| *e == ext as usize).map(|(o, _)| *o);
+    if let Some(orig) = orig {
+        unsafe { *ext.add(8) = *(orig as *const usize).add(7) };
+    }
+}
+
 fn extend_object(obj: *mut c_void, real_slots: usize) {
     if obj.is_null() {
         return;
@@ -1212,6 +1225,9 @@ unsafe extern "system" fn device_create_extended<const SLOT: usize>(this: *mut c
             let out = args[out_index - 1] as *mut *mut c_void;
             if !out.is_null() && (out as usize) % 8 == 0 {
                 extend_object(unsafe { *out }, *real_slots);
+                if crate::VCCORLIB110.load(Ordering::Relaxed) && (20..=23).contains(&SLOT) {
+                    older_sdk_state_get_desc(unsafe { *out });
+                }
                 CREATED_KINDS.lock().unwrap().push((unsafe { *out } as usize, SLOT));
             }
         }
@@ -2503,4 +2519,9 @@ unsafe extern "system" fn ctx_state_old<const DESK: usize>(this: *mut c_void, st
     }
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, usize, usize) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(DESK))) };
     unsafe { f(real, state, a3, a4) };
+    // The title keeps calling methods on the state object (GetDesc), so it gets its extended vtable back.
+    if !state.is_null() {
+        extend_object(state, 8);
+        older_sdk_state_get_desc(state);
+    }
 }

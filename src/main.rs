@@ -608,7 +608,7 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                 let mut owner = RawBuf::new();
                 describe(first, &mut owner);
                 let shell_name = winrt::identify_vtable(first).unwrap_or("");
-                rlog!("  {name}={p:#x} -> [{first:#x}] {} {shell_name}", owner.as_str());
+                rlog!("  {name}={p:#x} -> [{first:#x}] {} {shell_name} {}", owner.as_str(), gpu::d3d_object_name(p as u64));
             }
         }
         if code == 0xC000_0005 {
