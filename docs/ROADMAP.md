@@ -7,7 +7,7 @@ The goal is a layer that runs many Xbox One titles on Windows x64 without graphi
 ## Next up (in order)
 
 1. **Play Sonic Mania through and hunt glitches.** Later zones, special stages, two-player split screen, DualSense over USB; compare every screen with the original (formats, blending, sampling).
-2. **Check the first Forza dump.** Once the main exe is available: `--imports`, `--run`, and check whether its shaders are DXBC or GCN microcode, which decides the size of the graphics job. FH4 probably needs D3D12.X (unverified); FH3 is the closest to what the layer already handled.
+2. **Get the full Forza Horizon 3 past its zip-mount crash** (NULL read at title+`0x1b04f7f`, see FINDINGS), then check whether its shaders are DXBC or GCN microcode, which decides the size of the graphics job. FH4 probably needs D3D12.X (unverified).
 3. **Memory.** The demo asked for an 8.8 GB allocation and hit the commit limit; expect the same from a full game.
 4. **Decode GPU command packets** (AMD PM4) into desktop D3D11 calls if the title uses them (Sonic Mania does not; Forza does).
 5. **Textures.** Decode the console tile modes and de-tile placed textures.

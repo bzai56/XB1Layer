@@ -527,3 +527,15 @@ The winmm entry for the user's Bluetooth DualSense never changed (centred axes, 
 ### Test report (user, 2026-11-02)
 
 Sonic Mania plays from the title screen through gameplay with the DualSense over Bluetooth (confirmed working) and the keyboard, with no input lag, no crashes and no visible graphical glitches. The DualSense over USB uses the same reader (report `0x01`, 64 bytes) but has not been tested. Only the early part of the game has been played, so later zones, special stages and the 2-player split screen are untested.
+
+## Full Forza Horizon 3 (Opus 1.0.125.0) first run
+
+The full game's `forza_durango_release_final.exe` (85 MB, 17 sections) loads at its preferred base: 726 imports resolve, 15 stay stubbed (EtwPlus 4, `xg_x` 7, `D3DMapEsramMemory`, `DXGIXGetFrameStatistics`, `GetConsoleType`, `SetWasapiThreadAffinityMask`). `DXGIXPresentArray` and `DXGIXSetVLineNotification` are now resolved, unlike in the kiosk demo.
+
+`--run` (with `XB1_FILES=1` to log file opens) gets through startup, mounts about 85 of the 1075 zips listed in `media\zipmanifest.xml` (the manifest paths use the console's `game:\` prefix, which the title translates to `.\media\...` itself), reads several physics and audio XML files, then crashes with a NULL read at title+`0x1b04f7f`:
+
+- The function at title+`0x1b04d40` loops over a name table (`Global`, `Startup`, `PreRace_321`, ...) and opens `game:\<name>.xml` through title+`0x1ea29d0`. The result object is NULL when the open fails, and the code then dereferences `[rsp+0x40]` (0) without a check.
+- No file API call is logged for that open, so the lookup fails inside the title's own zip layer, before any `CreateFile2`. `Global.xml` exists only inside zips (`stateflow.zip`, `renderscenarios.zip`), and neither zip had been opened when the crash happened.
+- `Windows.Xbox.Management.Deployment.PackageTransferManager` (`slot 6` plus an event subscription) is polled about 1500 times before the crash, interleaved with the file loads. It may be gating zip mounting (install-state polling); that is a guess, not verified.
+
+Open question: why the title mounts zips in a different order than the manifest and never reaches `stateflow.zip`. Next step: log the title's zip mount decisions (or read the object at `[rbp+0x18]` in that function) and check what the `PackageTransferManager` methods are expected to return.
