@@ -36,7 +36,7 @@ cargo run -- path\to\title.exe --imports  # also list every stubbed import, grou
 cargo run -- path\to\title.exe --run    # also run the entry point (Sonic Mania boots and runs; Forza Horizon 3 does not draw yet)
 ```
 
-Debug flags for `--run`: `--watch=N`, `--trace-api`, `--trace-heap`, `--iat`, `--ring=`, `--watch-sites=`. Environment: `XB1_D3D_DEBUG=1` (D3D11 debug layer), `XB1_NO_EXTEND=1`, `XB1_NO_MIRROR=1`. See [Architecture](docs/ARCHITECTURE.md#debugging-aids).
+Debug flags for `--run`: `--watch=N`, `--trace-api`, `--trace-heap`, `--iat`, `--ring=`, `--watch-sites=`. Environment: `XB1_D3D_DEBUG=1` (D3D11 debug layer), `XB1_LOG_ALL=1` (log every context call instead of forwarding), `XB1_NO_EXTEND=1`, `XB1_NO_MIRROR=1`. See [Architecture](docs/ARCHITECTURE.md#debugging-aids).
 
 Run a title from its own folder so relative paths resolve.
 

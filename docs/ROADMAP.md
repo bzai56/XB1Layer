@@ -1,20 +1,20 @@
 # Roadmap
 
-The goal is a layer that runs many Xbox One titles on Windows x64 without graphical glitches. Today nothing is drawn. Details of each item are in [FINDINGS.md](FINDINGS.md).
+The goal is a layer that runs many Xbox One titles on Windows x64 without graphical glitches. Today Sonic Mania boots and draws; nothing else does yet. Details of each item are in [FINDINGS.md](FINDINGS.md).
 
-**Focus: Sonic Mania.** It is far simpler than the Forza Horizon 3 kiosk demo (plain D3D11 device, about eleven context calls a frame, XAudio2), so it is the vehicle for the first real picture. The Forza items below are parked until Sonic Mania renders.
+**Focus: Sonic Mania.** It is far simpler than the Forza Horizon 3 kiosk demo (plain D3D11 device, about eleven context calls a frame, XAudio2), so it is the vehicle for the first real picture (done: it renders). The Forza items below are parked until Sonic Mania renders.
 
 ## Next up: Sonic Mania (in order)
 
 1. **Input for Sonic Mania.** The intro, logos and menus render; next make it playable: a gamepad (the `Windows.Xbox.Input.Controller` list is still empty) and keyboard mapped to console input.
-3. **Hunt glitches.** Compare with the expected output, fix formats, blending, sampling and de-tiling that look wrong.
-4. **Input.** Gamepad and keyboard so the game can be played.
+2. **Hunt glitches.** Compare with the expected output, fix formats, blending, sampling and de-tiling that look wrong.
+3. **Later screens.** Play through to gameplay and check textures, blending and the 16-bit screen format on every screen.
 
 ## Parked: Forza Horizon 3 kiosk demo
 
 1. **Get the title to render.** It boots into its main loop and stays there but never draws or presents. Find what its loading screens wait on (the `CPresentation` readiness flag, window events the shell never raises, the database gate in FINDINGS). Until it renders there are no draw packets to decode.
 2. **Remove the startup gaps.** The test title now stops on a different Xbox stand-in gap from run to run, before its first present. Each gap is a console WinRT method whose shape was guessed wrong; fix them from the call sites until the title reaches its first present.
-3. **Swap chain and window.** `DXGIXPresentArray` and `DXGIXSetVLineNotification` are logging stubs. Create a native window, a desktop swap chain, and present the title's display planes.
+3. **Swap chain and window for the D3D11X path.** `DXGIXPresentArray` and `DXGIXSetVLineNotification` are logging stubs; reuse the display module (done for plain `D3D11CreateDevice`) and present the title's display planes.
 4. **Decode the GPU command packets.** The stream is AMD PM4 (see FINDINGS). So far it contains only two repeating idle-loop packet kinds and no draws, because the title is stuck before rendering; decode draws, state, binding, clears and copies once it gets that far, and turn them into desktop D3D11 calls. This is the core of rendering.
 5. **Textures.** Decode the console tile modes and de-tile placed textures (placed buffers are already mirrored).
 6. **Identify the remaining context-table indices** (24 to 33, 64 and up). Only evidenced indices forward to the driver; forwarding guesses corrupted it.
