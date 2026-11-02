@@ -514,4 +514,4 @@ Entering a game made the title call the `Windows.Xbox.UI.SystemUI` statics slot 
 
 Test hook for scripted runs: `XB1_AUTOPRESS="30:4:1;34:16:1"` presses Menu for 1 s at t = 30 s and A for 1 s at t = 34 s (button bits as in the reading table above).
 
-Input note: the layer reads XInput slots 0 to 3 and logs `no XInput pad connected` when none answers. A controller that is not an XInput device (for example a DualShock/DualSense without Steam Input or DS4Windows, or a generic DirectInput pad) is not seen; the keyboard works.
+Input note: the layer reads XInput slots 0 to 3 first; if none answers it reads the legacy joystick API (winmm), which sees HID pads such as a DualSense or DualShock (USB or Bluetooth), assuming the usual Windows layout (Cross = A, Circle = B, Square = X, Triangle = Y, Options = Menu, Create = View, L1/R1, L3/R3, hat = d-pad, X/Y and Z/R = sticks, L2/R2 as buttons). The winmm path was written without a pad to compare against: report any wrong button or axis.

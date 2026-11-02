@@ -1223,6 +1223,7 @@ unsafe fn fill_gamepad_reading(out: *mut u8) {
         if m.is_null() { 0 } else { GetProcAddress(m, b"XInputGetState ".as_ptr()) as usize }
     });
     let mut pad = XInputState::default();
+    let mut found_xinput = false;
     if get_state != 0 {
         let f: unsafe extern "system" fn(u32, *mut XInputState) -> u32 = unsafe { std::mem::transmute(get_state) };
         // The first connected pad of the four XInput slots.
@@ -1239,11 +1240,71 @@ unsafe fn fill_gamepad_reading(out: *mut u8) {
                 break;
             }
         }
+        found_xinput = found;
         if !found {
             static LOGGED: AtomicBool = AtomicBool::new(false);
             if !LOGGED.swap(true, Ordering::Relaxed) {
                 wlog!("[winrt] no XInput pad connected (only XInput devices are read)");
             }
+        }
+    }
+    // No XInput pad: try the legacy joystick API (winmm), which sees DirectInput/HID pads such as a
+    // DualSense or DualShock over USB or Bluetooth. Layout assumed from the usual Windows mapping:
+    // buttons 0..13 = Square, Cross, Circle, Triangle, L1, R1, L2, R2, Create, Options, L3, R3, PS,
+    // touchpad; X/Y = left stick, Z/R = right stick, U/V = triggers, POV = d-pad.
+    let mut extra_buttons = 0u32;
+    let mut extra_axes: Option<[f32; 6]> = None;
+    if !found_xinput {
+        #[repr(C)]
+        #[derive(Default)]
+        struct JoyInfoEx {
+            size: u32,
+            flags: u32,
+            x: u32,
+            y: u32,
+            z: u32,
+            r: u32,
+            u: u32,
+            v: u32,
+            buttons: u32,
+            button_number: u32,
+            pov: u32,
+            reserved: [u32; 2],
+        }
+        #[link(name = "winmm")]
+        unsafe extern "system" {
+            fn joyGetPosEx(id: u32, info: *mut JoyInfoEx) -> u32;
+        }
+        for id in 0..4u32 {
+            let mut j = JoyInfoEx { size: std::mem::size_of::<JoyInfoEx>() as u32, flags: 0xFF, ..Default::default() };
+            if unsafe { joyGetPosEx(id, &mut j) } != 0 {
+                continue;
+            }
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                wlog!("[winrt] joystick {id} found through winmm (assumed DualSense/DualShock layout)");
+            }
+            let bmap = [(1u32, 16u32), (2, 32), (0, 64), (3, 128), (4, 4096), (5, 8192), (9, 4), (8, 8), (10, 16384), (11, 32768)];
+            for (b, bit) in bmap {
+                if j.buttons & (1 << b) != 0 {
+                    extra_buttons |= bit;
+                }
+            }
+            match j.pov {
+                0..=36000 => {
+                    let a = j.pov / 100;
+                    if a >= 315 || a <= 45 { extra_buttons |= 256; }
+                    if (45..=135).contains(&a) { extra_buttons |= 2048; }
+                    if (135..=225).contains(&a) { extra_buttons |= 512; }
+                    if (225..=315).contains(&a) { extra_buttons |= 1024; }
+                }
+                _ => {}
+            }
+            let ax = |v: u32| ((v as f32 - 32767.5) / 32767.5).clamp(-1.0, 1.0);
+            let lt = if j.buttons & (1 << 6) != 0 { 1.0 } else { 0.0 };
+            let rt = if j.buttons & (1 << 7) != 0 { 1.0 } else { 0.0 };
+            extra_axes = Some([lt, rt, ax(j.x), -ax(j.y), ax(j.z), -ax(j.r)]);
+            break;
         }
     }
     // XInput button bit -> GamepadButtons bit (Menu 4, View 8, A 16, B 32, X 64, Y 128, DPad up 256,
@@ -1255,6 +1316,7 @@ unsafe fn fill_gamepad_reading(out: *mut u8) {
             buttons |= bit;
         }
     }
+    buttons |= extra_buttons;
     let mut pid = 0u32;
     unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut pid) };
     if pid == unsafe { GetCurrentProcessId() } {
@@ -1277,7 +1339,7 @@ unsafe fn fill_gamepad_reading(out: *mut u8) {
         }
     }
     let axis = |v: i16| (v as f32 / 32768.0).clamp(-1.0, 1.0);
-    let r: [f32; 6] = [pad.lt as f32 / 255.0, pad.rt as f32 / 255.0, axis(pad.lx), axis(pad.ly), axis(pad.rx), axis(pad.ry)];
+    let r: [f32; 6] = extra_axes.unwrap_or([pad.lt as f32 / 255.0, pad.rt as f32 / 255.0, axis(pad.lx), axis(pad.ly), axis(pad.rx), axis(pad.ry)]);
     unsafe {
         ptr::write_unaligned(out as *mut u64, STAMP.fetch_add(16_667, Ordering::Relaxed));
         ptr::write_unaligned(out.add(8) as *mut u32, buttons);
