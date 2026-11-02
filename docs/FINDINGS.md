@@ -387,3 +387,10 @@ So the mapping has to be built per index from the arguments of real calls, and S
 8. Work out the real shape of the `PackageTransferManager` interfaces and the `42A6A529` / `9FF3799E` `CoreApplication` extensions.
 9. Provide a `G:` equivalent and inspect `media/` (encrypted content is out of scope).
 10. Back the window with a native `HWND` and raise `CoreWindow` events.
+
+## Sonic Mania: first output (explicit context table)
+
+- The embedded context table is a constant one slot behind the desktop table from console index 32 on. `+0x580` is console 52 = `ClearDepthStencilView(dsv, 3, ...)` (desktop 53), not 53, so no extra method sits between 49 and 53; the missing method is somewhere between console 24 and 31.
+- With the explicit table (`EMBED_EXTRA` in `src/gpu.rs`: 8→9, 10, 12, 16, 18, 19, 32→33, 35→36, 42→43, 43→44, 52→53) every context function Sonic calls now forwards to the desktop context.
+- Result: the window is no longer black in most runs but shows a solid white frame (one run stayed black). Not yet known whether the white is a real game screen or a bad shader/texture binding (no shader resource view is bound: console index 8 is `PSSetShader`, so how textures are bound is still unidentified).
+- Screen capture of the flip-model window needs it in the foreground; `PrintWindow` returns black.
