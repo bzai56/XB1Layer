@@ -547,3 +547,9 @@ Open question: why the title mounts zips in a different order than the manifest 
 - **It is not a timing race:** `XB1_STALL_MS=20000` (new: holds the thread 20 s at a `--watch-sites` hit) opened no further zips and the crash is identical. So manifest-listed zips are not mounted eagerly and an on-demand mount for `RenderScenarios\...` does not happen.
 - Also ruled out: the `PackageTransferManager` calls (about 1500) are just the title fetching the manager object (title+`0x1c357b0`, vtable slot 6 = static getter) and registering an event handler, not an install-state wait.
 - Next: find the title's zip-lookup routine (called from title+`0x1ea29d0`) and see why the manifest entry for `renderscenarios.zip` is not matched; the manifest parser is title+`0x18dd6d0`.
+
+### Full Forza Horizon 3: what else was ruled out
+
+- The pool of five worker threads (title+`0x1a3f0c0`, created suspended by title+`0x1a35000`, resumed through a tail-called `ResumeThread`) does start; a `[thread] title thread started` line now logs each start. So the missing zip mounts are not caused by workers that never run.
+- `XB1_FILES=1` now also logs `GetFileAttributesW`, `GetFileAttributesExW` and `FindFirstFileW`. The title makes no such call for `renderscenarios.zip` (or for any root-level zip such as `stateflow.zip`); it only enumerates `UI\`, `UI\Textures\`, `Drivers\` and `Stripped\` for `*.zip`. Reads on zips are overlapped (`ERROR_IO_PENDING`), completed through thread-pool I/O.
+- Still unexplained: the code path that is meant to mount the root-level zips listed in `zipmanifest.xml`. The lookup (title+`0x1e9ed30`, `0x1ea9090`, both behind a global file manager and a critical section) finds nothing for the `RenderScenarios` folder, so the next step is to find where that path is matched against the manifest entries.

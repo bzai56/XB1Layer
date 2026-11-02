@@ -30,6 +30,9 @@ unsafe extern "system" {
     fn CreateFile2(name: *const u16, access: u32, share: u32, disp: u32, params: *mut c_void) -> *mut c_void;
     fn FindFirstFileExA(name: *const i8, level: u32, data: *mut c_void, op: u32, filter: *mut c_void, flags: u32) -> *mut c_void;
     fn GetFileAttributesExA(name: *const i8, level: u32, data: *mut c_void) -> i32;
+    fn GetFileAttributesW(name: *const u16) -> u32;
+    fn GetFileAttributesExW(name: *const u16, level: u32, data: *mut c_void) -> i32;
+    fn FindFirstFileW(name: *const u16, data: *mut c_void) -> *mut c_void;
     fn ReadFile(h: *mut c_void, buf: *mut c_void, n: u32, read: *mut u32, ov: *mut c_void) -> i32;
     fn GetFileInformationByHandleEx(h: *mut c_void, class: u32, buf: *mut c_void, size: u32) -> i32;
     fn GetLastError() -> u32;
@@ -808,6 +811,7 @@ extern "system" fn thread_trampoline(p: *mut c_void) -> u32 {
         rlog!("[thread] trampoline started with routine {routine:#x}, param {param:#x}, box {p:p}");
     }
     ensure_tls_on_current_thread();
+    rlog!("[thread] title thread started: routine title+{:#x} param {param:#x}", routine.wrapping_sub(IMG_BASE.load(Ordering::Relaxed)));
     let hw = HWBP_ADDR.load(Ordering::Relaxed);
     if hw != 0 {
         unsafe { arm_hwbp_on(GetCurrentThread(), hw) };
@@ -1760,6 +1764,9 @@ fn override_for(dll: &str, func: &str) -> Option<usize> {
         "FindFirstFileExA" if RING.load(Ordering::Relaxed) != 0 || std::env::var_os("XB1_FILES").is_some() => Some(xb_find_first_file_ex_a as usize),
         "GetFileAttributesExA" if RING.load(Ordering::Relaxed) != 0 || std::env::var_os("XB1_FILES").is_some() => Some(xb_get_file_attributes_ex_a as usize),
         "CreateFileW" if RING.load(Ordering::Relaxed) != 0 || std::env::var_os("XB1_FILES").is_some() => Some(xb_create_file_w as usize),
+        "GetFileAttributesW" if RING.load(Ordering::Relaxed) != 0 || std::env::var_os("XB1_FILES").is_some() => Some(xb_get_file_attributes_w as usize),
+        "GetFileAttributesExW" if RING.load(Ordering::Relaxed) != 0 || std::env::var_os("XB1_FILES").is_some() => Some(xb_get_file_attributes_ex_w as usize),
+        "FindFirstFileW" if RING.load(Ordering::Relaxed) != 0 || std::env::var_os("XB1_FILES").is_some() => Some(xb_find_first_file_w as usize),
         "ReadFile" if RING.load(Ordering::Relaxed) != 0 || std::env::var_os("XB1_FILES").is_some() => Some(xb_read_file as usize),
         "GetFileInformationByHandleEx" if RING.load(Ordering::Relaxed) != 0 || std::env::var_os("XB1_FILES").is_some() => Some(xb_get_file_info as usize),
         _ => None,
@@ -2708,3 +2715,25 @@ fn main() {
     }
 }
 
+
+
+extern "system" fn xb_get_file_attributes_w(name: *const u16) -> u32 {
+    let r = unsafe { GetFileAttributesW(name) };
+    let err = if r == u32::MAX { unsafe { GetLastError() } } else { 0 };
+    ring_write(format_args!("  GetFileAttributesW({:?}) -> {r:#x} err={err}\n", wide_to_string(name)));
+    r
+}
+
+extern "system" fn xb_get_file_attributes_ex_w(name: *const u16, level: u32, data: *mut c_void) -> i32 {
+    let ok = unsafe { GetFileAttributesExW(name, level, data) };
+    let err = if ok == 0 { unsafe { GetLastError() } } else { 0 };
+    ring_write(format_args!("  GetFileAttributesExW({:?}) -> ok={ok} err={err}\n", wide_to_string(name)));
+    ok
+}
+
+extern "system" fn xb_find_first_file_w(name: *const u16, data: *mut c_void) -> *mut c_void {
+    let h = unsafe { FindFirstFileW(name, data) };
+    let err = if h as isize == -1 { unsafe { GetLastError() } } else { 0 };
+    ring_write(format_args!("  FindFirstFileW({:?}) -> {h:p} err={err}\n", wide_to_string(name)));
+    h
+}
