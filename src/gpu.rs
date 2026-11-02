@@ -183,6 +183,9 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
                     let thunk = forward_context_thunk(unsafe { thunks.add((128 + console_slot) * 32) }, desktop_slot);
                     v.push((index_of(EMBED_TABLE + console_slot * 8), thunk));
                 }
+                v.push((index_of(EMBED_TABLE + 13 * 8), ctx_map_old as usize));
+                v.push((index_of(EMBED_TABLE + 31 * 8), ctx_om_set_render_targets_old as usize));
+                v.push((index_of(EMBED_TABLE + 87 * 8), ctx_om_get_render_targets_old as usize));
             }
             return v;
         }
@@ -1889,6 +1892,10 @@ fn build_vtable(kind: Kind) -> Vec<usize> {
         let mut arena = ArgArena::new();
         v[41] = arena.make("[gpu] device slot 41 (SetExceptionMode on the desktop)".to_string(), ret_zero as usize as u64);
         v[42] = arena.make("[gpu] device slot 42 (GetExceptionMode on the desktop)".to_string(), ret_zero as usize as u64);
+        if crate::VCCORLIB110.load(Ordering::Relaxed) {
+            // Older XDK: the title calls slot 41 as GetImmediateContext(&out) (the result becomes its context).
+            v[41] = device_get_immediate_context as usize;
+        }
         std::mem::forget(arena);
         // Buffers and textures also need their console-only MiscFlags bits removed.
         v[3] = device_create_buffer as usize;
@@ -2087,14 +2094,17 @@ pub fn wrap_dxgi(real: *mut c_void, kind: u8) -> *mut c_void {
     let vtbl: &'static mut [usize; SLOTS] = Box::leak(Box::new([0usize; SLOTS]));
     for (s, entry) in vtbl.iter_mut().enumerate() {
         let desktop = match kind {
-            3 if s >= 9 => s - 2,
+            3 if s >= 12 => s - 2,
+            3 if (8..=10).contains(&s) => s - 1,
             3 => s,
+            4 if s >= 8 => s - 1,
+            4 => s,
             _ if s >= 7 => s - 1,
             _ => s,
         };
         *entry = forward_thunk(unsafe { thunks.add(s * 32) }, desktop);
     }
-    if kind != 3 {
+    if kind < 3 {
         vtbl[7] = dxgi_get_parent_wrapped as usize;
     }
     if kind == 1 {
@@ -2103,7 +2113,11 @@ pub fn wrap_dxgi(real: *mut c_void, kind: u8) -> *mut c_void {
     if kind == 2 {
         vtbl[10] = dxgi_get_buffer_wrapped as usize;
     }
-    let obj: &'static mut [usize; 2] = Box::leak(Box::new([vtbl.as_ptr() as usize, real as usize]));
+    vtbl[0] = wrapped_qi as usize;
+    if kind == 4 {
+        vtbl[8] = view_get_resource_wrapped as usize;
+    }
+    let obj: &'static mut [usize; 3] = Box::leak(Box::new([vtbl.as_ptr() as usize, real as usize, kind as usize]));
     WRAPPERS.lock().unwrap().push((obj.as_ptr() as usize, real as usize));
     glog!("[gpu] object {real:p} wrapped as kind {kind} (0 DXGI, 1 DXGI device, 2 swap chain, 3 resource)");
     obj.as_mut_ptr() as *mut c_void
@@ -2119,5 +2133,95 @@ pub fn unwrap_object(p: *mut c_void) -> *mut c_void {
 
 /// `(console index, desktop slot)` pairs seen in Minecraft Xbox One Edition (older XDK), from logged
 /// calls: 31 is called as (1, &rtv, dsv) = `OMSetRenderTargets` (desktop 33); 42 as (1, &viewport) =
-/// `RSSetViewports` (desktop 44).
-const OLD_SDK_EXTRA: [(usize, usize); 2] = [(31, 33), (42, 44)];
+/// `RSSetViewports` (desktop 44); 13 is `Map` (see `ctx_map_old`, desktop 14) and 14 `Unmap(res, 0)` (desktop 15).
+const OLD_SDK_EXTRA: [(usize, usize); 2] = [(42, 44), (14, 15)];
+
+/// Older-XDK embedded index 13 (+0x448): `Map(resource, subresource, map type, flags, void** data)`. The
+/// console returns the data pointer itself; the desktop fills a `D3D11_MAPPED_SUBRESOURCE`
+/// (`[pData, RowPitch, DepthPitch]`). Evidence: called as `(res, 0, 4, 0, &p)` then `*p` is written
+/// and index 14 (+0x450, `Unmap(res, 0)`, desktop 15) follows.
+unsafe extern "system" fn ctx_map_old(this: *mut c_void, res: *mut c_void, sub: u32, map_type: u32, flags: u32, out: *mut *mut c_void) -> HRESULT {
+    let real = unsafe { real_context(this) };
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut [usize; 2]) -> HRESULT =
+        unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(14))) };
+    let mut mapped = [0usize; 2];
+    let hr = unsafe { f(real, unwrap_object(res), sub, map_type, flags, &mut mapped) };
+    if !out.is_null() {
+        unsafe { *out = if hr.0 >= 0 { mapped[0] as *mut c_void } else { ptr::null_mut() } };
+    }
+    static LOGS: AtomicU32 = AtomicU32::new(0);
+    if hr.0 < 0 && LOGS.fetch_add(1, Ordering::Relaxed) < 6 {
+        glog!("[gpu] Map({res:p}, {sub}, {map_type}, {flags:#x}) FAILED hr={:#x}", hr.0 as u32);
+    }
+    hr
+}
+
+/// Older-XDK embedded index 87 (+0x698): `OMGetRenderTargets(n, &rtv, &dsv)` (desktop 89). The views
+/// it returns are wrapped, because this SDK's view interfaces are one slot longer (`GetResource` is
+/// called through slot 8).
+unsafe extern "system" fn ctx_om_get_render_targets_old(this: *mut c_void, n: u32, rtvs: *mut *mut c_void, dsv: *mut *mut c_void) {
+    let real = unsafe { real_context(this) };
+    let f: unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void, *mut *mut c_void) =
+        unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(89))) };
+    unsafe { f(real, n, rtvs, dsv) };
+    if !rtvs.is_null() {
+        for i in 0..n as usize {
+            let slot = unsafe { rtvs.add(i) };
+            if !unsafe { *slot }.is_null() {
+                unsafe { *slot = wrap_dxgi(*slot, 4) };
+            }
+        }
+    }
+    if !dsv.is_null() && !unsafe { *dsv }.is_null() {
+        unsafe { *dsv = wrap_dxgi(*dsv, 4) };
+    }
+}
+
+/// Older-XDK embedded index 31 (+0x4D8): `OMSetRenderTargets(n, &rtv, dsv)` (desktop 33), with wrapped
+/// views (from `ctx_om_get_render_targets_old`) turned back into the real ones.
+unsafe extern "system" fn ctx_om_set_render_targets_old(this: *mut c_void, n: u32, rtvs: *const *mut c_void, dsv: *mut c_void) {
+    let real = unsafe { real_context(this) };
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void, *mut c_void) =
+        unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(33))) };
+    let mut views = [ptr::null_mut::<c_void>(); 8];
+    let count = (n as usize).min(8);
+    if !rtvs.is_null() {
+        for (i, v) in views.iter_mut().enumerate().take(count) {
+            *v = unwrap_object(unsafe { *rtvs.add(i) });
+        }
+    }
+    unsafe { f(real, n, if rtvs.is_null() { ptr::null() } else { views.as_ptr() }, unwrap_object(dsv)) };
+}
+
+fn kind_of(wrapper: *mut c_void) -> u8 {
+    unsafe { *((wrapper as *const usize).add(2)) as u8 }
+}
+
+/// `QueryInterface` on a wrapper: the answer is wrapped the same way, because the title uses the
+/// result with the same (older) vtable layout.
+unsafe extern "system" fn wrapped_qi(this: *mut c_void, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    let real = real_of(this);
+    let f: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT = unsafe { std::mem::transmute(*(*(real as *const *const usize))) };
+    let hr = unsafe { f(real, iid, out) };
+    if hr.0 == 0 {
+        let answer = unsafe { *out };
+        if answer == real {
+            // The same object: hand out the wrapper itself (one more reference was taken on the real one).
+            unsafe { *out = this };
+        } else {
+            unsafe { *out = wrap_dxgi(answer, kind_of(this)) };
+        }
+    }
+    hr
+}
+
+/// `ID3D11View::GetResource` as the older SDK calls it (console slot 8, desktop 7); the resource is
+/// wrapped as a resource.
+unsafe extern "system" fn view_get_resource_wrapped(this: *mut c_void, out: *mut *mut c_void) {
+    let real = real_of(this);
+    let f: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(7))) };
+    unsafe { f(real, out) };
+    if !out.is_null() && !unsafe { *out }.is_null() {
+        unsafe { *out = wrap_dxgi(*out, 3) };
+    }
+}

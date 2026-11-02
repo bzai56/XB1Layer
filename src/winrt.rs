@@ -1044,7 +1044,7 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
     // Slot 8 on the gamepad interface is `GetCurrentReading(GamepadReading* out)`: a 36-byte struct
     // (timestamp u64, buttons u32, left and right trigger f32, left and right stick x/y f32), decoded
     // from the title's poll at title+0x254e30 (it zeroes the struct, calls slot 8, then reads it).
-    if o.class.starts_with("Windows.Xbox.Input.Controller.Controllers (element") && !o.class.contains('#') && N == 8 && is_writable(arg1) {
+    if o.class.starts_with("Windows.Xbox.Input.Controller.Controllers (element") && !o.class.contains('#') && N == 8 && is_writable(arg1) && !crate::VCCORLIB110.load(Ordering::Relaxed) {
         unsafe { fill_gamepad_reading(arg1 as *mut u8) };
         return HRESULT(0);
     }
@@ -1173,6 +1173,7 @@ fn vector_view_vtbl() -> *const usize {
         v[6] = vector_view_get_at as usize;
         v[7] = vector_view_get_size as usize;
         v[8] = vector_view_index_of as usize;
+        v[9] = vector_view_get_many as usize;
         v
     })
     .as_ptr()
@@ -1581,3 +1582,26 @@ pub fn try_activation_factory(class: &str, iid: &GUID, out: *mut *mut c_void) ->
     Some(hr)
 }
 
+
+/// `IVectorView<T>::GetMany(uint start, uint capacity, T* items, uint* actual)`: GetAt for each
+/// index from `start` on (the older Minecraft build reads its controller list this way).
+unsafe extern "system" fn vector_view_get_many(this: *mut c_void, start: u32, capacity: u32, items: *mut *mut c_void, actual: *mut u32) -> HRESULT {
+    let o = unsafe { &*(this as *const GenericObj) };
+    let size = o.kind as u32;
+    let mut written = 0u32;
+    if !items.is_null() {
+        let mut i = start;
+        while i < size && written < capacity {
+            if unsafe { vector_view_get_at(this, i, items.add(written as usize)) }.0 != 0 {
+                break;
+            }
+            written += 1;
+            i += 1;
+        }
+    }
+    if !actual.is_null() {
+        unsafe { *actual = written };
+    }
+    wlog!("[winrt] {}: GetMany({start}, {capacity}) -> {written} element(s)", o.class);
+    HRESULT(0)
+}
