@@ -184,9 +184,15 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
                     v.push((index_of(EMBED_TABLE + console_slot * 8), thunk));
                 }
                 v.push((index_of(EMBED_TABLE + 13 * 8), ctx_map_old as usize));
-                v.push((index_of(EMBED_TABLE + 10 * 8), ctx_draw_indexed as usize));
+                v.push((index_of(EMBED_TABLE + 11 * 8), ctx_draw_indexed as usize));
                 v.push((index_of(EMBED_TABLE + 18 * 8), ctx_bind_object as usize));
-                v.push((index_of(EMBED_TABLE + 11 * 8), ctx_draw_old as usize));
+                v.push((index_of(EMBED_TABLE + 42 * 8), ctx_viewports as usize));
+                v.push((index_of(EMBED_TABLE + 33 * 8), ctx_state_old::<35> as usize));
+                v.push((index_of(EMBED_TABLE + 34 * 8), ctx_state_old::<36> as usize));
+                v.push((index_of(EMBED_TABLE + 41 * 8), ctx_state_old::<43> as usize));
+                v.push((index_of(EMBED_TABLE + 51 * 8), ctx_clear_dsv_old as usize));
+                v.push((index_of(EMBED_TABLE + 43 * 8), ctx_scissor_old as usize));
+                v.push((index_of(EMBED_TABLE + 12 * 8), ctx_draw_old as usize));
                 v.push((index_of(EMBED_TABLE + 31 * 8), ctx_om_set_render_targets_old as usize));
                 v.push((index_of(EMBED_TABLE + 87 * 8), ctx_om_get_render_targets_old as usize));
             }
@@ -1118,6 +1124,9 @@ unsafe extern "system" fn ctx_draw_indexed(this: *mut c_void, packed: u64) {
     // The console packs both numbers into one register: index count in the high half, first index
     // in the low half (`0x600000000` = 6 indices from 0, `0x60000001e` = 6 indices from 30).
     let (count, start) = ((packed >> 32) as u32, packed as u32);
+    LAST_DRAW[0].store(1, Ordering::Relaxed);
+    LAST_DRAW[1].store(count, Ordering::Relaxed);
+    LAST_DRAW[2].store(start, Ordering::Relaxed);
     sync_before_draw(this);
     let real = unsafe { real_context(this) };
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, i32) =
@@ -1365,7 +1374,11 @@ fn apply_inlined_state(this: *mut c_void, real: *mut c_void) {
     }
 }
 
+pub static DRAWS_SINCE_PRESENT: AtomicU32 = AtomicU32::new(0);
+/// The arguments of the most recent draw (1 indexed or 0 plain, count, start), for the frame log.
+static LAST_DRAW: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
 extern "system" fn sync_before_draw(this: *mut c_void) {
+    DRAWS_SINCE_PRESENT.fetch_add(1, Ordering::Relaxed);
     let real = unsafe { (*(this as *const Proxy)).real };
     apply_inlined_state(this, real);
     if env_flag("XB1_NO_MIRROR") {
@@ -2175,6 +2188,10 @@ unsafe extern "system" fn dxgi_get_buffer_wrapped(this: *mut c_void, index: u32,
     let f: unsafe extern "system" fn(*mut c_void, u32, *const GUID, *mut *mut c_void) -> HRESULT = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(9))) };
     let hr = unsafe { f(real, index, iid, out) };
     if hr.0 == 0 {
+        glog!("[gpu] swap chain buffer {index} is the real resource {:p}", unsafe { *out });
+        if index == 0 {
+            BACKBUFFER.store(unsafe { *out } as usize, Ordering::Relaxed);
+        }
         unsafe { *out = wrap_dxgi(*out, 3) };
     }
     hr
@@ -2235,8 +2252,8 @@ pub fn unwrap_object(p: *mut c_void) -> *mut c_void {
 /// `RSSetViewports` (desktop 44); 33 `OMSetBlendState(state, factor, mask)` (35), 34 `OMSetDepthStencilState(state, ref)` (36),
 /// 41 `RSSetState` (43), 43 `RSSetScissorRects` (45), 46 `UpdateSubresource` with the subresource counting 0 to 4 (48),
 /// 51 `ClearDepthStencilView(dsv, 3, ..)` (53), all two behind the desktop; 17 `IASetVertexBuffers` (18), 6 and 15 the VS and PS `SetConstantBuffers` (7, 16), 19 and 20 the PS `SetShaderResources`/`SetSamplers` (8, 10) and 7 the VS resources (25; a guess), 18 the Sonic-shaped `IASetIndexBuffer(format, buffer, offset)`, 10 a packed `DrawIndexed`, 11 `Draw`; 13 is `Map` (see `ctx_map_old`, desktop 14) and 14 `Unmap(res, 0)` (desktop 15).
-const OLD_SDK_EXTRA: [(usize, usize); 14] =
-    [(42, 44), (14, 15), (33, 35), (34, 36), (41, 43), (43, 45), (46, 48), (51, 53), (17, 18), (6, 7), (15, 16), (19, 8), (20, 10), (7, 25)];
+const OLD_SDK_EXTRA: [(usize, usize); 9] =
+    [(14, 15), (46, 48), (17, 18), (6, 7), (15, 16), (7, 8), (9, 10), (23, 25), (24, 26)];
 
 /// Older-XDK embedded index 13 (+0x448): `Map(resource, subresource, map type, flags, void** data)`. The
 /// console returns the data pointer itself; the desktop fills a `D3D11_MAPPED_SUBRESOURCE`
@@ -2287,6 +2304,21 @@ unsafe extern "system" fn ctx_om_set_render_targets_old(this: *mut c_void, n: u3
         unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(33))) };
     let mut views = [ptr::null_mut::<c_void>(); 8];
     let count = (n as usize).min(8);
+    static OMLOGS: AtomicU32 = AtomicU32::new(0);
+    if OMLOGS.fetch_add(1, Ordering::Relaxed) < 12 {
+        let first = if rtvs.is_null() { ptr::null_mut() } else { unsafe { *rtvs } };
+        let real_view = unwrap_object(first);
+        let mut res: *mut c_void = ptr::null_mut();
+        if !real_view.is_null() {
+            let get: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = unsafe { std::mem::transmute(*((*(real_view as *const *const usize)).add(7))) };
+            unsafe { get(real_view, &mut res) };
+            if !res.is_null() {
+                let rel: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { std::mem::transmute(*((*(res as *const *const usize)).add(2))) };
+                unsafe { rel(res) };
+            }
+        }
+        glog!("[gpu] OMSetRenderTargets({n}, rtv {first:p}, its resource {res:p}, dsv {dsv:p}) draws since last present {}", DRAWS_SINCE_PRESENT.load(Ordering::Relaxed));
+    }
     if !rtvs.is_null() {
         for (i, v) in views.iter_mut().enumerate().take(count) {
             *v = unwrap_object(unsafe { *rtvs.add(i) });
@@ -2331,6 +2363,13 @@ unsafe extern "system" fn view_get_resource_wrapped(this: *mut c_void, out: *mut
 /// `IDXGISwapChain::Present(sync, flags)` as the older SDK calls it (console slot 9, desktop 8).
 unsafe extern "system" fn dxgi_present_wrapped(this: *mut c_void, sync: u32, flags: u32) -> HRESULT {
     let real = real_of(this);
+    if std::env::var_os("XB1_READBACK").is_some() {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if n == 100 || n == 700 || n == 1400 {
+            readback_stats(&format!("before present {n}"));
+        }
+    }
     let f: unsafe extern "system" fn(*mut c_void, u32, u32) -> HRESULT = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(8))) };
     let hr = unsafe { f(real, sync, flags) };
     static LOGS: AtomicU32 = AtomicU32::new(0);
@@ -2338,21 +2377,130 @@ unsafe extern "system" fn dxgi_present_wrapped(this: *mut c_void, sync: u32, fla
         glog!("[gpu] Present(sync {sync}, flags {flags:#x}) -> {:#x}", hr.0 as u32);
     }
     static FRAMES: AtomicU32 = AtomicU32::new(0);
-    if FRAMES.fetch_add(1, Ordering::Relaxed) == 150 {
+    let frame = FRAMES.fetch_add(1, Ordering::Relaxed);
+    let drawn = DRAWS_SINCE_PRESENT.swap(0, Ordering::Relaxed);
+    if frame < 6 || frame % 300 == 0 {
+        glog!("[gpu] frame {frame}: {drawn} draw call(s) since the last Present (last: indexed {} count {} start {})", LAST_DRAW[0].load(Ordering::Relaxed), LAST_DRAW[1].load(Ordering::Relaxed), LAST_DRAW[2].load(Ordering::Relaxed));
+    }
+    if frame == 150 {
         report_context_changes();
     }
     crate::display::limit_frame_rate();
     hr
 }
 
-/// Older-XDK embedded index 11 (+0x440): `Draw(vertex count, first vertex)` (desktop 13), seen as (4, 0, ..).
+/// Older-XDK embedded index 12 (+0x440): `Draw(vertex count, first vertex)` (desktop 13), seen as (4, 0, ..).
 unsafe extern "system" fn ctx_draw_old(this: *mut c_void, count: u32, start: u32) {
     static LOGS: AtomicU32 = AtomicU32::new(0);
     if LOGS.fetch_add(1, Ordering::Relaxed) < 4 {
         glog!("[gpu] Draw({count}, {start})");
     }
+    LAST_DRAW[0].store(0, Ordering::Relaxed);
+    LAST_DRAW[1].store(count, Ordering::Relaxed);
+    LAST_DRAW[2].store(start, Ordering::Relaxed);
     sync_before_draw(this);
     let real = unsafe { real_context(this) };
+    // The topology is console-side state the layer does not read yet: a plain `Draw` of four vertices is a
+    // quad as a triangle strip (the title and logo quads showed as one diagonal triangle as a list).
+    {
+        static COUNTS: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
+        if count < 8 && COUNTS[count as usize].fetch_add(1, Ordering::Relaxed) == 0 {
+            glog!("[gpu] first plain Draw with {count} vertices");
+        }
+        let topology: u32 = if count == 4 { 5 } else { 4 }; // TRIANGLESTRIP or TRIANGLELIST
+        let t: unsafe extern "system" fn(*mut c_void, u32) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(24))) };
+        unsafe { t(real, topology) };
+    }
     let f: unsafe extern "system" fn(*mut c_void, u32, u32) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(13))) };
     unsafe { f(real, count, start) };
+}
+
+/// The swap chain's buffer 0 as the title got it (a real desktop resource).
+static BACKBUFFER: AtomicUsize = AtomicUsize::new(0);
+
+/// Reads the back buffer back and reports how many pixels are not black and the first few values
+/// (`XB1_READBACK=1`; a debugging aid to tell "the draws produced black" from "the picture is lost").
+fn readback_stats(tag: &str) {
+    use windows::core::Interface;
+    let raw = BACKBUFFER.load(Ordering::Relaxed) as *mut c_void;
+    if raw.is_null() {
+        return;
+    }
+    let Some(tex) = (unsafe { ID3D11Texture2D::from_raw_borrowed(&raw) }) else { return };
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe { tex.GetDesc(&mut desc) };
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+    desc.MiscFlags = 0;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+    let Ok(device) = (unsafe { tex.GetDevice() }) else { return };
+    let mut staging: Option<ID3D11Texture2D> = None;
+    if unsafe { device.CreateTexture2D(&desc, None, Some(&mut staging)) }.is_err() {
+        glog!("[gpu] readback: could not create the staging texture");
+        return;
+    }
+    let staging = staging.unwrap();
+    let Ok(ctx) = (unsafe { device.GetImmediateContext() }) else { return };
+    unsafe { ctx.CopyResource(&staging, tex) };
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    if unsafe { ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }.is_err() {
+        glog!("[gpu] readback: Map failed");
+        return;
+    }
+    let (w, h) = (desc.Width as usize, desc.Height as usize);
+    let mut lit = 0usize;
+    let mut sample = [0u8; 16];
+    for y in 0..h {
+        let row = unsafe { std::slice::from_raw_parts((mapped.pData as *const u8).add(y * mapped.RowPitch as usize), w * 4) };
+        for x in 0..w {
+            if row[x * 4] != 0 || row[x * 4 + 1] != 0 || row[x * 4 + 2] != 0 {
+                if lit == 0 {
+                    sample.copy_from_slice(&row[x * 4..x * 4 + 4].iter().chain(row[..12].iter()).copied().collect::<Vec<u8>>()[..16]);
+                }
+                lit += 1;
+            }
+        }
+    }
+    unsafe { ctx.Unmap(&staging, 0) };
+    glog!("[gpu] readback {tag}: {w}x{h} format {} - {lit} non-black pixel(s), first {:02x?}", desc.Format.0, &sample[..4]);
+}
+
+/// Older-XDK embedded index 43: `RSSetScissorRects(count, rects)` (desktop 45); the first calls log the rectangles.
+unsafe extern "system" fn ctx_scissor_old(this: *mut c_void, count: u32, rects: *const i32) {
+    static LOGS: AtomicU32 = AtomicU32::new(0);
+    if LOGS.fetch_add(1, Ordering::Relaxed) < 6 && !rects.is_null() && count >= 1 {
+        let r = unsafe { std::slice::from_raw_parts(rects, 4) };
+        glog!("[gpu] RSSetScissorRects({count}): left {} top {} right {} bottom {}", r[0], r[1], r[2], r[3]);
+    }
+    let real = unsafe { real_context(this) };
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const i32) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(45))) };
+    unsafe { f(real, count, rects) };
+}
+
+/// Older-XDK embedded index 51: `ClearDepthStencilView(dsv, flags, depth, stencil)` (desktop 53). The depth
+/// and stencil the title passes are not trusted yet (the fourth argument is a leftover pointer), so the
+/// clear uses depth 1.0 and stencil 0, the usual values.
+unsafe extern "system" fn ctx_clear_dsv_old(this: *mut c_void, dsv: *mut c_void, flags: u32, depth: f32, stencil: u64) {
+    static LOGS: AtomicU32 = AtomicU32::new(0);
+    if LOGS.fetch_add(1, Ordering::Relaxed) < 4 {
+        glog!("[gpu] ClearDepthStencilView(dsv {dsv:p}, flags {flags:#x}, depth {depth}, stencil raw {stencil:#x})");
+    }
+    let real = unsafe { real_context(this) };
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, f32, u8) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(53))) };
+    unsafe { f(real, unwrap_object(dsv), flags, 1.0, 0) };
+}
+
+/// Older-XDK state setters (blend 33 -> 35, depth-stencil 34 -> 36, rasterizer 41 -> 43): `(state, a3, a4)`.
+/// `XB1_DEFAULT_STATES=1` replaces the state object with NULL (the desktop defaults) to test whether the
+/// title's state objects are the reason nothing shows.
+unsafe extern "system" fn ctx_state_old<const DESK: usize>(this: *mut c_void, state: *mut c_void, a3: usize, a4: usize) {
+    let real = unsafe { real_context(this) };
+    let state = if env_flag("XB1_DEFAULT_STATES") { ptr::null_mut() } else { unwrap_object(state) };
+    if !state.is_null() {
+        restore_object_vtable(state);
+    }
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, usize, usize) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(DESK))) };
+    unsafe { f(real, state, a3, a4) };
 }

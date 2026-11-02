@@ -2,7 +2,7 @@
 
 An experimental compatibility layer for running Xbox One (GDK/XDK "Durango") x64 titles on Windows x64.
 
-**The aim is to be compatible with a wide range of Xbox One games**, not one title. Anything specific to a single title is a stand-in to be replaced by a general implementation. **Sonic Mania** is the first title that runs, chosen because it is simple (plain D3D11 2D renderer, XAudio2). The Forza Horizon 3 kiosk demo that was used to find the first console API needs is retired; the next target is a full Forza Horizon game (2, 3 or 4) once a dump is available.
+**The aim is to be compatible with a wide range of Xbox One games**, not one title. Anything specific to a single title is a stand-in to be replaced by a general implementation. **Sonic Mania** is the first title that runs, followed by Minecraft Xbox One Edition's menu, chosen because it is simple (plain D3D11 2D renderer, XAudio2). The Forza Horizon 3 kiosk demo that was used to find the first console API needs is retired; the next target is a full Forza Horizon game (2, 3 or 4) once a dump is available.
 
 **Status: early prototype. Sonic Mania is playable with picture, sound and input.** The layer loads unpacked Xbox One titles, runs them through startup into their main loop, and presents their frames in a native window. The goal is a layer that runs titles without graphical glitches; it is not there yet. Only Sonic Mania has been checked for that, and only the parts played so far (intro, menus and the early part of the first zone).
 
@@ -16,9 +16,11 @@ An experimental compatibility layer for running Xbox One (GDK/XDK "Durango") x64
 - **Audio**: proxy for the console extension of `MMDeviceEnumerator`, console audio HAL stand-ins.
 - **Diagnostics**: crash-proof ring trace (`--ring=`, `tools\read-ring.ps1`), `--watch-sites`, `--test-d3d`, per-call GPU logging.
 
+- **Minecraft Xbox One Edition (1.2.0.0, an older XDK)** boots and shows its **main menu** (panorama, logo, buttons, text, controller prompts) with sound; the layer wraps its older DXGI/D3D11 interface layout and maps its embedded context calls (see FINDINGS). Not yet: navigating (its gamepad slot differs from Sonic Mania's), the rest of the embedded calls, the world.
+
 ## What does not work
 - **Forza Horizon 3 kiosk demo** (retired): booted into its main loop but never drew or presented. It writes AMD PM4 command packets that nothing decodes, uses placed textures with console tiling that is not de-tiled, and its D3D11X present path (`DXGIXPresentArray`, `DXGIXSetVLineNotification`) is still a logging stub.
-- **Minecraft Xbox One Edition (1.2.0.0)**: boots to window, device and swap chain creation, then fails on the older console D3D11/DXGI interface layout (see FINDINGS). **Other titles**: untested. Console context-table indices 23 and 24 to 31 are unidentified, and anything not evidenced by a logged call only logs.
+- **Other titles**: untested. Console context-table indices 23 and 24 to 31 are unidentified, and anything not evidenced by a logged call only logs.
 - D3D12.X titles are not supported.
 
 ## Build and run
