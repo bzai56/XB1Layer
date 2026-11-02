@@ -616,6 +616,17 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
             let target = *(rec.add(40) as *const usize);
             let kind = match kind { 0 => "read", 1 => "write", _ => "execute" };
             rlog!("  access violation: {kind} of {target:#x}");
+            if kind == "execute" {
+                let rsp = reg(0x98) as usize;
+                let mut words = [0usize; 24];
+                let mut got = 0usize;
+                ReadProcessMemory(GetCurrentProcess(), rsp as *const c_void, words.as_mut_ptr() as *mut c_void, 24 * 8, &mut got);
+                let base = IMG_BASE.load(Ordering::Relaxed);
+                let me = GetModuleHandleA(std::ptr::null()) as usize;
+                for (i, w) in words.iter().enumerate().take(got / 8) {
+                    rlog!("  rsp+{:#x} = {:#x} (title+{:#x}, layer+{:#x})", i * 8, w, w.wrapping_sub(base), w.wrapping_sub(me));
+                }
+            }
             // MEMORY_BASIC_INFORMATION: BaseAddress, AllocationBase, AllocationProtect(+pad), RegionSize, State, Protect, Type
             let mut mbi = [0u64; 8];
             if VirtualQuery(target as *const c_void, mbi.as_mut_ptr() as *mut c_void, 48) != 0 {
@@ -683,7 +694,12 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                 break;
             }
             let v = *((rsp + i * 8) as *const usize);
-            if v >= base + 8 && v < base + size && (*((v - 5) as *const u8) == 0xE8 || (*((v - 6) as *const u8) == 0xFF && *((v - 5) as *const u8) == 0x15)) {
+            if v >= base + 8 && v < base + size && {
+                let after_call = |n: usize| *((v - n) as *const u8);
+                            // call rel32, call [rip+disp], call [reg+disp8], call [reg+disp32], call reg
+                            let is_call = after_call(5) == 0xE8 || (after_call(6) == 0xFF && after_call(5) == 0x15) || (after_call(3) == 0xFF && (after_call(2) & 0xF8) == 0x50) || (after_call(6) == 0xFF && (after_call(5) & 0xF8) == 0x90) || (after_call(2) == 0xFF && (after_call(1) & 0xF8) == 0xD0);
+                is_call
+            } {
                 rlog!("  stack+{:#x}: return address title+{:#x}", i * 8, v - base);
                 shown += 1;
                 if shown == 12 {
@@ -753,14 +769,30 @@ unsafe fn install_tls_for_current_thread() {
     // HEAP_ZERO_MEMORY = 0x8.
     let arr = HeapAlloc(GetProcessHeap(), 0x8, SLOTS * 8) as *mut *mut c_void;
     if !(*slot).is_null() {
-        ptr::copy_nonoverlapping(*slot, arr, 16);
+        // Copy the entries the loader made, including those of DLLs loaded after the thread started
+        // (graphics drivers have implicit TLS too). The array's size is not known, so as many as can
+        // be read of the first 64 are taken; unused trailing entries are never looked at.
+        let mut got = 0usize;
+        let mut want = 64usize;
+        while want >= 16 {
+            if ReadProcessMemory(GetCurrentProcess(), *slot as *const c_void, arr as *mut c_void, want * 8, &mut got) != 0 {
+                break;
+            }
+            want /= 2;
+        }
+        if want < 16 {
+            ptr::copy_nonoverlapping(*slot, arr, 16);
+        }
     }
     *arr.add(TLS_TITLE_INDEX) = block as *mut c_void;
+    OLD_TLS.with(|o| o.set(*slot as usize));
     *slot = arr;
     rlog!("[tls] thread {} got the title's static TLS (array {arr:p})", GetCurrentThreadId());
 }
 
 thread_local! {
+    /// The loader's TLS pointer array that the title's array replaced on this thread (0 if none).
+    static OLD_TLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Whether this thread already has the title's static TLS installed.
     static TLS_READY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -818,6 +850,15 @@ extern "system" fn thread_trampoline(p: *mut c_void) -> u32 {
     }
     let f: extern "system" fn(*mut c_void) -> u32 = unsafe { std::mem::transmute(routine) };
     let code = f(param as *mut c_void);
+    // Give the loader its own array back so its thread teardown frees what it allocated.
+    let old_array = OLD_TLS.with(|o| o.replace(0));
+    if old_array != 0 {
+        unsafe {
+            let teb: usize;
+            std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb, options(nostack, readonly, preserves_flags));
+            *((teb + 0x58) as *mut usize) = old_array;
+        }
+    }
     let base = IMG_BASE.load(Ordering::Relaxed);
     rlog!("[thread] routine title+{:#x} param {param:#x} returned {code:#x}", routine.wrapping_sub(base));
     code
@@ -839,6 +880,8 @@ extern "system" fn xb_create_thread(
         rlog!("[thread] CreateThread routine OUTSIDE the title: {routine:#x} param {param:#x}");
     }
     let boxed = Box::into_raw(Box::new(ThreadStart { routine, param }));
+    // Console threads can ask for small stacks that the desktop D3D11 runtime and drivers overflow.
+    let (stack, flags) = if stack != 0 && stack < (1 << 20) { rlog!("[thread] stack {stack:#x} raised to 1 MiB"); (1 << 20, flags | 0x10000) } else { (stack, flags) };
     let h = unsafe { CreateThread(attrs, stack, thread_trampoline as usize, boxed as *mut c_void, flags, tid) };
     if h.is_null() {
         drop(unsafe { Box::from_raw(boxed) });
@@ -1663,6 +1706,14 @@ extern "system" fn xb_d3d11_create_device(
         "[gpu] D3D11CreateDevice(adapter {adapter:p}, driver {driver_type}, flags {flags:#x}, {n_levels} level(s), first {first:#x}, sdk {sdk}) -> {:#x}",
         hr as u32
     );
+    if hr >= 0 && std::env::var_os("XB1_TEST_DEFERRED").is_some() {
+        // Experiment: does CreateDeferredContext work on the fresh device at all?
+        let dev = unsafe { *device };
+        let create: extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32 = unsafe { std::mem::transmute(*((*(dev as *const *const usize)).add(27))) };
+        let mut ctx: *mut c_void = ptr::null_mut();
+        let r = create(dev, 0, &mut ctx);
+        rlog!("[gpu] test CreateDeferredContext on the fresh device -> {:#x} {ctx:p}", r as u32);
+    }
     if hr >= 0 {
         unsafe { gpu::wrap_created_device(device, context) };
         display::install();

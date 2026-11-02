@@ -761,7 +761,9 @@ unsafe fn generic_add_ref_ret(p: *mut c_void) -> *mut c_void {
 unsafe extern "system" fn generic_release(this: *mut c_void) -> u32 {
     let left = unsafe { (*(this as *const GenericObj)).refs.fetch_sub(1, Ordering::AcqRel) - 1 };
     if left == 0 {
-        drop(unsafe { Box::from_raw(this as *mut GenericObj) });
+        // Stand-ins stand for runtime-owned singletons (the title balances its own references on the
+        // assumption that the runtime keeps the object alive), so they are never freed.
+        unsafe { (*(this as *const GenericObj)).refs.store(1, Ordering::Release) };
     }
     left
 }
@@ -835,10 +837,27 @@ fn looks_like_hstring_header(p: *mut c_void) -> bool {
 /// property getter or factory method). Otherwise the call fails with E_NOTIMPL.
 unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: *mut c_void, arg2: *mut c_void, a3: *mut c_void, _a4: usize, a5: *mut c_void, _a6: usize) -> HRESULT {
     let o = unsafe { &*(this as *const GenericObj) };
+    {
+        static LAST: Mutex<String> = Mutex::new(String::new());
+        static REPORTED: AtomicBool = AtomicBool::new(false);
+        let v0 = unsafe { *generic_vtbl() };
+        if v0 != generic_qi as usize && !REPORTED.swap(true, Ordering::Relaxed) {
+            eprintln!("[winrt] generic vtable slot 0 is corrupt ({v0:#x}); it was fine before the previous call: {}; now {} slot {N}", LAST.lock().unwrap(), o.class);
+        }
+        *LAST.lock().unwrap() = format!("{} slot {N} arg1 {arg1:p} arg2 {arg2:p} a3 {a3:p}", o.class);
+    }
+    // `CurrentApp.LicenseInformation` (`ILicenseInformation`): slot 7 is `IsActive` and slot 8 `IsTrial`,
+    // both `boolean*`. The generic stand-in wrote an object pointer, which made the game a trial, so the
+    // answers are a full, active license.
+    if o.class == "Windows.ApplicationModel.Store.CurrentApp#slot6" && (N == 7 || N == 8) && is_writable(arg1) {
+        unsafe { *(arg1 as *mut u8) = if N == 7 { 1 } else { 0 } };
+        wlog_rare!("[winrt] LicenseInformation slot {N} -> {}", if N == 7 { "IsActive = true" } else { "IsTrial = false" });
+        return HRESULT(0);
+    }
     // The object `SystemUI` slot 10 returns is an async operation: slot 6 is `put_Completed(handler)`
     // (one argument; the second register holds the object's own vtable pointer, so the event-add path
     // would write a token over vtable slot 0, which crashed with "execute of 0xb").
-    if o.class == "Windows.Xbox.UI.SystemUI#slot10" && N == 6 {
+    if (o.class == "Windows.Xbox.UI.SystemUI#slot10" || o.class == "Windows.Xbox.Storage.ConnectedStorageSpace#slot8") && N == 6 {
         // Complete at once: the game waits for the handler (AsyncStatus::Completed = 1).
         if looks_like_com_object(arg1) {
             let vt = unsafe { *(arg1 as *const *const usize) };
@@ -1029,7 +1048,7 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
     }
     // A delegate in arg1 means `add_Event(handler, &token)`: leave the handler alone.
     if looks_like_com_object(arg1) {
-        if is_writable(arg2) {
+        if is_writable(arg2) && !in_layer_image(arg2) {
             unsafe { ptr::write_unaligned(arg2 as *mut i64, next_token()) };
         }
         wlog!("[winrt] {} slot {N}: arg1 is a COM object -> treated as an event subscription", o.class);
@@ -1604,4 +1623,17 @@ unsafe extern "system" fn vector_view_get_many(this: *mut c_void, start: u32, ca
     }
     wlog!("[winrt] {}: GetMany({start}, {capacity}) -> {written} element(s)", o.class);
     HRESULT(0)
+}
+
+/// True if `p` lies inside this layer's own image (its vtables and statics): never a token slot.
+fn in_layer_image(p: *mut c_void) -> bool {
+    unsafe extern "system" {
+        fn GetModuleHandleA(name: *const i8) -> *mut u8;
+    }
+    let base = unsafe { GetModuleHandleA(ptr::null()) };
+    if base.is_null() {
+        return false;
+    }
+    let size = unsafe { *(base.add(*(base.add(0x3C) as *const u32) as usize + 0x50) as *const u32) } as usize;
+    (p as usize) >= base as usize && (p as usize) < base as usize + size
 }

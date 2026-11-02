@@ -657,10 +657,28 @@ fn spawn_debug_message_pump(device: ID3D11Device) {
 
 /// `ID3D11Device::CreateDeferredContext(UINT flags, ID3D11DeviceContext**)`
 unsafe extern "system" fn device_create_deferred_context(this: *mut c_void, flags: u32, out: *mut *mut c_void) -> HRESULT {
+    glog!("[gpu] CreateDeferredContext(flags {flags:#x}, out {out:p}) on {this:p}");
     let p = unsafe { &*(this as *const Proxy) };
     let f: unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> HRESULT =
         unsafe { std::mem::transmute(*((*(p.real as *const *const usize)).add(DEVICE_CREATE_DEFERRED_CONTEXT))) };
-    let hr = unsafe { f(p.real, flags, out) };
+    if std::env::var_os("XB1_NO_DEFERRED").is_some() {
+        return HRESULT(0x80004001u32 as i32);
+    }
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _serial = ONE_AT_A_TIME.lock().unwrap();
+    // Experiment (XB1_DEFERRED_ON_HELPER=1): run the call on a plain thread of the layer.
+    let hr = if std::env::var_os("XB1_DEFERRED_ON_HELPER").is_some() {
+        let (real, outp) = (p.real as usize, out as usize);
+        std::thread::spawn(move || {
+            let f: unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> HRESULT = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(DEVICE_CREATE_DEFERRED_CONTEXT))) };
+            unsafe { f(real as *mut c_void, flags, outp as *mut *mut c_void) }
+        })
+        .join()
+        .unwrap()
+    } else {
+        unsafe { f(p.real, flags, out) }
+    };
+    glog!("[gpu] CreateDeferredContext -> {:#x}", hr.0 as u32);
     if hr.0 >= 0 && !out.is_null() && unsafe { !(*out).is_null() } {
         // A deferred context is a separate object; give it its own proxy without caching.
         let proxy = new_proxy(unsafe { *out }, Kind::Context);
@@ -2142,9 +2160,9 @@ const OLD_SDK_EXTRA: [(usize, usize); 2] = [(42, 44), (14, 15)];
 /// and index 14 (+0x450, `Unmap(res, 0)`, desktop 15) follows.
 unsafe extern "system" fn ctx_map_old(this: *mut c_void, res: *mut c_void, sub: u32, map_type: u32, flags: u32, out: *mut *mut c_void) -> HRESULT {
     let real = unsafe { real_context(this) };
-    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut [usize; 2]) -> HRESULT =
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut [usize; 3]) -> HRESULT =
         unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(14))) };
-    let mut mapped = [0usize; 2];
+    let mut mapped = [0usize; 3]; // D3D11_MAPPED_SUBRESOURCE: pData, RowPitch, DepthPitch
     let hr = unsafe { f(real, unwrap_object(res), sub, map_type, flags, &mut mapped) };
     if !out.is_null() {
         unsafe { *out = if hr.0 >= 0 { mapped[0] as *mut c_void } else { ptr::null_mut() } };
