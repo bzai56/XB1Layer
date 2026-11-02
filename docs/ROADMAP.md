@@ -6,8 +6,7 @@ The goal is a layer that runs many Xbox One titles on Windows x64 without graphi
 
 ## Next up: Sonic Mania (in order)
 
-1. **Find why Sonic Mania's draws show nothing.** The context calls, the inlined vertex shader, pixel shader and input layout are bound and the device is no longer removed, but the window stays black and the debug layer warns that vertex slot 0 is too small for the draw (stride 20, 30 indices). Check the vertex and index buffer contents (Map/Unmap path, buffer sizes), the viewport and the render target the draw writes to.
-2. **First picture.** Run Sonic Mania and get the title's 2D scene into the window.
+1. **Input for Sonic Mania.** The intro, logos and menus render; next make it playable: a gamepad (the `Windows.Xbox.Input.Controller` list is still empty) and keyboard mapped to console input.
 3. **Hunt glitches.** Compare with the expected output, fix formats, blending, sampling and de-tiling that look wrong.
 4. **Input.** Gamepad and keyboard so the game can be played.
 
