@@ -169,6 +169,8 @@ const EMBED_EXTRA: [(usize, usize); 9] =
 fn forwarded_entries() -> &'static Vec<(usize, usize)> {
     static ENTRIES: OnceLock<Vec<(usize, usize)>> = OnceLock::new();
     let entries = ENTRIES.get_or_init(|| {
+        // XB1_LOG_ALL=1: forward nothing, so every embedded function logs its raw arguments.
+        let log_all = std::env::var_os("XB1_LOG_ALL").is_some();
         let thunks = unsafe { VirtualAlloc(ptr::null_mut(), 16384, 0x3000, 0x40) } as *mut u8;
         assert!(!thunks.is_null(), "thunk allocation failed");
         let mut v = Vec::new();
@@ -177,7 +179,7 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
             // Only indices with direct evidence forward: 11 and 23 (SetShader with NULL), 14 and 15
             // (Map/Unmap). Index 8 was assumed to be PSSetShaderResources and is called as
             // (pointer, 0, 0x76b40), so the console table is not a plain copy of the desktop one.
-            if slot > 3 && !EMBED_VERIFIED.contains(&slot) {
+            if slot > 3 && (log_all || !EMBED_VERIFIED.contains(&slot)) {
                 continue;
             }
             let entry = match slot {
@@ -193,20 +195,20 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
         for console_slot in EMBED_SHIFTED_FROM..=EMBED_SHIFTED_TO {
             // Only indices with direct evidence forward (see EMBED_VERIFIED_SHIFTED); the others log
             // their arguments so they can be identified from the calls.
-            if !EMBED_VERIFIED_SHIFTED.contains(&console_slot) {
+            if log_all || !EMBED_VERIFIED_SHIFTED.contains(&console_slot) {
                 continue;
             }
             let thunk = forward_context_thunk(unsafe { thunks.add((64 + console_slot - EMBED_SHIFTED_FROM) * 32) }, console_slot + 1);
             v.push((index_of(EMBED_TABLE + console_slot * 8), thunk));
         }
-        for (console_slot, desktop_slot) in EMBED_EXTRA {
+        for (console_slot, desktop_slot) in EMBED_EXTRA.iter().copied().filter(|_| !log_all) {
             let thunk = forward_context_thunk(unsafe { thunks.add((128 + console_slot) * 32) }, desktop_slot);
             v.push((index_of(EMBED_TABLE + console_slot * 8), thunk));
         }
         // Draws and dispatches first mirror the placement buffers (see sync_before_draw).
         let synced = unsafe { VirtualAlloc(ptr::null_mut(), 4096, 0x3000, 0x40) } as *mut u8;
         assert!(!synced.is_null(), "thunk allocation failed");
-        for (n, desktop_slot) in DRAW_SLOTS.iter().enumerate() {
+        for (n, desktop_slot) in DRAW_SLOTS.iter().enumerate().filter(|_| !log_all) {
             let console_slot = if *desktop_slot > EMBED_FORWARD_MAX { desktop_slot - 1 } else { *desktop_slot };
             let target = index_of(EMBED_TABLE + console_slot * 8);
             let thunk = synced_forward_thunk(unsafe { synced.add(n * 128) }, *desktop_slot);
