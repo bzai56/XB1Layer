@@ -466,6 +466,9 @@ fn show(v: u64, out: &mut crate::RawBuf) {
 
 /// Names a real D3D11 object (by asking it which interface it supports) for the call trace. Only
 /// objects whose vtable lies inside `d3d11.dll` are asked; anything else is "-".
+/// Presents so far.
+static FRAMES: AtomicU32 = AtomicU32::new(0);
+
 pub fn d3d_object_name(v: u64) -> &'static str {
     use windows::core::Interface;
     unsafe extern "system" {
@@ -541,8 +544,11 @@ extern "system" fn arg_stub_hit(idx: u64, ret: u64, this: u64, a2: u64, a3: u64,
     static TRACE_LIMIT: OnceLock<u64> = OnceLock::new();
     static TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
     let limit = *TRACE_LIMIT.get_or_init(|| std::env::var("XB1_CTX_TRACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
-    let seq = if limit > 0 { TRACE_SEQ.fetch_add(1, Ordering::Relaxed) } else { u64::MAX };
-    let traced = seq < limit && count <= 10;
+    // XB1_TRACE_FRAME=n: the trace starts at the n-th Present (to reach a screen that is not the first).
+    static TRACE_FROM: OnceLock<u32> = OnceLock::new();
+    let from = *TRACE_FROM.get_or_init(|| std::env::var("XB1_TRACE_FRAME").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+    let seq = if limit > 0 && FRAMES.load(Ordering::Relaxed) >= from { TRACE_SEQ.fetch_add(1, Ordering::Relaxed) } else { u64::MAX };
+    let traced = seq < limit && (count <= 10 || from > 0);
     if !traced && count > 6 && !count.is_power_of_two() {
         return;
     }
@@ -1053,11 +1059,14 @@ unsafe extern "system" fn ctx_bind_object(this: *mut c_void, _a2: usize, obj: *m
     if kind.is_none() && qi_kind(obj) == "Buffer" {
         // IASetIndexBuffer(buffer, DXGI_FORMAT_R16_UINT, 0): the first console argument is a format enum
         let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32) = unsafe { std::mem::transmute(*vt.add(19)) };
+        LAST_IB.store(buffer_desc(obj)[0], Ordering::Relaxed);
+        LAST_IB_ARGS[0].store(_a2 as u32, Ordering::Relaxed);
+        LAST_IB_ARGS[1].store(_a4 as u32, Ordering::Relaxed);
         static IBLOGS: AtomicU32 = AtomicU32::new(0);
         if IBLOGS.fetch_add(1, Ordering::Relaxed) < 3 {
             glog!("[gpu] index buffer {obj:p} desc {:x?}, console format {_a2}", buffer_desc(obj));
         }
-        unsafe { f(real, obj, if _a2 == 0 { 57 } else { 42 }, 0) };
+        unsafe { f(real, obj, if _a2 == 0 { 57 } else { 42 }, _a4 as u32) }; // 57 is R16_UINT, 42 R32_UINT; the last argument is the byte offset
         return;
     }
     let slot = match kind {
@@ -1133,15 +1142,41 @@ unsafe extern "system" fn ctx_ia_vb(this: *mut c_void, start: u32, count: u32, b
 
 /// Console index 12: `DrawIndexed(count, start)`. The console method has no base-vertex argument, so
 /// `r9` still holds whatever the title left there (`0x76b40`); pass 0.
+static LAST_IB: AtomicU32 = AtomicU32::new(0);
+static LAST_IB_ARGS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+
+/// `XB1_DRAW_TRACE=n` (with `XB1_TRACE_FRAME`): logs the first n draws from that Present on.
+fn draw_trace(kind: &str, count: u32, start: u32) {
+    static LIMIT: OnceLock<(u32, u32)> = OnceLock::new();
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let (limit, from) = *LIMIT.get_or_init(|| {
+        let n = |k: &str| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        (n("XB1_DRAW_TRACE"), n("XB1_TRACE_FRAME"))
+    });
+    if limit > 0 && FRAMES.load(Ordering::Relaxed) >= from {
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        if n < limit {
+            glog!("[gpu] draw #{n} {kind} count {count} start {start} (index buffer bytes {:#x}, format arg {}, offset arg {:#x})", LAST_IB.load(Ordering::Relaxed), LAST_IB_ARGS[0].load(Ordering::Relaxed), LAST_IB_ARGS[1].load(Ordering::Relaxed));
+        }
+    }
+}
+
 unsafe extern "system" fn ctx_draw_indexed(this: *mut c_void, packed: u64) {
     // The console packs both numbers into one register: index count in the high half, first index
     // in the low half (`0x600000000` = 6 indices from 0, `0x60000001e` = 6 indices from 30).
     let (count, start) = ((packed >> 32) as u32, packed as u32);
+    draw_trace("indexed", count, start);
     LAST_DRAW[0].store(1, Ordering::Relaxed);
     LAST_DRAW[1].store(count, Ordering::Relaxed);
     LAST_DRAW[2].store(start, Ordering::Relaxed);
     sync_before_draw(this);
     let real = unsafe { real_context(this) };
+    // Console-side topology is not read (see `ctx_draw_old`, which leaves a strip behind): an indexed
+    // draw is a triangle list.
+    if crate::VCCORLIB110.load(Ordering::Relaxed) {
+        let t: unsafe extern "system" fn(*mut c_void, u32) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(24))) };
+        unsafe { t(real, 4) };
+    }
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, i32) =
         unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(12))) };
     unsafe { f(real, count, start, 0) };
@@ -2392,7 +2427,6 @@ unsafe extern "system" fn dxgi_present_wrapped(this: *mut c_void, sync: u32, fla
     if LOGS.fetch_add(1, Ordering::Relaxed) < 5 {
         glog!("[gpu] Present(sync {sync}, flags {flags:#x}) -> {:#x}", hr.0 as u32);
     }
-    static FRAMES: AtomicU32 = AtomicU32::new(0);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed);
     let drawn = DRAWS_SINCE_PRESENT.swap(0, Ordering::Relaxed);
     if frame < 6 || frame % 300 == 0 {
@@ -2411,6 +2445,7 @@ unsafe extern "system" fn ctx_draw_old(this: *mut c_void, count: u32, start: u32
     if LOGS.fetch_add(1, Ordering::Relaxed) < 4 {
         glog!("[gpu] Draw({count}, {start})");
     }
+    draw_trace("plain", count, start);
     LAST_DRAW[0].store(0, Ordering::Relaxed);
     LAST_DRAW[1].store(count, Ordering::Relaxed);
     LAST_DRAW[2].store(start, Ordering::Relaxed);

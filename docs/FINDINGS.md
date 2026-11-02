@@ -675,3 +675,12 @@ Pressing A on "Play Game" (hold the key for about 200 ms; a 1 ms `SendKeys` pres
 - Next crash, in `d3d11.dll` (call at `title+0x2c1fce`): the title calls slot 8 of a depth-stencil state, which is `GetDesc` on the older SDK (desktop slot 7). `restore_object_vtable` put the original 8-slot vtable back after the first bind, so slot 8 ran into data. State objects now get their extended vtable back after each bind and slot 8 is the desktop `GetDesc` (older SDK only).
 - Result: pressing A on Play Game shows the Start Game / Join Game screen with background, title, prompts and the user name. The two panels' fills are wrong (large grey triangles and two squares where a world list and its icons should be), so some mesh or texture path of that screen is still unmapped. No world was entered yet.
 
+### Minecraft: Start Game panels fixed (index buffer offset)
+
+- Cause of the grey V-shaped fills: console index 18 is `IASetIndexBuffer(format, buffer, byte offset)` and the layer passed offset 0. Minecraft keeps many meshes in one index buffer and binds each at a byte offset (logged: 2700-byte buffer, draws of 663, 255, 228, 204 indices at offsets 0, 0x52e, 0x72c, 0x8f4, i.e. 16-bit indices back to back), so every mesh after the first read the wrong indices. The offset is now passed (verified: both panels draw as the real frames).
+- Format constants: desktop 57 is `R16_UINT`, 42 `R32_UINT`; console format 0 is 16-bit (the layer already mapped it so; an attempt to "fix" it to 32-bit turned the whole picture black).
+- Indexed draws now set a triangle list on the older SDK, because the plain 4-vertex `Draw` leaves a triangle strip behind. Not what caused the panels, but it was wrong.
+- `+0x740` (index 104) is a call with only `this`, followed by a dirty-flag update in the title; it is log-only and harmless so far.
+- Debug aids: `XB1_TRACE_FRAME=n` starts `XB1_CTX_TRACE` at the n-th Present, `XB1_DRAW_TRACE=n` logs the first n draws from there with the bound index buffer size, format and offset.
+- Still wrong on that screen: the two small squares in each panel (probably unloaded or unmapped textures); not yet looked at.
+
