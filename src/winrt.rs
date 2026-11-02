@@ -1014,6 +1014,19 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         wlog!("[winrt] {} slot {N}: arg1 is a COM object -> treated as an event subscription", o.class);
         return HRESULT(0);
     }
+    // `IController::get_User` (slot 6 on a controller element): the shared user.
+    if o.class.starts_with("Windows.Xbox.Input.Controller.Controllers (element") && !o.class.contains('#') && N == 6 && is_writable(arg1) {
+        unsafe { *(arg1 as *mut *mut c_void) = shared_user() };
+        wlog!("[winrt] controller slot 6 -> the shared user element");
+        return HRESULT(0);
+    }
+    // Slot 8 on a controller element is polled every frame with an out-pointer and nothing is ever
+    // called on what it returns, so it is probably `get_Id` (a UINT64): a stable id.
+    if o.class.starts_with("Windows.Xbox.Input.Controller.Controllers (element") && !o.class.contains('#') && N == 8 && is_writable(arg1) {
+        unsafe { ptr::write_unaligned(arg1 as *mut u64, 1) };
+        wlog_rare!("[winrt] controller slot 8 -> id 1");
+        return HRESULT(0);
+    }
     if is_writable(arg1) {
         let child = create_generic(&format!("{}#slot{N}", o.class), &o.iid);
         unsafe { *(arg1 as *mut *mut c_void) = child };
@@ -1080,6 +1093,14 @@ unsafe extern "system" fn vector_view_get_at(this: *mut c_void, index: u32, out:
         wlog!("[winrt] {}: GetAt({index}) is out of range (size {size}) -> E_BOUNDS", o.class);
         return HRESULT(0x8000000Bu32 as i32);
     }
+    // The title compares users by identity (a controller's user against the user list), so the
+    // user list always hands out the same object.
+    if o.class == "Windows.Xbox.System.User.Users" && index == 0 {
+        let user = shared_user();
+        unsafe { *out = user };
+        wlog!("[winrt] {}: GetAt(0) -> the shared user element", o.class);
+        return HRESULT(0);
+    }
     let element = create_generic(&format!("{} (element {index})", o.class), &o.iid);
     wlog!("[winrt] {}: GetAt({index}) -> a stand-in element", o.class);
     unsafe { *out = element };
@@ -1138,6 +1159,19 @@ fn vector_view_vtbl() -> *const usize {
 
 /// A vector-view stand-in holding `size` generic elements. The size is stored in `kind` (kinds 0
 /// to 2 are taken by the other generic objects, so the vtable, not the kind, selects behavior).
+/// The one signed-in user element (see `vector_view_get_at`).
+fn shared_user() -> *mut c_void {
+    static USER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let mut u = USER.load(Ordering::Acquire);
+    if u == 0 {
+        let o = create_generic("Windows.Xbox.System.User.Users (element 0)", &GUID::from_u128(0xB4F23A93_7FC6_4A50_B153_950016389E50));
+        u = o as usize;
+        USER.store(u, Ordering::Release);
+    }
+    unsafe { (*(u as *const GenericObj)).refs.fetch_add(1, Ordering::AcqRel) };
+    u as *mut c_void
+}
+
 fn create_vector_view(class: &str, iid: &GUID, size: u8) -> *mut c_void {
     let o = create_generic(class, iid);
     unsafe {
