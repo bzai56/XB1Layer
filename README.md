@@ -16,7 +16,7 @@ An experimental compatibility layer for running Xbox One (GDK/XDK "Durango") x64
 - **Audio**: proxy for the console extension of `MMDeviceEnumerator`, console audio HAL stand-ins.
 - **Diagnostics**: crash-proof ring trace (`--ring=`, `tools\read-ring.ps1`), `--watch-sites`, `--test-d3d`, per-call GPU logging.
 
-- **Minecraft Xbox One Edition (1.2.0.0, an older XDK)** boots and shows its **main menu** (panorama, logo, buttons, text, controller prompts) with sound; the layer wraps its older DXGI/D3D11 interface layout and maps its embedded context calls (see FINDINGS). Not yet: navigating (its gamepad slot differs from Sonic Mania's), the rest of the embedded calls, the world.
+- **Minecraft Xbox One Edition (1.2.0.0, an older XDK)** boots and shows its **main menu** (panorama, logo, buttons, text, controller prompts) with sound; the layer wraps its older DXGI/D3D11 interface layout and maps its embedded context calls (see FINDINGS). **Keyboard input works in its menu** (arrows, Z = A); selecting entries beyond the menu, the rest of the embedded calls and the world are not checked yet.
 
 ## What does not work
 - **Forza Horizon 3 kiosk demo** (retired): booted into its main loop but never drew or presented. It writes AMD PM4 command packets that nothing decodes, uses placed textures with console tiling that is not de-tiled, and its D3D11X present path (`DXGIXPresentArray`, `DXGIXSetVLineNotification`) is still a logging stub.

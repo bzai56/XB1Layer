@@ -153,12 +153,23 @@ fn raise_user_handlers(handlers: &[(usize, usize)]) {
 /// Delegates the title registers on the `Windows.Xbox.Input` statics: `(class, slot, handler)`.
 static INPUT_HANDLERS: Mutex<Vec<(&'static str, usize, usize)>> = Mutex::new(Vec::new());
 
-/// The one controller element the layer has: the controller list hands it out and the input events use it
-/// as their sender, so the title sees the same object (and the same id) everywhere.
+/// The controller as the title holds it (`IGamepad^`): the controller list hands it out and the input events use it as
+/// their sender, so the title sees the same object everywhere. On the older SDK it has its own vtable layout: slot 8
+/// is `GetCurrentReading(GamepadReading*)`. The `IController` view of it (`9776FF56`, see `controller_view`) answers
+/// the same slot number with the user.
 fn controller_element() -> *mut c_void {
     static ELEMENT: OnceLock<usize> = OnceLock::new();
     *ELEMENT.get_or_init(|| {
         let iid = GUID::from_u128(0x8C4C1BCD_FDAB_4BF8_BDE9_ABB2B1D6FDD3);
+        create_generic("Windows.Xbox.Input.Gamepad (element)", &iid) as usize
+    }) as *mut c_void
+}
+
+/// The `IController` (`9776FF56`) view of the controller: slot 6 is `get_Id`, 7 `get_Type`, 8 `get_User`.
+fn controller_view() -> *mut c_void {
+    static VIEW: OnceLock<usize> = OnceLock::new();
+    *VIEW.get_or_init(|| {
+        let iid = GUID::from_u128(0x9776FF56_9BFD_4581_AD45_B645BBA526D6);
         create_generic("Windows.Xbox.Input.Controller.Controllers (element 0)", &iid) as usize
     }) as *mut c_void
 }
@@ -188,7 +199,8 @@ pub fn raise_input_events() {
                 let vtbl = unsafe { *(h as *const *const usize) };
                 let invoke: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT = unsafe { std::mem::transmute(*vtbl.add(3)) };
                 let iid = GUID::from_u128(0x8C4C1BCD_FDAB_4BF8_BDE9_ABB2B1D6FDD3);
-                let args = create_generic("ControllerEventArgs", &iid);
+                // `ControllerPairingChangedEventArgs.Controller` is an `IController^`, `GamepadAddedEventArgs.Gamepad` an `IGamepad^`.
+                let args = create_generic(if class == "Controller" { "ControllerEventArgs" } else { "GamepadEventArgs" }, &iid);
                 let hr = unsafe { invoke(h as *mut c_void, controller_element(), args) };
                 wlog!("[winrt]   input event ({class} add slot {slot}): Invoke -> {:#x}", hr.0 as u32);
             }
@@ -798,6 +810,15 @@ unsafe extern "system" fn generic_qi(this: *mut c_void, iid: *const GUID, out: *
             wlog!("[winrt] element QueryInterface({:?})", unsafe { *iid });
         }
     }
+    if o.class == "Windows.Xbox.Input.Gamepad (element)" || o.class == "Windows.Xbox.Input.Controller.Controllers (element 0)" && crate::VCCORLIB110.load(Ordering::Relaxed) {
+        let want = unsafe { *iid };
+        let target = if want == GUID::from_u128(0x9776FF56_9BFD_4581_AD45_B645BBA526D6) { Some(controller_view()) } else if want == GUID::from_u128(0x082E402C_07DF_45E1_A5AB_A3127AF197B5) { Some(controller_element()) } else { None };
+        if let Some(t) = target {
+            unsafe { generic_add_ref(t) };
+            unsafe { *out = t };
+            return HRESULT(0);
+        }
+    }
     wlog_rare!("[winrt] {}::QueryInterface({:?}) -> self", o.class, unsafe { *iid });
     o.refs.fetch_add(1, Ordering::AcqRel);
     unsafe { *out = this };
@@ -826,7 +847,7 @@ unsafe extern "system" fn generic_release(this: *mut c_void) -> u32 {
 unsafe extern "system" fn generic_class_name(this: *mut c_void, out: *mut *mut c_void) -> HRESULT {
     let o = unsafe { &*(this as *const GenericObj) };
     // The title compares a controller's runtime class name with "Windows.Xbox.Input.Gamepad" to pick its type.
-    let name = if o.class.starts_with("Windows.Xbox.Input.Controller.Controllers (element") { "Windows.Xbox.Input.Gamepad" } else { o.class.as_str() };
+    let name = if o.class.starts_with("Windows.Xbox.Input.Controller.Controllers (element") || o.class == "Windows.Xbox.Input.Gamepad (element)" { "Windows.Xbox.Input.Gamepad" } else { o.class.as_str() };
     wlog_rare!("[winrt] GetRuntimeClassName on {} -> {name}", o.class);
     unsafe { *out = std::mem::transmute::<HSTRING, *mut c_void>(HSTRING::from(name)) };
     HRESULT(0)
@@ -904,6 +925,12 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         }
         *LAST.lock().unwrap() = format!("{} slot {N} arg1 {arg1:p} arg2 {arg2:p} a3 {a3:p}", o.class);
     }
+    // The gamepad as `IGamepad^` (older SDK): slot 8 is `GetCurrentReading(GamepadReading*)`, polled every frame into a
+    // 40-byte buffer; same reading as Sonic Mania's newer SDK (36 bytes: time, buttons, triggers, sticks).
+    if o.class == "Windows.Xbox.Input.Gamepad (element)" && N == 8 && is_writable(arg1) {
+        unsafe { fill_gamepad_reading(arg1 as *mut u8) };
+        return HRESULT(0);
+    }
     // Older SDK: slot 6 of the controller interface is `get_Id` (a UInt64 the title compares to find the record).
     if o.class.starts_with("Windows.Xbox.Input.Controller.Controllers (element") && !o.class.contains('#') && N == 6 && is_writable(arg1) && crate::VCCORLIB110.load(Ordering::Relaxed) {
         unsafe { ptr::write_unaligned(arg1 as *mut u64, 1) };
@@ -917,9 +944,9 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         return HRESULT(0);
     }
     // The arguments of the input events answer every getter with the controller element.
-    if o.class == "ControllerEventArgs" && is_writable(arg1) {
-        unsafe { *(arg1 as *mut *mut c_void) = controller_element() };
-        wlog_rare!("[winrt] ControllerEventArgs slot {N} -> the controller element");
+    if (o.class == "ControllerEventArgs" || o.class == "GamepadEventArgs") && is_writable(arg1) {
+        unsafe { *(arg1 as *mut *mut c_void) = if o.class == "ControllerEventArgs" { controller_view() } else { controller_element() } };
+        wlog_rare!("[winrt] {} slot {N} -> the controller", o.class);
         return HRESULT(0);
     }
     // Older SDK: `IController::get_User` is slot 8 (Sonic Mania's newer SDK has it at slot 6). The title
@@ -1230,7 +1257,7 @@ unsafe extern "system" fn vector_view_get_at(this: *mut c_void, index: u32, out:
         wlog!("[winrt] {}: GetAt(0) -> the shared user element", o.class);
         return HRESULT(0);
     }
-    if o.class == "Windows.Xbox.Input.Controller.Controllers" && index == 0 {
+    if o.class == "Windows.Xbox.Input.Controller.Controllers" && index == 0 && crate::VCCORLIB110.load(Ordering::Relaxed) {
         unsafe { *out = controller_element() };
         wlog_rare!("[winrt] {}: GetAt(0) -> the controller element", o.class);
         return HRESULT(0);
