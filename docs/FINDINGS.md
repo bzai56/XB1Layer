@@ -398,3 +398,10 @@ So the mapping has to be built per index from the arguments of real calls, and S
 ### Sonic Mania: console indices 8 and 19 are not what the desktop names suggest
 
 With `XB1_D3D_DEBUG=1`: forwarding console 8 as `PSSetShader` gives "First parameter is corrupt", and console 19 as `IASetIndexBuffer(buf, fmt, 0)` receives a pointer where the DXGI format should be (`0x1c02d575970`). Wrapping them (restoring the shader's desktop vtable, sanitising the format) ended in a NULL execute, so that attempt was reverted. These two (and the missing method between console 24 and 31) are likely the texture/shader binding that keeps the frame white: identify them from the raw arguments before forwarding.
+
+### Sonic Mania: raw arguments of console 8 and 19 (log-only now)
+
+- Console 8 (`+0x420`) is called as `(0x140f6f580, 0, 0x76b40)` from `title+0x214cbd`: a pointer into the title's own image, a zero and a constant that looks like a register base (`0x76b40`, same family as the PM4 register bases). It is not a desktop `PSSetShader`; it is a console "bind shader by register block" call, which fits the console compiling shaders to GCN microcode offline.
+- Console 19 (`+0x478`) is called as `(NULL, ptr, 0)` from `title+0x214b47`, every frame. Not `IASetIndexBuffer`.
+- Consequence to verify: if the shaders handed to `CreateVertexShader`/`CreatePixelShader` are GCN binaries rather than DXBC, the desktop cannot run them and a GCN-to-DXBC translator (or recognising the title's small fixed shader set) is needed for any picture. Check the bytecode header of the first `CreatePixelShader` call (DXBC starts with `DXBC`).
+- Indices 8 and 19 now log instead of forwarding.

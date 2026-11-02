@@ -162,8 +162,8 @@ const EMBED_VERIFIED_SHIFTED: [usize; 5] = [34, 46, 49, 59, 63];
 /// one behind: 32 `OMSetRenderTargets(1,&rtv,dsv)`, 35 `OMSetDepthStencilState(state,1)`,
 /// 42 `RSSetState`, 43 `RSSetViewports(1,&vp)`; console 52 (offset +0x580) is
 /// `ClearDepthStencilView(dsv,3,..)` = desktop 53, so the shift is a constant one from 32 on.
-const EMBED_EXTRA: [(usize, usize); 11] =
-    [(8, 9), (10, 10), (12, 12), (16, 16), (18, 18), (19, 19), (32, 33), (35, 36), (42, 43), (43, 44), (52, 53)];
+const EMBED_EXTRA: [(usize, usize); 9] =
+    [(10, 10), (12, 12), (16, 16), (18, 18), (32, 33), (35, 36), (42, 43), (43, 44), (52, 53)];
 
 /// `(embedded index, entry)` pairs that forward to the real context. Built once.
 fn forwarded_entries() -> &'static Vec<(usize, usize)> {
