@@ -475,3 +475,7 @@ The 2x2 repetition is not the viewport (`RSSetViewports(1)` = 0,0,1920,1080, dep
 ### Sonic Mania: the 2x2 repetition was the draw's packed arguments
 
 The vertex buffer holds four 4-vertex quads: a full-screen quad, left/right half layouts and top/bottom ones for split-screen (UVs 0..0.828 x 0..0.9375 = 424x240 of the 512x256 texture). The index buffer picks which layout to draw, and the console `DrawIndexed` packs `(index count << 32) | first index` into one register (`0x600000000` = 6 indices from 0, `0x60000001e` = 6 from 30). The layer had treated the low half as the count (30 indices = five quads, i.e. every layout at once). `ctx_draw_indexed` now unpacks it and the intro artwork renders once, filling the window with no debug-layer warnings. (Test title was renamed `SonicMania.exe`.)
+
+### Status: Sonic Mania boots
+
+Sonic Mania (1.0.4.2, unpacked) now boots under the layer and runs through its intro, logos and menus with correct picture and sound (verified by the user watching the window, 2026-11-02). Input is the missing piece for playing it.
