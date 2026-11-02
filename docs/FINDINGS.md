@@ -519,3 +519,7 @@ Input note: the layer reads XInput slots 0 to 3 first; if none answers it reads 
 #### DualSense through HID
 
 The winmm entry for the user's Bluetooth DualSense never changed (centred axes, no buttons, whatever was pressed), so `src/dualsense.rs` reads the pad through the HID API: it finds VID 054C / PID 0CE6 (or the Edge 0DF2) with SetupAPI, opens it and reads input reports on a background thread. Reports understood: USB `0x01` (64 bytes), Bluetooth simple `0x01` (10 bytes) and Bluetooth full `0x31` (78 bytes, the one seen here), converted to the Xbox bits (Cross = A, Circle = B, Square = X, Triangle = Y, Options = Menu, Create = View, hat = d-pad, L1/R1, L3/R3; L2/R2 analog; sticks centred at 127.5). The layout follows the Linux `hid-playstation` driver and has not been checked against button presses by me. XInput first, then the DualSense reader, then winmm.
+
+### Test report (user, 2026-11-02)
+
+Sonic Mania plays from the title screen through gameplay with the DualSense over Bluetooth (confirmed working) and the keyboard, with no input lag, no crashes and no visible graphical glitches. The DualSense over USB uses the same reader (report `0x01`, 64 bytes) but has not been tested. Only the early part of the game has been played, so later zones, special stages and the 2-player split screen are untested.
