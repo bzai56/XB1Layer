@@ -7,7 +7,7 @@ An experimental compatibility layer for running Xbox One (GDK/XDK "Durango") x64
 **Status: early prototype. Sonic Mania plays its intro and logo sequence with picture and sound; no other title draws yet.** It loads and starts unpacked Xbox One titles and runs them through startup into their main loop. Sonic Mania runs, presents every frame to a native window and plays sound, but the window is still black: the title draws through console context functions that are only partly mapped to the desktop D3D11 context. Forza Horizon 3 boots into its main loop but never presents. The goal is a layer that runs titles without graphical glitches; it is not there.
 
 ## What works
-- **Sonic Mania boots and runs**: it starts, plays its intro, logo sequence and menus with picture (desktop D3D11 through the layer's proxy device) and sound (XAudio2) in a native window. No input yet, so it cannot be played. Run it with `xb1layer.exe SonicMania.exe --run` from the title's folder.
+- **Sonic Mania boots and runs**: it starts, plays its intro, logo sequence and menus with picture (desktop D3D11 through the layer's proxy device) and sound (XAudio2) in a native window. No input yet, so it cannot be played.
 - Manual PE64 mapping (headers, sections, base relocations)
 - Import resolution against real Windows DLLs
 - Logging stubs for unresolved imports (console-only DLLs such as `d3d11_x.dll`, `xg_x.dll`)
@@ -33,7 +33,7 @@ Requires Rust (MSVC toolchain, x64).
 cargo build
 cargo run -- path\to\title.exe          # load only, print import summary
 cargo run -- path\to\title.exe --imports  # also list every stubbed import, grouped by DLL
-cargo run -- path\to\title.exe --run    # also run the entry point (real titles do not get far yet)
+cargo run -- path\to\title.exe --run    # also run the entry point (Sonic Mania boots and runs; Forza Horizon 3 does not draw yet)
 ```
 
 Debug flags for `--run`: `--watch=N`, `--trace-api`, `--trace-heap`, `--iat`, `--ring=`, `--watch-sites=`. Environment: `XB1_D3D_DEBUG=1` (D3D11 debug layer), `XB1_NO_EXTEND=1`, `XB1_NO_MIRROR=1`. See [Architecture](docs/ARCHITECTURE.md#debugging-aids).
