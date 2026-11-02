@@ -744,18 +744,6 @@ struct GenericObj {
 unsafe extern "system" fn generic_qi(this: *mut c_void, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
     let o = unsafe { &*(this as *const GenericObj) };
     wlog_rare!("[winrt] {}::QueryInterface({:?}) -> self", o.class, unsafe { *iid });
-    if unsafe { *iid } == GUID::from_u128(0x9776FF56_9BFD_4581_AD45_B645BBA526D6) {
-        // Where the title polls its gamepad: log the caller's offsets in the title image.
-        static LOGS: AtomicU32 = AtomicU32::new(0);
-        if LOGS.fetch_add(1, Ordering::Relaxed) < 2 {
-            unsafe extern "system" { fn RtlCaptureStackBackTrace(skip: u32, count: u32, frames: *mut *mut c_void, hash: *mut u32) -> u16; }
-            let mut frames = [ptr::null_mut::<c_void>(); 6];
-            let n = unsafe { RtlCaptureStackBackTrace(0, 6, frames.as_mut_ptr(), ptr::null_mut()) } as usize;
-            let base = crate::IMG_BASE.load(Ordering::Relaxed);
-            let rvas: Vec<String> = frames[..n].iter().map(|f| format!("{:#x}", (*f as usize).wrapping_sub(base))).collect();
-            wlog!("[winrt] gamepad QueryInterface called from title+{rvas:?}");
-        }
-    }
     o.refs.fetch_add(1, Ordering::AcqRel);
     unsafe { *out = this };
     HRESULT(0)

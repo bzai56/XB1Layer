@@ -1,4 +1,8 @@
-# Findings: Forza Horizon 3 kiosk demo
+# Findings
+
+The first sections are about the Forza Horizon 3 kiosk demo (retired as a test title); the Sonic Mania sections follow, then notes on input and frame pacing.
+
+## Forza Horizon 3 kiosk demo
 
 Package: `Kiosk-Opus_1.0.0.0_x64__8wekyb3d8bbwe` (unpacked Xbox One app, tested locally; not distributed here).
 

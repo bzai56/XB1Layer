@@ -135,7 +135,7 @@ unsafe extern "system" fn context_grow_command_buffer(this: *mut c_void) -> usiz
 const EMBED_TABLE: usize = 0x3E0;
 
 /// Embedded indices below 24 whose desktop meaning is backed by logged calls.
-const EMBED_VERIFIED: [usize; 5] = [7, 11, 14, 15, 23];
+const EMBED_VERIFIED: [usize; 4] = [7, 11, 14, 15];
 
 /// Highest desktop slot forwarded through the embedded table (`GSSetShader`).
 const EMBED_FORWARD_MAX: usize = 23;
@@ -162,8 +162,8 @@ const EMBED_VERIFIED_SHIFTED: [usize; 5] = [34, 46, 49, 59, 63];
 /// one behind: 32 `OMSetRenderTargets(1,&rtv,dsv)`, 35 `OMSetDepthStencilState(state,1)`,
 /// 42 `RSSetState`, 43 `RSSetViewports(1,&vp)`; console 52 (offset +0x580) is
 /// `ClearDepthStencilView(dsv,3,..)` = desktop 53, so the shift is a constant one from 32 on.
-const EMBED_EXTRA: [(usize, usize); 12] =
-    [(8, 8), (19, 19), (23, 23), (10, 10), (12, 12), (16, 16), (18, 18), (32, 33), (35, 36), (42, 43), (43, 44), (52, 53)];
+const EMBED_EXTRA: [(usize, usize); 11] =
+    [(8, 8), (19, 19), (10, 10), (12, 12), (16, 16), (18, 18), (32, 33), (35, 36), (42, 43), (43, 44), (52, 53)];
 
 /// `(embedded index, entry)` pairs that forward to the real context. Built once.
 fn forwarded_entries() -> &'static Vec<(usize, usize)> {
@@ -204,14 +204,6 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
         for (console_slot, desktop_slot) in EMBED_EXTRA.iter().copied().filter(|_| !log_all) {
             if console_slot == 8 {
                 v.push((index_of(EMBED_TABLE + 8 * 8), ctx_ps_srv as usize));
-                continue;
-            }
-            let probe = match console_slot {
-                23 => Some(ctx_probe::<23, 0> as usize),
-                _ => None::<usize>,
-            };
-            if let Some(p) = probe {
-                v.push((index_of(EMBED_TABLE + console_slot * 8), p));
                 continue;
             }
             if console_slot == 43 {
@@ -979,30 +971,6 @@ fn qi_kind(obj: *mut c_void) -> &'static str {
         }
     }
     "other"
-}
-
-/// Logging probe: what kind of object does `*a4` (or `*a3`) point to, then forward as desktop slot `DESK`
-/// (0 = do not forward).
-unsafe extern "system" fn ctx_probe<const IDX: usize, const DESK: usize>(this: *mut c_void, a2: usize, a3: usize, a4: usize) {
-    static LOGS: AtomicU32 = AtomicU32::new(0);
-    if LOGS.fetch_add(1, Ordering::Relaxed) < 3 {
-        glog!("[gpu] probe console {IDX}: a2={a2:#x} a3={a3:#x}: {} a4={a4:#x}: {}", safe_dump(a3 as u64, 32), safe_dump(a4 as u64, 16));
-    }
-    if IDX == 23 && a3 > 0x10000 && a3 % 8 == 0 && LOGS.load(Ordering::Relaxed) <= 8 {
-        let pair = unsafe { [*(a3 as *const usize), *((a3 + 8) as *const usize)] };
-        let kinds = CREATED_KINDS.lock().unwrap();
-        for o in pair {
-            let k = kinds.iter().rev().find(|(x, _)| *x == o).map(|(_, k)| *k);
-            glog!("[gpu] probe 23 object {o:#x} created by device slot {k:?}");
-        }
-    }
-    if DESK == 0 {
-        return;
-    }
-    let real = unsafe { real_context(this) };
-    let f: unsafe extern "system" fn(*mut c_void, usize, usize, usize) =
-        unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(DESK))) };
-    unsafe { f(real, a2, a3, a4) };
 }
 
 /// `ID3D11Buffer::GetDesc` (slot 10): `[ByteWidth, Usage, BindFlags, CPUAccessFlags, MiscFlags, Stride]`.
