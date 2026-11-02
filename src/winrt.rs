@@ -846,6 +846,17 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         }
         *LAST.lock().unwrap() = format!("{} slot {N} arg1 {arg1:p} arg2 {arg2:p} a3 {a3:p}", o.class);
     }
+    if o.class.starts_with("Windows.Xbox.Input.Controller.Controllers (element") && N == 8 {
+        static SEEN: AtomicU32 = AtomicU32::new(0);
+        if SEEN.fetch_add(1, Ordering::Relaxed) < 1 {
+            unsafe extern "system" { fn RtlCaptureStackBackTrace(skip: u32, count: u32, frames: *mut *mut c_void, hash: *mut u32) -> u16; }
+            let mut frames = [ptr::null_mut::<c_void>(); 6];
+            let n = unsafe { RtlCaptureStackBackTrace(0, 6, frames.as_mut_ptr(), ptr::null_mut()) } as usize;
+            let base = crate::IMG_BASE.load(Ordering::Relaxed);
+            let rvas: Vec<String> = frames[..n].iter().map(|f| format!("{:#x}", (*f as usize).wrapping_sub(base))).collect();
+            wlog!("[winrt] controller slot 8 called from title+{rvas:?} with args {arg1:p} {arg2:p} {a3:p}");
+        }
+    }
     // `CurrentApp.LicenseInformation` (`ILicenseInformation`): slot 7 is `IsActive` and slot 8 `IsTrial`,
     // both `boolean*`. The generic stand-in wrote an object pointer, which made the game a trial, so the
     // answers are a full, active license.

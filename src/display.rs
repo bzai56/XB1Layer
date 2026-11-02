@@ -96,7 +96,7 @@ static ORIGINAL_PRESENT1: OnceLock<usize> = OnceLock::new();
 /// locked 60 frames per second and run too fast on a faster monitor (a vsync only paces to the
 /// monitor). Sleeps after each present until the next 1/60 s slot. `XB1_FPS=<n>` changes the rate,
 /// `XB1_FPS=0` turns the limit off.
-fn limit_frame_rate() {
+pub fn limit_frame_rate() {
     use std::time::{Duration, Instant};
     static FPS: OnceLock<f64> = OnceLock::new();
     static NEXT: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);

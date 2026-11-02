@@ -18,7 +18,7 @@
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::*;
@@ -454,6 +454,71 @@ fn show(v: u64, out: &mut crate::RawBuf) {
     }
 }
 
+
+/// Names a real D3D11 object (by asking it which interface it supports) for the call trace. Only
+/// objects whose vtable lies inside `d3d11.dll` are asked; anything else is "-".
+fn d3d_object_name(v: u64) -> &'static str {
+    use windows::core::Interface;
+    unsafe extern "system" {
+        fn GetModuleHandleA(name: *const i8) -> *mut u8;
+    }
+    static RANGE: OnceLock<(usize, usize)> = OnceLock::new();
+    let (lo, hi) = *RANGE.get_or_init(|| unsafe {
+        let m = GetModuleHandleA(c"d3d11.dll".as_ptr());
+        if m.is_null() {
+            return (0, 0);
+        }
+        let size = *(m.add(*(m.add(0x3C) as *const u32) as usize + 0x50) as *const u32) as usize;
+        (m as usize, m as usize + size)
+    });
+    let mut vt = 0u64;
+    let mut got = 0usize;
+    if v < 0x10000 || v % 8 != 0 || unsafe { ReadProcessMemory(GetCurrentProcess(), v as *const c_void, &mut vt as *mut u64 as *mut c_void, 8, &mut got) } == 0 {
+        return "-";
+    }
+    if (vt as usize) < lo || (vt as usize) >= hi {
+        return "-";
+    }
+    let obj = v as *mut c_void;
+    let mut qi_addr = 0usize;
+    if unsafe { ReadProcessMemory(GetCurrentProcess(), vt as *const c_void, &mut qi_addr as *mut usize as *mut c_void, 8, &mut got) } == 0 || qi_addr < lo || qi_addr >= hi {
+        return "-";
+    }
+    let qi: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT = unsafe { std::mem::transmute(qi_addr) };
+    let table: [(&str, GUID); 13] = [
+        ("Buffer", ID3D11Buffer::IID),
+        ("Tex2D", ID3D11Texture2D::IID),
+        ("SRV", ID3D11ShaderResourceView::IID),
+        ("RTV", ID3D11RenderTargetView::IID),
+        ("DSV", ID3D11DepthStencilView::IID),
+        ("Sampler", ID3D11SamplerState::IID),
+        ("InputLayout", ID3D11InputLayout::IID),
+        ("Blend", ID3D11BlendState::IID),
+        ("DepthState", ID3D11DepthStencilState::IID),
+        ("Raster", ID3D11RasterizerState::IID),
+        ("VS", ID3D11VertexShader::IID),
+        ("PS", ID3D11PixelShader::IID),
+        ("Context", ID3D11DeviceContext::IID),
+    ];
+    for (name, iid) in table.iter() {
+        let mut out = ptr::null_mut();
+        if unsafe { qi(obj, iid, &mut out) }.0 >= 0 {
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { std::mem::transmute(*((*(out as *const *const usize)).add(2))) };
+            unsafe { rel(out) };
+            return name;
+        }
+    }
+    "other"
+}
+
+/// What `a` and what it points to are, for the call trace.
+fn trace_kinds(a: u64) -> String {
+    let mut first = 0u64;
+    let mut got = 0usize;
+    let pointee = if a > 0x10000 && unsafe { ReadProcessMemory(GetCurrentProcess(), a as *const c_void, &mut first as *mut u64 as *mut c_void, 8, &mut got) } != 0 { first } else { 0 };
+    format!("{}/{}", d3d_object_name(a), d3d_object_name(pointee))
+}
+
 /// Called by every argument-logging stub. Logs the first calls of each stub, then only
 /// powers of two, so a function called every frame does not flood the log.
 extern "system" fn arg_stub_hit(idx: u64, ret: u64, this: u64, a2: u64, a3: u64, a4: u64) {
@@ -463,13 +528,22 @@ extern "system" fn arg_stub_hit(idx: u64, ret: u64, this: u64, a2: u64, a3: u64,
         e.1 += 1;
         (e.0.clone(), e.1)
     };
-    if count > 6 && !count.is_power_of_two() {
+    // XB1_CTX_TRACE=n: log every call of the first n (in order), to read a frame's call sequence.
+    static TRACE_LIMIT: OnceLock<u64> = OnceLock::new();
+    static TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
+    let limit = *TRACE_LIMIT.get_or_init(|| std::env::var("XB1_CTX_TRACE").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+    let seq = if limit > 0 { TRACE_SEQ.fetch_add(1, Ordering::Relaxed) } else { u64::MAX };
+    let traced = seq < limit && count <= 10;
+    if !traced && count > 6 && !count.is_power_of_two() {
         return;
     }
     let (base, size) = crate::image_range();
     let mut line = crate::RawBuf::new();
     {
         use std::fmt::Write;
+        if traced {
+            let _ = write!(line, "seq {seq} ");
+        }
         let _ = write!(line, "{name} (call #{count}) this=");
     }
     show(this, &mut line);
@@ -477,6 +551,9 @@ extern "system" fn arg_stub_hit(idx: u64, ret: u64, this: u64, a2: u64, a3: u64,
         use std::fmt::Write;
         let _ = write!(line, " {label}=");
         show(a, &mut line);
+        if traced {
+            let _ = write!(line, "{{{}}}", trace_kinds(a));
+        }
     }
     {
         use std::fmt::Write;
@@ -2130,6 +2207,7 @@ pub fn wrap_dxgi(real: *mut c_void, kind: u8) -> *mut c_void {
     }
     if kind == 2 {
         vtbl[10] = dxgi_get_buffer_wrapped as usize;
+        vtbl[9] = dxgi_present_wrapped as usize;
     }
     vtbl[0] = wrapped_qi as usize;
     if kind == 4 {
@@ -2151,8 +2229,10 @@ pub fn unwrap_object(p: *mut c_void) -> *mut c_void {
 
 /// `(console index, desktop slot)` pairs seen in Minecraft Xbox One Edition (older XDK), from logged
 /// calls: 31 is called as (1, &rtv, dsv) = `OMSetRenderTargets` (desktop 33); 42 as (1, &viewport) =
-/// `RSSetViewports` (desktop 44); 13 is `Map` (see `ctx_map_old`, desktop 14) and 14 `Unmap(res, 0)` (desktop 15).
-const OLD_SDK_EXTRA: [(usize, usize); 2] = [(42, 44), (14, 15)];
+/// `RSSetViewports` (desktop 44); 33 `OMSetBlendState(state, factor, mask)` (35), 34 `OMSetDepthStencilState(state, ref)` (36),
+/// 41 `RSSetState` (43), 43 `RSSetScissorRects` (45), 46 `UpdateSubresource` with the subresource counting 0 to 4 (48),
+/// 51 `ClearDepthStencilView(dsv, 3, ..)` (53), all two behind the desktop; 13 is `Map` (see `ctx_map_old`, desktop 14) and 14 `Unmap(res, 0)` (desktop 15).
+const OLD_SDK_EXTRA: [(usize, usize); 8] = [(42, 44), (14, 15), (33, 35), (34, 36), (41, 43), (43, 45), (46, 48), (51, 53)];
 
 /// Older-XDK embedded index 13 (+0x448): `Map(resource, subresource, map type, flags, void** data)`. The
 /// console returns the data pointer itself; the desktop fills a `D3D11_MAPPED_SUBRESOURCE`
@@ -2242,4 +2322,17 @@ unsafe extern "system" fn view_get_resource_wrapped(this: *mut c_void, out: *mut
     if !out.is_null() && !unsafe { *out }.is_null() {
         unsafe { *out = wrap_dxgi(*out, 3) };
     }
+}
+
+/// `IDXGISwapChain::Present(sync, flags)` as the older SDK calls it (console slot 9, desktop 8).
+unsafe extern "system" fn dxgi_present_wrapped(this: *mut c_void, sync: u32, flags: u32) -> HRESULT {
+    let real = real_of(this);
+    let f: unsafe extern "system" fn(*mut c_void, u32, u32) -> HRESULT = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(8))) };
+    let hr = unsafe { f(real, sync, flags) };
+    static LOGS: AtomicU32 = AtomicU32::new(0);
+    if LOGS.fetch_add(1, Ordering::Relaxed) < 5 {
+        glog!("[gpu] Present(sync {sync}, flags {flags:#x}) -> {:#x}", hr.0 as u32);
+    }
+    crate::display::limit_frame_rate();
+    hr
 }
