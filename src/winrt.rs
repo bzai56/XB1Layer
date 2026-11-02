@@ -847,6 +847,27 @@ fn looks_like_hstring_header(p: *mut c_void) -> bool {
 /// property getter or factory method). Otherwise the call fails with E_NOTIMPL.
 unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: *mut c_void, arg2: *mut c_void, a3: *mut c_void, _a4: usize, a5: *mut c_void, _a6: usize) -> HRESULT {
     let o = unsafe { &*(this as *const GenericObj) };
+    // The object `SystemUI` slot 10 returns is an async operation: slot 6 is `put_Completed(handler)`
+    // (one argument; the second register holds the object's own vtable pointer, so the event-add path
+    // would write a token over vtable slot 0, which crashed with "execute of 0xb").
+    if o.class == "Windows.Xbox.UI.SystemUI#slot10" && N == 6 {
+        // Complete at once: the game waits for the handler (AsyncStatus::Completed = 1).
+        if looks_like_com_object(arg1) {
+            let vt = unsafe { *(arg1 as *const *const usize) };
+            let invoke: unsafe extern "system" fn(*mut c_void, *mut c_void, i32) -> HRESULT = unsafe { std::mem::transmute(*vt.add(3)) };
+            let hr = unsafe { invoke(arg1, this, 1) };
+            wlog!("[winrt] SystemUI async operation: put_Completed -> handler Invoke(Completed) = {:#x}", hr.0 as u32);
+        }
+        return HRESULT(0);
+    }
+    // `SystemUI` statics slot 10 is `(user, 0, Object** out)` (title call site 0x26ac25, reached when a
+    // game starts): it returns an object, not an event token; leaving the out-pointer NULL crashed
+    // the title at 0x26660c.
+    if o.class == "Windows.Xbox.UI.SystemUI" && N == 10 && (a3 as usize) % 8 == 0 && is_writable(a3) {
+        unsafe { *(a3 as *mut *mut c_void) = create_generic("Windows.Xbox.UI.SystemUI#slot10", &o.iid) };
+        wlog!("[winrt] SystemUI slot 10 (user, 0, out) -> a stand-in object");
+        return HRESULT(0);
+    }
     // `Store.Product` statics slot 11 is `(user, id, flag, ptr, ptr, Product** out)`: the object comes
     // back through the fifth argument after `this` (stack; title call site 0x1948e55).
     if o.class == "Windows.Xbox.ApplicationModel.Store.Product" && N == 11 && (a5 as usize) % 8 == 0 && is_writable(a5) {
@@ -1204,8 +1225,25 @@ unsafe fn fill_gamepad_reading(out: *mut u8) {
     let mut pad = XInputState::default();
     if get_state != 0 {
         let f: unsafe extern "system" fn(u32, *mut XInputState) -> u32 = unsafe { std::mem::transmute(get_state) };
-        if unsafe { f(0, &mut pad) } != 0 {
-            pad = XInputState::default();
+        // The first connected pad of the four XInput slots.
+        let mut found = false;
+        for slot in 0..4u32 {
+            let mut st = XInputState::default();
+            if unsafe { f(slot, &mut st) } == 0 {
+                pad = st;
+                found = true;
+                static LOGGED: AtomicBool = AtomicBool::new(false);
+                if !LOGGED.swap(true, Ordering::Relaxed) {
+                    wlog!("[winrt] XInput pad found in slot {slot}");
+                }
+                break;
+            }
+        }
+        if !found {
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                wlog!("[winrt] no XInput pad connected (only XInput devices are read)");
+            }
         }
     }
     // XInput button bit -> GamepadButtons bit (Menu 4, View 8, A 16, B 32, X 64, Y 128, DPad up 256,
@@ -1224,6 +1262,17 @@ unsafe fn fill_gamepad_reading(out: *mut u8) {
         for (key, bit) in keys {
             if unsafe { GetAsyncKeyState(key) } < 0 {
                 buttons |= bit;
+            }
+        }
+    }
+    // Test hook: XB1_AUTOPRESS="30:4:1;34:16:1" presses Menu for 1 s at t=30 s and A at t=34 s.
+    if let Ok(spec) = std::env::var("XB1_AUTOPRESS") {
+        static START: OnceLock<std::time::Instant> = OnceLock::new();
+        let t = START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64();
+        for item in spec.split(';') {
+            let v: Vec<f64> = item.split(':').filter_map(|x| x.parse().ok()).collect();
+            if v.len() == 3 && t >= v[0] && t < v[0] + v[2] {
+                buttons |= v[1] as u32;
             }
         }
     }

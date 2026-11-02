@@ -507,3 +507,11 @@ The title's per-frame poll (`title+0x254e30`) queries the controller element for
 | 0x1C / 0x20 | right stick x / y (f32) |
 
 `fill_gamepad_reading` (src/winrt.rs) fills it from the first XInput pad and, while the layer's window has the focus, the keyboard: arrows = d-pad, Z / X / A / S = A / B / X / Y, Enter = Menu, Backspace = View, Q / W = shoulders. One stand-in controller is now always present (`XB1_NO_GAMEPAD=1` removes it). Confirmed by the user playing with the keyboard.
+
+### Starting a game crashed: `SystemUI` async operation
+
+Entering a game made the title call the `Windows.Xbox.UI.SystemUI` statics slot 10 as `(user, 0, Object** out)` (call site `title+0x26ac25`; it creates an `IAsyncOperation`-like object) and then slot 6 on the result, `put_Completed(handler)`. The generic stand-in treated slot 10 as an event subscription (out-pointer left NULL: crash at `title+0x26660c`), and then treated slot 6 as an event add too, writing a token through its second argument, which for that call is the object's own vtable pointer: vtable slot 0 became `0xb` (crash "execute of 0xb"). Now slot 10 returns a stand-in operation and `put_Completed` invokes the handler immediately with `AsyncStatus::Completed` (1). Result: Sonic Mania runs from the title screen into Green Hill Zone (score, time, rings, pause menu) with correct pictures.
+
+Test hook for scripted runs: `XB1_AUTOPRESS="30:4:1;34:16:1"` presses Menu for 1 s at t = 30 s and A for 1 s at t = 34 s (button bits as in the reading table above).
+
+Input note: the layer reads XInput slots 0 to 3 and logs `no XInput pad connected` when none answers. A controller that is not an XInput device (for example a DualShock/DualSense without Steam Input or DS4Windows, or a generic DirectInput pad) is not seen; the keyboard works.
