@@ -616,7 +616,7 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
             let target = *(rec.add(40) as *const usize);
             let kind = match kind { 0 => "read", 1 => "write", _ => "execute" };
             rlog!("  access violation: {kind} of {target:#x}");
-            if kind == "execute" {
+            if kind == "execute" || std::env::var_os("XB1_DUMP_STACK").is_some() {
                 let rsp = reg(0x98) as usize;
                 let mut words = [0usize; 24];
                 let mut got = 0usize;
