@@ -810,6 +810,19 @@ fn ensure_tls_on_current_thread() {
     });
 }
 
+/// Puts the loader's own TLS pointer array back on this thread (undoing `install_tls_for_current_thread`), so that
+/// ntdll's thread teardown frees only what it allocated. Must be called before a thread that got the title's TLS ends.
+pub fn restore_loader_tls() {
+    let old_array = OLD_TLS.with(|o| o.replace(0));
+    if old_array != 0 {
+        unsafe {
+            let teb: usize;
+            std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb, options(nostack, readonly, preserves_flags));
+            *((teb + 0x58) as *mut usize) = old_array;
+        }
+    }
+}
+
 /// A thread-pool I/O callback registered by the title, wrapped so pool threads get TLS first.
 struct PoolIo {
     callback: usize,
@@ -851,14 +864,7 @@ extern "system" fn thread_trampoline(p: *mut c_void) -> u32 {
     let f: extern "system" fn(*mut c_void) -> u32 = unsafe { std::mem::transmute(routine) };
     let code = f(param as *mut c_void);
     // Give the loader its own array back so its thread teardown frees what it allocated.
-    let old_array = OLD_TLS.with(|o| o.replace(0));
-    if old_array != 0 {
-        unsafe {
-            let teb: usize;
-            std::arch::asm!("mov {}, gs:[0x30]", out(reg) teb, options(nostack, readonly, preserves_flags));
-            *((teb + 0x58) as *mut usize) = old_array;
-        }
-    }
+    restore_loader_tls();
     let base = IMG_BASE.load(Ordering::Relaxed);
     rlog!("[thread] routine title+{:#x} param {param:#x} returned {code:#x}", routine.wrapping_sub(base));
     code

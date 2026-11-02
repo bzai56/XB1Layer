@@ -121,7 +121,7 @@ pub fn raise_user_events() {
     std::thread::spawn(|| {
         crate::ensure_tls_on_current_thread();
         let mut raised = 0usize;
-        for _ in 0..200 {
+        loop {
             std::thread::sleep(std::time::Duration::from_millis(250));
             let (total, pending): (usize, Vec<(usize, usize)>) = {
                 let all = USER_HANDLERS.lock().unwrap();
@@ -134,6 +134,7 @@ pub fn raise_user_events() {
             raise_user_handlers(&pending);
             raised = total;
         }
+        crate::restore_loader_tls();
     });
 }
 
@@ -184,7 +185,7 @@ pub fn raise_input_events() {
         // The handlers are the title's code and use its thread-local storage.
         crate::ensure_tls_on_current_thread();
         let mut raised = 0usize;
-        for _ in 0..200 {
+        loop {
             std::thread::sleep(std::time::Duration::from_millis(250));
             let (total, pending): (usize, Vec<(&'static str, usize, usize)>) = {
                 let all = INPUT_HANDLERS.lock().unwrap();
@@ -206,6 +207,7 @@ pub fn raise_input_events() {
             }
             raised = total;
         }
+        crate::restore_loader_tls();
     });
 }
 
@@ -945,7 +947,7 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
     }
     // The arguments of the input events answer every getter with the controller element.
     if (o.class == "ControllerEventArgs" || o.class == "GamepadEventArgs") && is_writable(arg1) {
-        unsafe { *(arg1 as *mut *mut c_void) = if o.class == "ControllerEventArgs" { controller_view() } else { controller_element() } };
+        unsafe { *(arg1 as *mut *mut c_void) = controller_view() };
         wlog_rare!("[winrt] {} slot {N} -> the controller", o.class);
         return HRESULT(0);
     }
@@ -964,10 +966,18 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         wlog_rare!("[winrt] LicenseInformation slot {N} -> {}", if N == 7 { "IsActive = true" } else { "IsTrial = false" });
         return HRESULT(0);
     }
+    // Xbox Live services operation start `(a, b, c, int, Operation** out)` (title call site 0x30e9d4): the out pointer is the
+    // fifth argument (on the stack), and the returned object is an async operation the title hooks a completion handler on.
+    if o.class.starts_with("Microsoft.Xbox.Services.XboxLiveContext#slot6#slot") && N == 9 && (_a4 as usize) % 8 == 0 && is_writable(_a4 as *mut c_void) {
+        let child = create_generic(&format!("{}#slot9", o.class), &o.iid);
+        unsafe { *(_a4 as *mut *mut c_void) = child };
+        wlog!("[winrt] {} slot 9 -> an async operation through the fifth argument", o.class);
+        return HRESULT(0);
+    }
     // The object `SystemUI` slot 10 returns is an async operation: slot 6 is `put_Completed(handler)`
     // (one argument; the second register holds the object's own vtable pointer, so the event-add path
     // would write a token over vtable slot 0, which crashed with "execute of 0xb").
-    if (o.class == "Windows.Xbox.UI.SystemUI#slot10" || o.class == "Windows.Xbox.Storage.ConnectedStorageSpace#slot8") && N == 6 {
+    if (o.class == "Windows.Xbox.UI.SystemUI#slot10" || o.class == "Windows.Xbox.Storage.ConnectedStorageSpace#slot8" || o.class.starts_with("Microsoft.Xbox.Services.XboxLiveContext#slot6#slot")) && N == 6 {
         // Complete at once: the game waits for the handler (AsyncStatus::Completed = 1).
         if looks_like_com_object(arg1) {
             let vt = unsafe { *(arg1 as *const *const usize) };
@@ -1130,6 +1140,14 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         wlog!("[winrt] {}: slot {N} -> HSTRING \"XB1Layer Player\"", o.class);
         return HRESULT(0);
     }
+    // Older SDK, `IUser` booleans (polled every frame once Play Game is chosen; the generic object pointer made
+    // the title treat the user as a guest): slot 10 `IsGuest` = false, slot 11 `IsSignedIn` = true (settled from the "Guest Xbox profile" and "You are not signed in" dialogs that the other order produced). A guess from
+    // the "Guest Xbox profile" dialog that appeared.
+    if o.class.starts_with("Windows.Xbox.System.User.Users (element") && !o.class.contains('#') && (N == 10 || N == 11) && crate::VCCORLIB110.load(Ordering::Relaxed) && is_writable(arg1) {
+        unsafe { *(arg1 as *mut u8) = if N == 11 { 1 } else { 0 } };
+        wlog_rare!("[winrt] user slot {N} (older SDK) -> {}", if N == 11 { "true" } else { "false" });
+        return HRESULT(0);
+    }
     // Slot 15 of a user is parsed by the title with base-10 `wcstoull`: the Xbox user id as a string.
     if o.class.starts_with("Windows.Xbox.System.User.Users (element") && !o.class.contains('#') && N == 15 && is_writable(arg1) {
         unsafe { *(arg1 as *mut *mut c_void) = std::mem::transmute::<HSTRING, *mut c_void>(HSTRING::from("2535400000000001")) };
@@ -1145,7 +1163,8 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
     }
     // Xbox Live services classes are factories: `(object, Object** out)` creates something from
     // the object (e.g. an XboxLiveContext from a user; title call site 0x1947b12), not an event add.
-    if o.class.starts_with("Microsoft.Xbox.") && looks_like_com_object(arg1) && (arg2 as usize) % 8 == 0 && is_writable(arg2) {
+    // `ConnectedStorageSpace.GetForUser(user, ConnectedStorageSpace** out)` (statics slot 6) is a factory too.
+    if (o.class.starts_with("Microsoft.Xbox.") || (o.class == "Windows.Xbox.Storage.ConnectedStorageSpace" && N == 6)) && looks_like_com_object(arg1) && (arg2 as usize) % 8 == 0 && is_writable(arg2) {
         unsafe { *(arg2 as *mut *mut c_void) = create_generic(&format!("{}#slot{N}", o.class), &o.iid) };
         wlog!("[winrt] {} slot {N}: (object, out) -> a stand-in object", o.class);
         return HRESULT(0);
@@ -1181,6 +1200,23 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
     // from the title's poll at title+0x254e30 (it zeroes the struct, calls slot 8, then reads it).
     if o.class.starts_with("Windows.Xbox.Input.Controller.Controllers (element") && !o.class.contains('#') && N == 8 && is_writable(arg1) && !crate::VCCORLIB110.load(Ordering::Relaxed) {
         unsafe { fill_gamepad_reading(arg1 as *mut u8) };
+        return HRESULT(0);
+    }
+    // Experiment (XB1_NO_HEAP_OUT=1): an out-parameter outside this thread's stack may be a smaller field of a heap object.
+    let on_stack = {
+        let (lo, hi): (usize, usize);
+        unsafe {
+            let mut a: usize;
+            let mut b: usize;
+            std::arch::asm!("mov {}, gs:[8]", out(reg) a, options(nostack, readonly, preserves_flags));
+            std::arch::asm!("mov {}, gs:[16]", out(reg) b, options(nostack, readonly, preserves_flags));
+            hi = a;
+            lo = b;
+        }
+        (arg1 as usize) >= lo && (arg1 as usize) < hi
+    };
+    if (std::env::var_os("XB1_NO_HEAP_OUT").is_some() || o.class == "Microsoft.Xbox.Services.Presence.PresenceData") && !on_stack && is_writable(arg1) {
+        wlog!("[winrt] {} slot {N}: out-parameter {arg1:p} is not on the stack, left alone", o.class);
         return HRESULT(0);
     }
     if is_writable(arg1) {
