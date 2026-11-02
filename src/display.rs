@@ -92,6 +92,49 @@ fn output_window(width: i32, height: i32) -> usize {
 static ORIGINAL_FOR_HWND: OnceLock<usize> = OnceLock::new();
 static ORIGINAL_PRESENT1: OnceLock<usize> = OnceLock::new();
 
+/// The console presents with a sync interval of 1 on a 60 Hz output, so titles are written for a
+/// locked 60 frames per second and run too fast on a faster monitor (a vsync only paces to the
+/// monitor). Sleeps after each present until the next 1/60 s slot. `XB1_FPS=<n>` changes the rate,
+/// `XB1_FPS=0` turns the limit off.
+fn limit_frame_rate() {
+    use std::time::{Duration, Instant};
+    static FPS: OnceLock<f64> = OnceLock::new();
+    static NEXT: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+    let fps = *FPS.get_or_init(|| std::env::var("XB1_FPS").ok().and_then(|v| v.parse().ok()).unwrap_or(60.0));
+    if fps <= 0.0 {
+        return;
+    }
+    let period = Duration::from_secs_f64(1.0 / fps);
+    let mut next = NEXT.lock().unwrap();
+    let now = Instant::now();
+    let target = match *next {
+        Some(t) if t > now.checked_sub(period * 2).unwrap_or(now) => t,
+        _ => now,
+    };
+    if target > now {
+        let wait = target - now;
+        if wait > Duration::from_millis(2) {
+            std::thread::sleep(wait - Duration::from_millis(2));
+        }
+        while Instant::now() < target {
+            std::hint::spin_loop();
+        }
+    }
+    *next = Some(target + period);
+    // Frames per second, logged a few times so the pacing can be checked.
+    static COUNT: std::sync::Mutex<(Option<Instant>, u32, u32)> = std::sync::Mutex::new((None, 0, 0));
+    let mut c = COUNT.lock().unwrap();
+    let start = *c.0.get_or_insert(now);
+    c.1 += 1;
+    if now.duration_since(start) >= Duration::from_secs(1) {
+        if c.2 < 5 {
+            eprintln!("[display] {} frames in the last second", c.1);
+            c.2 += 1;
+        }
+        *c = (Some(now), 0, c.2);
+    }
+}
+
 /// `IDXGISwapChain1::Present1(this, sync, flags, params)`: the title passes NULL parameters, which this
 /// DXGI build dereferences unguarded (`mov rax, [r9+0x10]`), so an empty structure is substituted.
 unsafe extern "system" fn present1(this: *mut c_void, sync: u32, flags: u32, params: *const c_void) -> i32 {
@@ -102,6 +145,7 @@ unsafe extern "system" fn present1(this: *mut c_void, sync: u32, flags: u32, par
         unsafe { std::mem::transmute(*ORIGINAL_PRESENT1.get().unwrap()) };
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let hr = unsafe { orig(this, sync, flags, p) };
+    limit_frame_rate();
     if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
         eprintln!("[display] Present1(sync {sync}, flags {flags:#x}) -> {:#x}", hr as u32);
     }
