@@ -776,8 +776,8 @@ unsafe extern "system" fn generic_class_name(this: *mut c_void, out: *mut *mut c
 
 /// True if `p` points into committed, writable memory (so it can plausibly be an out-parameter).
 fn is_writable(p: *mut c_void) -> bool {
-    if (p as usize) < 0x10000 {
-        return false;
+    if (p as usize) < 0x10000 || in_layer_image(p) {
+        return false; // never an out-parameter: the layer's own vtables and statics live in its image
     }
     let mut mbi = [0u64; 8];
     if unsafe { VirtualQuery(p, mbi.as_mut_ptr() as *mut c_void, 48) } == 0 {
@@ -842,20 +842,16 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         static REPORTED: AtomicBool = AtomicBool::new(false);
         let v0 = unsafe { *generic_vtbl() };
         if v0 != generic_qi as usize && !REPORTED.swap(true, Ordering::Relaxed) {
-            eprintln!("[winrt] generic vtable slot 0 is corrupt ({v0:#x}); it was fine before the previous call: {}; now {} slot {N}", LAST.lock().unwrap(), o.class);
+            eprintln!("[winrt] generic vtable slot 0 is corrupt ({v0:#x}), vtable at {:p}; it was fine before the previous call: {}; now {} slot {N}", generic_vtbl(), LAST.lock().unwrap(), o.class);
         }
         *LAST.lock().unwrap() = format!("{} slot {N} arg1 {arg1:p} arg2 {arg2:p} a3 {a3:p}", o.class);
     }
-    if o.class.starts_with("Windows.Xbox.Input.Controller.Controllers (element") && N == 8 {
-        static SEEN: AtomicU32 = AtomicU32::new(0);
-        if SEEN.fetch_add(1, Ordering::Relaxed) < 1 {
-            unsafe extern "system" { fn RtlCaptureStackBackTrace(skip: u32, count: u32, frames: *mut *mut c_void, hash: *mut u32) -> u16; }
-            let mut frames = [ptr::null_mut::<c_void>(); 6];
-            let n = unsafe { RtlCaptureStackBackTrace(0, 6, frames.as_mut_ptr(), ptr::null_mut()) } as usize;
-            let base = crate::IMG_BASE.load(Ordering::Relaxed);
-            let rvas: Vec<String> = frames[..n].iter().map(|f| format!("{:#x}", (*f as usize).wrapping_sub(base))).collect();
-            wlog!("[winrt] controller slot 8 called from title+{rvas:?} with args {arg1:p} {arg2:p} {a3:p}");
-        }
+    // Older SDK: `IController::get_User` is slot 8 (Sonic Mania's newer SDK has it at slot 6). The title
+    // compares the returned user with its user list, so it must be the shared user.
+    if o.class.starts_with("Windows.Xbox.Input.Controller.Controllers (element") && !o.class.contains('#') && N == 8 && is_writable(arg1) && crate::VCCORLIB110.load(Ordering::Relaxed) {
+        unsafe { *(arg1 as *mut *mut c_void) = shared_user() };
+        wlog_rare!("[winrt] controller slot 8 (older SDK) -> the shared user element");
+        return HRESULT(0);
     }
     // `CurrentApp.LicenseInformation` (`ILicenseInformation`): slot 7 is `IsActive` and slot 8 `IsTrial`,
     // both `boolean*`. The generic stand-in wrote an object pointer, which made the game a trial, so the
@@ -1564,7 +1560,7 @@ pub fn wrap_co_created(clsid: &GUID, iid: &GUID, out: *mut *mut c_void) {
 /// Called before the real activation-factory lookup. Returns `Some(hr)` when the class is
 /// one we implement ourselves.
 pub fn try_activation_factory(class: &str, iid: &GUID, out: *mut *mut c_void) -> Option<HRESULT> {
-    if class.starts_with("Windows.Xbox.") || class.starts_with("Microsoft.Xbox.") {
+    if class.starts_with("Windows.Xbox.") || class.starts_with("Microsoft.Xbox.") || class.starts_with("Windows.Kinect.") {
         unsafe { *out = create_generic(class, iid) };
         wlog!("[winrt] generic stand-in for console-only class {class} (iid {iid:?})");
         return Some(HRESULT(0));
@@ -1637,14 +1633,21 @@ unsafe extern "system" fn vector_view_get_many(this: *mut c_void, start: u32, ca
 }
 
 /// True if `p` lies inside this layer's own image (its vtables and statics): never a token slot.
+/// (`GetModuleHandle(NULL)` is the title here, because the bootstrap points the PEB at it, so the layer's
+/// own module is found from the address of this function.)
 fn in_layer_image(p: *mut c_void) -> bool {
     unsafe extern "system" {
-        fn GetModuleHandleA(name: *const i8) -> *mut u8;
+        fn GetModuleHandleExA(flags: u32, address: *const c_void, module: *mut *mut u8) -> i32;
     }
-    let base = unsafe { GetModuleHandleA(ptr::null()) };
-    if base.is_null() {
-        return false;
-    }
-    let size = unsafe { *(base.add(*(base.add(0x3C) as *const u32) as usize + 0x50) as *const u32) } as usize;
-    (p as usize) >= base as usize && (p as usize) < base as usize + size
+    static RANGE: OnceLock<(usize, usize)> = OnceLock::new();
+    let (lo, hi) = *RANGE.get_or_init(|| unsafe {
+        let mut base: *mut u8 = ptr::null_mut();
+        // GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT
+        if GetModuleHandleExA(0x4 | 0x2, in_layer_image as *const c_void, &mut base) == 0 || base.is_null() {
+            return (0, 0);
+        }
+        let size = *(base.add(*(base.add(0x3C) as *const u32) as usize + 0x50) as *const u32) as usize;
+        (base as usize, base as usize + size)
+    });
+    (p as usize) >= lo && (p as usize) < hi
 }
