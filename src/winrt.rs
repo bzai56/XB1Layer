@@ -951,7 +951,8 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
     // `Controller` statics slot 6 is the controller list, an IVectorView<IController> (the title
     // calls `get_Size` and `GetAt(index, &out)` on it). Empty for now: no controllers connected.
     if (o.class == "Windows.Xbox.Input.Controller" || o.class == "Windows.Xbox.Input.Gamepad") && N == 6 && is_writable(arg1) {
-        let list = create_vector_view("Windows.Xbox.Input.Controller.Controllers", &o.iid, 0);
+        let count = if std::env::var_os("XB1_GAMEPAD").is_some() { 1 } else { 0 };
+        let list = create_vector_view("Windows.Xbox.Input.Controller.Controllers", &o.iid, count);
         unsafe { *(arg1 as *mut *mut c_void) = list };
         wlog!("[winrt] {} slot 6 (Controllers) -> an empty vector view", o.class);
         return HRESULT(0);

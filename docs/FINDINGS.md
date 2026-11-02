@@ -479,3 +479,7 @@ The vertex buffer holds four 4-vertex quads: a full-screen quad, left/right half
 ### Status: Sonic Mania boots
 
 Sonic Mania (1.0.4.2, unpacked) now boots under the layer and runs through its intro, logos and menus with correct picture and sound (verified by the user watching the window, 2026-11-02). Input is the missing piece for playing it.
+
+### Sonic Mania: first look at input
+
+`XB1_GAMEPAD=1` makes the `Controllers` list contain one stand-in element. The title then calls `GetAt(0)`, calls slot 6 on the element through the `Controller` interface (`7400624F-...`; it takes an out-pointer, so it returns an object), queries the element for `9776FF56-9BFD-4581-AD45-B645BBA526D6` (the gamepad interface) and calls slot 6 on that too (also an out-pointer, probably `GetCurrentReading`), then subscribes to three controller events (slots 7, 9 and 11). After that, nothing touches the stand-ins again during the 12-second run, so the per-frame poll is either not reached with the generic stand-ins or goes through objects they returned. Next: give the two returned objects real shapes (a reading with the button bitmask, two trigger values and four thumbstick axes, filled from XInput and the keyboard) and log which slots the title calls on them. The switch is off by default because nothing is mapped yet.
