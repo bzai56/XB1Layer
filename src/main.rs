@@ -8,6 +8,7 @@
 //! Usage: xb1layer <file.exe> [--run]
 
 mod display;
+mod dualsense;
 mod gpu;
 mod tlsdll;
 mod winrt;

@@ -515,3 +515,7 @@ Entering a game made the title call the `Windows.Xbox.UI.SystemUI` statics slot 
 Test hook for scripted runs: `XB1_AUTOPRESS="30:4:1;34:16:1"` presses Menu for 1 s at t = 30 s and A for 1 s at t = 34 s (button bits as in the reading table above).
 
 Input note: the layer reads XInput slots 0 to 3 first; if none answers it reads the legacy joystick API (winmm), which sees HID pads such as a DualSense or DualShock (USB or Bluetooth), assuming the usual Windows layout (Cross = A, Circle = B, Square = X, Triangle = Y, Options = Menu, Create = View, L1/R1, L3/R3, hat = d-pad, X/Y and Z/R = sticks, L2/R2 as buttons). The winmm path was written without a pad to compare against: report any wrong button or axis.
+
+#### DualSense through HID
+
+The winmm entry for the user's Bluetooth DualSense never changed (centred axes, no buttons, whatever was pressed), so `src/dualsense.rs` reads the pad through the HID API: it finds VID 054C / PID 0CE6 (or the Edge 0DF2) with SetupAPI, opens it and reads input reports on a background thread. Reports understood: USB `0x01` (64 bytes), Bluetooth simple `0x01` (10 bytes) and Bluetooth full `0x31` (78 bytes, the one seen here), converted to the Xbox bits (Cross = A, Circle = B, Square = X, Triangle = Y, Options = Menu, Create = View, hat = d-pad, L1/R1, L3/R3; L2/R2 analog; sticks centred at 127.5). The layout follows the Linux `hid-playstation` driver and has not been checked against button presses by me. XInput first, then the DualSense reader, then winmm.

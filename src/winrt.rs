@@ -1254,7 +1254,13 @@ unsafe fn fill_gamepad_reading(out: *mut u8) {
     // touchpad; X/Y = left stick, Z/R = right stick, U/V = triggers, POV = d-pad.
     let mut extra_buttons = 0u32;
     let mut extra_axes: Option<[f32; 6]> = None;
-    if !found_xinput {
+    crate::dualsense::start();
+    let ds = if found_xinput { None } else { crate::dualsense::state() };
+    if let Some((b, axes)) = ds {
+        extra_buttons = b;
+        extra_axes = Some(axes);
+    }
+    if !found_xinput && ds.is_none() {
         #[repr(C)]
         #[derive(Default)]
         struct JoyInfoEx {
