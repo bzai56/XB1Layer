@@ -984,7 +984,7 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
     // The object `SystemUI` slot 10 returns is an async operation: slot 6 is `put_Completed(handler)`
     // (one argument; the second register holds the object's own vtable pointer, so the event-add path
     // would write a token over vtable slot 0, which crashed with "execute of 0xb").
-    if (o.class == "Windows.Xbox.UI.SystemUI#slot10" || o.class == "Windows.Xbox.Storage.ConnectedStorageSpace#slot8" || o.class.starts_with("Microsoft.Xbox.Services.XboxLiveContext#slot6#slot")) && N == 6 {
+    if (o.class == "Windows.Xbox.UI.SystemUI#slot10" || o.class == "Windows.Xbox.Storage.ConnectedStorageSpace#slot8" || o.class == "Windows.Xbox.Storage.ConnectedStorageSpace#slot6" || o.class.starts_with("Microsoft.Xbox.Services.XboxLiveContext#slot6#slot")) && N == 6 {
         // Complete at once: the game waits for the handler (AsyncStatus::Completed = 1).
         if looks_like_com_object(arg1) {
             let vt = unsafe { *(arg1 as *const *const usize) };
@@ -1183,6 +1183,14 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         wlog!("[winrt] {} slot {N}: (object, out) -> a stand-in object", o.class);
         return HRESULT(0);
     }
+    // Storage objects: `Get/Create(name, Object** out)` where the name is a string whose pointer is
+    // not always recognizable as an HSTRING header (title call site 0x599190): the object goes to the
+    // second argument, and the first is never written.
+    if o.class.starts_with("Windows.Xbox.Storage.ConnectedStorageSpace#") && N == 9 && (arg2 as usize) % 8 == 0 && is_writable(arg2) && !in_layer_image(arg2) {
+        unsafe { *(arg2 as *mut *mut c_void) = create_generic(&format!("{}#slot{N}", o.class), &o.iid) };
+        wlog!("[winrt] {} slot {N}: (name, out) -> a stand-in object", o.class);
+        return HRESULT(0);
+    }
     // A string in arg1 (`GetXxx(name, Object** out)`): the object goes to the second argument.
     if looks_like_hstring_header(arg1) && (arg2 as usize) % 8 == 0 && is_writable(arg2) {
         unsafe { *(arg2 as *mut *mut c_void) = create_generic(&format!("{}#slot{N}", o.class), &o.iid) };
@@ -1199,6 +1207,22 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         }
         if is_writable(arg2) && !in_layer_image(arg2) {
             unsafe { ptr::write_unaligned(arg2 as *mut i64, next_token()) };
+        }
+        // `put_Completed(handler)` of a storage operation: one argument, so the second register still
+        // holds the object's own vtable pointer (in the layer's image); an event add would have a token pointer.
+        if o.class.starts_with("Windows.Xbox.Storage.") && N == 6 && in_layer_image(arg2) {
+            let vt = unsafe { *(arg1 as *const *const usize) };
+            let invoke: unsafe extern "system" fn(*mut c_void, *mut c_void, i32) -> HRESULT = unsafe { std::mem::transmute(*vt.add(3)) };
+            let hr = unsafe { invoke(arg1, this, 1) };
+            wlog!("[winrt] {} slot 6: put_Completed -> handler Invoke(Completed) = {:#x}", o.class, hr.0 as u32);
+            return HRESULT(0);
+        }
+        if o.class.starts_with("Windows.Xbox.Storage.") {
+            unsafe extern "system" { fn RtlCaptureStackBackTrace(skip: u32, count: u32, frames: *mut *mut c_void, hash: *mut u32) -> u16; }
+            let mut frames = [ptr::null_mut::<c_void>(); 2];
+            unsafe { RtlCaptureStackBackTrace(0, 2, frames.as_mut_ptr(), ptr::null_mut()) };
+            let (base, _) = crate::image_range();
+            wlog!("[winrt] {} slot {N} called from title+{:#x} / {:#x} (arg1={:p} arg2={:p})", o.class, (frames[0] as usize).wrapping_sub(base), (frames[1] as usize).wrapping_sub(base), arg1, arg2);
         }
         wlog!("[winrt] {} slot {N}: arg1 is a COM object -> treated as an event subscription", o.class);
         return HRESULT(0);

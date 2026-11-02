@@ -684,3 +684,11 @@ Pressing A on "Play Game" (hold the key for about 200 ms; a 1 ms `SendKeys` pres
 - Debug aids: `XB1_TRACE_FRAME=n` starts `XB1_CTX_TRACE` at the n-th Present, `XB1_DRAW_TRACE=n` logs the first n draws from there with the bound index buffer size, format and offset.
 - Still wrong on that screen: the two small squares in each panel (probably unloaded or unmapped textures); not yet looked at.
 
+### Minecraft: Start Game waits on the storage API
+
+- The four squares in each panel are the loading spinner, not missing textures. It never finished because the title's save-game storage chain (4J's wrapper over `Windows.Xbox.Storage.ConnectedStorageSpace`) stalled.
+- Call-site evidence (title `0x5a6263`): the object `GetForUser` returns is an asynchronous operation; the title calls its slot 6 with one handler argument, which is `put_Completed`. The layer took it for an event add, so the handler was never invoked. Storage objects' slot 6 with a layer-owned second register (the vtable pointer left there by a one-argument call) is now completed immediately; verified: the title goes on to use the result.
+- The next calls are `(name, Object** out)` with a string that is not always recognizable as an HSTRING header; the string pointer was being treated as the out parameter and the real one left NULL (crash at `0x59c4c8`). Storage objects' slot 9 now writes the stand-in to the second argument.
+- Current stop: crash at `title+0x53be0e`, in the title's input mapping code (`mov edx,[rcx+rdx*4]` with `rcx = table[3]` garbage), reached right after the storage chain. Not yet known whether a layer write corrupted that table or the table is never filled for a fourth pad; to check next.
+- The storage objects are still generic stand-ins whose shapes are guessed from call sites; the result of `GetForUser`'s operation (the real space) and the container/blob calls need proper semantics (and a place to keep saves) for worlds to be created and listed.
+
