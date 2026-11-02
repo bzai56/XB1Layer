@@ -33,7 +33,7 @@ cargo run -- path\to\title.exe --run      # also run the entry point
 
 For example, Sonic Mania, from its own folder: `xb1layer.exe "SonicMania.exe" --run`.
 
-Debug flags for `--run`: `--watch=N`, `--trace-api`, `--trace-heap`, `--iat`, `--ring=`, `--watch-sites=`. Environment: `XB1_D3D_DEBUG=1` (D3D11 debug layer), `XB1_LOG_ALL=1` (log every context call instead of forwarding), `XB1_FPS=<n>` (frame limit, default 60, 0 = off), `XB1_NO_GAMEPAD=1`, `XB1_INPUT_LOG=1` (print raw joystick changes to map an unknown pad), `XB1_NO_EXTEND=1`, `XB1_NO_MIRROR=1`. See [Architecture](docs/ARCHITECTURE.md#debugging-aids).
+Debug flags for `--run`: `--watch=N`, `--trace-api`, `--trace-heap`, `--iat`, `--ring=`, `--watch-sites=`. Environment: `XB1_D3D_DEBUG=1` (D3D11 debug layer), `XB1_LOG_ALL=1` (log every context call instead of forwarding), `XB1_FPS=<n>` (frame limit, default 60, 0 = off), `XB1_NO_GAMEPAD=1`, `XB1_INPUT_LOG=1` (print raw joystick changes to map an unknown pad), `XB1_NO_EXTEND=1`, `XB1_NO_MIRROR=1`, `XB1_STALL_MS=n` (hold a thread n ms at a `--watch-sites` hit). See [Architecture](docs/ARCHITECTURE.md#debugging-aids).
 
 Run a title from its own folder so relative paths resolve.
 

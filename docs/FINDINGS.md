@@ -539,3 +539,11 @@ The full game's `forza_durango_release_final.exe` (85 MB, 17 sections) loads at 
 - `Windows.Xbox.Management.Deployment.PackageTransferManager` (`slot 6` plus an event subscription) is polled about 1500 times before the crash, interleaved with the file loads. It may be gating zip mounting (install-state polling); that is a guess, not verified.
 
 Open question: why the title mounts zips in a different order than the manifest and never reaches `stateflow.zip`. Next step: log the title's zip mount decisions (or read the object at `[rbp+0x18]` in that function) and check what the `PackageTransferManager` methods are expected to return.
+
+### Full Forza Horizon 3: the failing open is `RenderScenarios\XboxOne\Global.xml`
+
+- The path the crashing function (title+`0x1b04d40`) passes to the open routine (title+`0x1ea29d0`) was read with `--watch-sites=0x1b04eea` and `XB1_PEEK="rdx+0>0:32;rdx+0>0x20:16"`: `game:\media\RenderScenarios\XboxOne\Global.xml`. It exists only inside `media\renderscenarios.zip` (entry `XboxOne/Global.xml`). The title never opens that zip.
+- `zipmanifest.xml` (1075 `game:\...zip` entries with directory offsets) is read first, then five worker threads are created suspended (title+`0x1a3f0c0`). The zips the title does open (85 of them: `ui`, `gametunablesettings`, `ui\*`, `drivers\*`, `stripped\*`) come from directory enumerations (`FindFirstFileExA(".\media\UI\*.zip")`), not from the manifest. Reads on them are overlapped (`ERROR_IO_PENDING`, completed through thread-pool I/O).
+- **It is not a timing race:** `XB1_STALL_MS=20000` (new: holds the thread 20 s at a `--watch-sites` hit) opened no further zips and the crash is identical. So manifest-listed zips are not mounted eagerly and an on-demand mount for `RenderScenarios\...` does not happen.
+- Also ruled out: the `PackageTransferManager` calls (about 1500) are just the title fetching the manager object (title+`0x1c357b0`, vtable slot 6 = static getter) and registering an event handler, not an install-state wait.
+- Next: find the title's zip-lookup routine (called from title+`0x1ea29d0`) and see why the manifest entry for `renderscenarios.zip` is not matched; the manifest parser is title+`0x18dd6d0`.

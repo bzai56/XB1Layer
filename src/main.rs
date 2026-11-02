@@ -363,6 +363,11 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                         "  rax={:#x} rcx={:#x} rdx={:#x} rbx={:#x} rsi={:#x} rdi={:#x} r8={:#x} r9={:#x}",
                         reg(0x78), reg(0x80), reg(0x88), reg(0x90), reg(0xA8), reg(0xB0), reg(0xB8), reg(0xC0)
                     );
+                    // XB1_STALL_MS=n: hold the thread at a watch site (experiment: is a failure a race with
+                    // another thread's work?).
+                    if let Some(ms) = std::env::var("XB1_STALL_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+                        std::thread::sleep(std::time::Duration::from_millis(ms));
+                    }
                     // XB1_PEEK="r13+0x24de:8;r15+0x230:2": memory at register+offset (hex bytes), for
                     // reading object fields at a watch site.
                     if let Some(spec) = PEEK_SPEC.get() {
