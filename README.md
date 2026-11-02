@@ -4,7 +4,7 @@ An experimental compatibility layer for running Xbox One (GDK/XDK "Durango") x64
 
 **The aim is to be compatible with a wide range of Xbox One games**, not one title. The Forza Horizon 3 kiosk demo was the first test case, used to find out what the console APIs need; anything specific to it is a stand-in to be replaced by a general implementation. **Development now focuses on Sonic Mania**, a much simpler title (plain D3D11 2D renderer, XAudio2), to get the first real picture; Forza Horizon 3 is parked until then.
 
-**Status: early prototype. Nothing is drawn yet.** It loads and starts unpacked Xbox One titles and runs them through startup into their main loop. Sonic Mania runs, presents every frame to a native window and plays sound, but the window is still black: the title draws through console context functions that are only partly mapped to the desktop D3D11 context. Forza Horizon 3 boots into its main loop but never presents. The goal is a layer that runs titles without graphical glitches; it is not there.
+**Status: early prototype. Sonic Mania draws its intro artwork (with glitches); nothing else does yet.** It loads and starts unpacked Xbox One titles and runs them through startup into their main loop. Sonic Mania runs, presents every frame to a native window and plays sound, but the window is still black: the title draws through console context functions that are only partly mapped to the desktop D3D11 context. Forza Horizon 3 boots into its main loop but never presents. The goal is a layer that runs titles without graphical glitches; it is not there.
 
 ## What works
 - Manual PE64 mapping (headers, sections, base relocations)

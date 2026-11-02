@@ -214,6 +214,14 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
                 v.push((index_of(EMBED_TABLE + console_slot * 8), p));
                 continue;
             }
+            if console_slot == 12 {
+                v.push((index_of(EMBED_TABLE + 12 * 8), ctx_draw_indexed as usize));
+                continue;
+            }
+            if console_slot == 18 {
+                v.push((index_of(EMBED_TABLE + 18 * 8), ctx_ia_vb as usize));
+                continue;
+            }
             if console_slot == 19 {
                 v.push((index_of(EMBED_TABLE + 19 * 8), ctx_bind_object as usize));
                 continue;
@@ -228,6 +236,9 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
             let console_slot = if *desktop_slot > EMBED_FORWARD_MAX { desktop_slot - 1 } else { *desktop_slot };
             let target = index_of(EMBED_TABLE + console_slot * 8);
             let thunk = synced_forward_thunk(unsafe { synced.add(n * 128) }, *desktop_slot);
+            if *desktop_slot == 12 {
+                continue;
+            }
             if let Some(entry) = v.iter_mut().find(|(i, _)| *i == target) {
                 entry.1 = thunk;
             }
@@ -914,6 +925,10 @@ unsafe extern "system" fn ctx_bind_object(this: *mut c_void, _a2: usize, obj: *m
     if kind.is_none() && qi_kind(obj) == "Buffer" {
         // IASetIndexBuffer(buffer, DXGI_FORMAT_R16_UINT, 0): the first console argument is a format enum
         let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32) = unsafe { std::mem::transmute(*vt.add(19)) };
+        static IBLOGS: AtomicU32 = AtomicU32::new(0);
+        if IBLOGS.fetch_add(1, Ordering::Relaxed) < 3 {
+            glog!("[gpu] index buffer {obj:p} desc {:x?}, console format {_a2}", buffer_desc(obj));
+        }
         unsafe { f(real, obj, if _a2 == 0 { 57 } else { 42 }, 0) };
         return;
     }
@@ -984,6 +999,42 @@ unsafe extern "system" fn ctx_probe<const IDX: usize, const DESK: usize>(this: *
     let f: unsafe extern "system" fn(*mut c_void, usize, usize, usize) =
         unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(DESK))) };
     unsafe { f(real, a2, a3, a4) };
+}
+
+/// `ID3D11Buffer::GetDesc` (slot 10): `[ByteWidth, Usage, BindFlags, CPUAccessFlags, MiscFlags, Stride]`.
+fn buffer_desc(buf: *mut c_void) -> [u32; 6] {
+    let mut d = [0u32; 6];
+    if buf.is_null() || (buf as usize) % 8 != 0 {
+        return d;
+    }
+    let vt = unsafe { *(buf as *const *const usize) };
+    let f: unsafe extern "system" fn(*mut c_void, *mut u32) = unsafe { std::mem::transmute(*vt.add(10)) };
+    unsafe { f(buf, d.as_mut_ptr()) };
+    d
+}
+
+/// Console index 18: `IASetVertexBuffers(start, count, buffers, strides, offsets)`, forwarded; the first
+/// calls log the buffer description and stride.
+unsafe extern "system" fn ctx_ia_vb(this: *mut c_void, start: u32, count: u32, bufs: *const *mut c_void, strides: *const u32, offsets: *const u32) {
+    static LOGS: AtomicU32 = AtomicU32::new(0);
+    if LOGS.fetch_add(1, Ordering::Relaxed) < 4 && !bufs.is_null() && !strides.is_null() && !offsets.is_null() {
+        let b = unsafe { *bufs };
+        glog!("[gpu] IASetVertexBuffers({start}, {count}) buffer {b:p} desc {:x?} stride {} offset {}", buffer_desc(b), unsafe { *strides }, unsafe { *offsets });
+    }
+    let real = unsafe { real_context(this) };
+    let f: unsafe extern "system" fn(*mut c_void, u32, u32, *const *mut c_void, *const u32, *const u32) =
+        unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(18))) };
+    unsafe { f(real, start, count, bufs, strides, offsets) };
+}
+
+/// Console index 12: `DrawIndexed(count, start)`. The console method has no base-vertex argument, so
+/// `r9` still holds whatever the title left there (`0x76b40`); pass 0.
+unsafe extern "system" fn ctx_draw_indexed(this: *mut c_void, count: u32, start: u32) {
+    sync_before_draw(this);
+    let real = unsafe { real_context(this) };
+    let f: unsafe extern "system" fn(*mut c_void, u32, u32, i32) =
+        unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(12))) };
+    unsafe { f(real, count, start, 0) };
 }
 
 /// Console index 8: `(pointer to a variable holding a view, ..)` -> `PSSetShaderResources(0, 1, views)`.
@@ -1424,6 +1475,11 @@ unsafe fn create_sanitized(
 
 unsafe extern "system" fn device_create_buffer(this: *mut c_void, desc: *const u32, init: *const c_void, out: *mut *mut c_void) -> HRESULT {
     // D3D11_BUFFER_DESC: 6 dwords, MiscFlags is the 5th. Desktop-valid: DRAWINDIRECT_ARGS, RAW_VIEWS, STRUCTURED.
+    static LOGS: AtomicU32 = AtomicU32::new(0);
+    if LOGS.fetch_add(1, Ordering::Relaxed) < 40 && !desc.is_null() {
+        let d = unsafe { std::slice::from_raw_parts(desc, 6) };
+        glog!("[gpu] CreateBuffer desc {:x?} initial data {:p}", d, init);
+    }
     unsafe { create_sanitized(this, 3, "CreateBuffer", desc, 6, 4, 0x10 | 0x20 | 0x40, init, out) }
 }
 
