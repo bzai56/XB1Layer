@@ -435,3 +435,10 @@ With `XB1_LOG_ALL=1` (Map/Unmap still forwarded), the same sequence repeats ever
 | 15 | 12 | `(0x600000000, 0, 0x76b40)` | draw (`edx` = 0; the high half is garbage) |
 
 Notes: indices 34, 35, 42, 43, 49, 52 are one slot behind the desktop table (constant shift from 32 on). No `VSSetShader` (11), `IASetPrimitiveTopology` or `PSSetShaderResources` shows up in the first three frames, so shaders, topology and texture views are bound by index 8, 19, 23 and the draw itself, with console-specific argument shapes. The 0x76b40 constant on 8 and 12 is the same register-base family as the PM4 bases. Next: disassemble `title+0x214c8d..0x214f28` to see how index 8's argument is built, and treat index 19's first argument as the index format.
+
+### Sonic Mania: console 8 and 19 identified
+
+- Console 8 (`+0x420`) is `PSSetShaderResources`: its first argument is the address of a variable holding a real `ID3D11ShaderResourceView` (confirmed by `QueryInterface`). Forwarded as `PSSetShaderResources(0, 1, views)`.
+- Console 19 (`+0x478`) is `IASetIndexBuffer`: the second argument is a real `ID3D11Buffer`, the first is a format enum (0 treated as R16_UINT). Forwarded with a DXGI format.
+- With those two bound the debug layer's remaining draw errors are only "no vertex shader bound" and "primitive topology 0". Console 12 is `DrawIndexed(count = edx, start = r8)` (the high half of `rdx` is junk, e.g. `0x60000001e` = 30 indices).
+- The vertex shader, input layout and topology are never set through any index seen in a frame (the per-frame set is 7, 8, 10, 12, 16, 18, 19, 23, 32, 34, 35, 42, 43, 49, 52). They must be bound in a call whose arguments hide them, probably index 23 `(0, <context>, &object)` or 10, whose `*a4` is a real D3D11 object that is not an SRV, PS, VS or buffer (a sampler or an input layout). Probing 7/16/18/23 together crashed the title (NULL execute), so probe them one at a time.

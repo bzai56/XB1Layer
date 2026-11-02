@@ -162,8 +162,8 @@ const EMBED_VERIFIED_SHIFTED: [usize; 5] = [34, 46, 49, 59, 63];
 /// one behind: 32 `OMSetRenderTargets(1,&rtv,dsv)`, 35 `OMSetDepthStencilState(state,1)`,
 /// 42 `RSSetState`, 43 `RSSetViewports(1,&vp)`; console 52 (offset +0x580) is
 /// `ClearDepthStencilView(dsv,3,..)` = desktop 53, so the shift is a constant one from 32 on.
-const EMBED_EXTRA: [(usize, usize); 9] =
-    [(10, 10), (12, 12), (16, 16), (18, 18), (32, 33), (35, 36), (42, 43), (43, 44), (52, 53)];
+const EMBED_EXTRA: [(usize, usize); 11] =
+    [(8, 8), (19, 19), (10, 10), (12, 12), (16, 16), (18, 18), (32, 33), (35, 36), (42, 43), (43, 44), (52, 53)];
 
 /// `(embedded index, entry)` pairs that forward to the real context. Built once.
 fn forwarded_entries() -> &'static Vec<(usize, usize)> {
@@ -202,6 +202,21 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
             v.push((index_of(EMBED_TABLE + console_slot * 8), thunk));
         }
         for (console_slot, desktop_slot) in EMBED_EXTRA.iter().copied().filter(|_| !log_all) {
+            if console_slot == 8 {
+                v.push((index_of(EMBED_TABLE + 8 * 8), ctx_ps_srv as usize));
+                continue;
+            }
+            let probe = match console_slot {
+                _ => None::<usize>,
+            };
+            if let Some(p) = probe {
+                v.push((index_of(EMBED_TABLE + console_slot * 8), p));
+                continue;
+            }
+            if console_slot == 19 {
+                v.push((index_of(EMBED_TABLE + 19 * 8), ctx_bind_object as usize));
+                continue;
+            }
             let thunk = forward_context_thunk(unsafe { thunks.add((128 + console_slot) * 32) }, desktop_slot);
             v.push((index_of(EMBED_TABLE + console_slot * 8), thunk));
         }
@@ -860,6 +875,121 @@ fn extend_object(obj: *mut c_void, real_slots: usize) {
     unsafe { *(obj as *mut usize) = ext };
 }
 
+/// `(object, creating device slot)` for shaders and input layouts, so a bind call can tell which
+/// kind of object it was handed (the console binds them all through one method).
+static CREATED_KINDS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+fn restore_object_vtable(obj: *mut c_void) {
+    if obj.is_null() || (obj as usize) % 8 != 0 {
+        return;
+    }
+    let current = unsafe { *(obj as *const usize) };
+    let map = EXTENDED_OBJECT_VTABLES.lock().unwrap();
+    if let Some((orig, _)) = map.iter().find(|(_, e)| *e == current) {
+        unsafe { *(obj as *mut usize) = *orig };
+    }
+}
+
+unsafe fn real_context(this: *mut c_void) -> *mut c_void {
+    unsafe { (*(this as *const Proxy)).real }
+}
+
+/// Console index 19 (called `(0, object, 0)` before each draw): binds a shader or an input layout.
+/// Dispatches on the creating device slot: 11 layout, 12 VS, 13 GS, 15 PS, 16 HS, 17 DS.
+unsafe extern "system" fn ctx_bind_object(this: *mut c_void, _a2: usize, obj: *mut c_void, _a4: usize) {
+    let kind = CREATED_KINDS.lock().unwrap().iter().rev().find(|(o, _)| *o == obj as usize).map(|(_, k)| *k);
+    static LOGS: AtomicU32 = AtomicU32::new(0);
+    if LOGS.fetch_add(1, Ordering::Relaxed) < 12 {
+        glog!("[gpu] bind object {obj:p} kind {kind:?} real {}", qi_kind(obj));
+    }
+    restore_object_vtable(obj);
+    let real = unsafe { real_context(this) };
+    let vt = unsafe { *(real as *const *const usize) };
+    // desktop slots: IASetInputLayout 17, VSSetShader 11, GSSetShader 23, PSSetShader 9
+    if kind.is_none() && qi_kind(obj) == "Buffer" {
+        // IASetIndexBuffer(buffer, DXGI_FORMAT_R16_UINT, 0): the first console argument is a format enum
+        let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32) = unsafe { std::mem::transmute(*vt.add(19)) };
+        unsafe { f(real, obj, if _a2 == 0 { 57 } else { 42 }, 0) };
+        return;
+    }
+    let slot = match kind {
+        Some(11) => 17,
+        Some(12) => 11,
+        Some(13) => 23,
+        Some(15) => 9,
+        _ => return,
+    };
+    if slot == 17 {
+        let f: unsafe extern "system" fn(*mut c_void, *mut c_void) = unsafe { std::mem::transmute(*vt.add(17)) };
+        unsafe { f(real, obj) };
+    } else {
+        let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, u32) = unsafe { std::mem::transmute(*vt.add(slot)) };
+        unsafe { f(real, obj, ptr::null(), 0) };
+        if slot == 11 {
+            // the draw follows: topology is a console-side draw argument, use triangle list
+            let t: unsafe extern "system" fn(*mut c_void, u32) = unsafe { std::mem::transmute(*vt.add(24)) };
+            unsafe { t(real, 4) };
+        }
+    }
+}
+
+/// Asks a real D3D11 object which interface it is (logging aid for the console's merged bind calls).
+fn qi_kind(obj: *mut c_void) -> &'static str {
+    if obj.is_null() || (obj as usize) % 8 != 0 {
+        return "null";
+    }
+    let iids: [(&str, [u8; 16]); 4] = [
+        ("SRV", [0xe0, 0x6f, 0xe0, 0xb0, 0x92, 0x81, 0x1a, 0x4e, 0xb1, 0xca, 0x36, 0xd7, 0x41, 0x47, 0x10, 0xb2]),
+        ("PS", [0x0d, 0xe4, 0x82, 0xea, 0xdc, 0x51, 0x33, 0x4f, 0x93, 0xd4, 0xdb, 0x7c, 0x91, 0x25, 0xae, 0x8c]),
+        ("VS", [0x64, 0x1d, 0x30, 0x3b, 0x78, 0xd6, 0x89, 0x42, 0x88, 0x97, 0x22, 0xf8, 0x92, 0x8b, 0x72, 0xf3]),
+        ("Buffer", [0x85, 0x0b, 0x57, 0x48, 0xee, 0xd1, 0xcd, 0x4f, 0xa2, 0x50, 0xeb, 0x35, 0x07, 0x22, 0xb0, 0x37]),
+    ];
+    for (name, iid) in iids {
+        let vt = unsafe { *(obj as *const *const usize) };
+        let qi: unsafe extern "system" fn(*mut c_void, *const u8, *mut *mut c_void) -> i32 = unsafe { std::mem::transmute(*vt) };
+        let mut out = ptr::null_mut();
+        if unsafe { qi(obj, iid.as_ptr(), &mut out) } >= 0 {
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { std::mem::transmute(*((*(out as *const *const usize)).add(2))) };
+            unsafe { rel(out) };
+            return name;
+        }
+    }
+    "other"
+}
+
+/// Logging probe: what kind of object does `*a4` (or `*a3`) point to, then forward as desktop slot `DESK`
+/// (0 = do not forward).
+unsafe extern "system" fn ctx_probe<const IDX: usize, const DESK: usize>(this: *mut c_void, a2: usize, a3: usize, a4: usize) {
+    static LOGS: AtomicU32 = AtomicU32::new(0);
+    let deref = |p: usize| if p > 0x10000 && p % 8 == 0 { unsafe { *(p as *const *mut c_void) } } else { ptr::null_mut() };
+    if LOGS.fetch_add(1, Ordering::Relaxed) < 3 {
+        glog!("[gpu] probe console {IDX}: *a3 is {}, *a4 is {}", qi_kind(deref(a3)), qi_kind(deref(a4)));
+    }
+    if DESK == 0 {
+        return;
+    }
+    let real = unsafe { real_context(this) };
+    let f: unsafe extern "system" fn(*mut c_void, usize, usize, usize) =
+        unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(DESK))) };
+    unsafe { f(real, a2, a3, a4) };
+}
+
+/// Console index 8: `(pointer to a variable holding a view, ..)` -> `PSSetShaderResources(0, 1, views)`.
+unsafe extern "system" fn ctx_ps_srv(this: *mut c_void, views: *const *mut c_void) {
+    if views.is_null() || (views as usize) % 8 != 0 {
+        return;
+    }
+    static LOGS: AtomicU32 = AtomicU32::new(0);
+    if LOGS.fetch_add(1, Ordering::Relaxed) < 6 {
+        glog!("[gpu] console 8 object {:p} is {}", unsafe { *views }, qi_kind(unsafe { *views }));
+    }
+    restore_object_vtable(unsafe { *views });
+    let real = unsafe { real_context(this) };
+    let f: unsafe extern "system" fn(*mut c_void, u32, u32, *const *mut c_void) =
+        unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(8))) };
+    unsafe { f(real, 0, 1, views) };
+}
+
 /// Device slot -> (index of the out-pointer among the arguments after `this`, real vtable slots of
 /// the created object).
 const EXTENDED_CREATORS: [(usize, usize, usize); 14] = [
@@ -896,6 +1026,7 @@ unsafe extern "system" fn device_create_extended<const SLOT: usize>(this: *mut c
             let out = args[out_index - 1] as *mut *mut c_void;
             if !out.is_null() && (out as usize) % 8 == 0 {
                 extend_object(unsafe { *out }, *real_slots);
+                CREATED_KINDS.lock().unwrap().push((unsafe { *out } as usize, SLOT));
             }
         }
     }
