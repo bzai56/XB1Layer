@@ -394,3 +394,7 @@ So the mapping has to be built per index from the arguments of real calls, and S
 - With the explicit table (`EMBED_EXTRA` in `src/gpu.rs`: 8→9, 10, 12, 16, 18, 19, 32→33, 35→36, 42→43, 43→44, 52→53) every context function Sonic calls now forwards to the desktop context.
 - Result: the window is no longer black in most runs but shows a solid white frame (one run stayed black). Not yet known whether the white is a real game screen or a bad shader/texture binding (no shader resource view is bound: console index 8 is `PSSetShader`, so how textures are bound is still unidentified).
 - Screen capture of the flip-model window needs it in the foreground; `PrintWindow` returns black.
+
+### Sonic Mania: console indices 8 and 19 are not what the desktop names suggest
+
+With `XB1_D3D_DEBUG=1`: forwarding console 8 as `PSSetShader` gives "First parameter is corrupt", and console 19 as `IASetIndexBuffer(buf, fmt, 0)` receives a pointer where the DXGI format should be (`0x1c02d575970`). Wrapping them (restoring the shader's desktop vtable, sanitising the format) ended in a NULL execute, so that attempt was reverted. These two (and the missing method between console 24 and 31) are likely the texture/shader binding that keeps the frame white: identify them from the raw arguments before forwarding.
