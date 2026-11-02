@@ -743,6 +743,12 @@ struct GenericObj {
 
 unsafe extern "system" fn generic_qi(this: *mut c_void, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
     let o = unsafe { &*(this as *const GenericObj) };
+    if o.class.contains("Controllers (element") {
+        static ELEM_QI: AtomicU32 = AtomicU32::new(0);
+        if ELEM_QI.fetch_add(1, Ordering::Relaxed) < 200 {
+            wlog!("[winrt] element QueryInterface({:?})", unsafe { *iid });
+        }
+    }
     wlog_rare!("[winrt] {}::QueryInterface({:?}) -> self", o.class, unsafe { *iid });
     o.refs.fetch_add(1, Ordering::AcqRel);
     unsafe { *out = this };
