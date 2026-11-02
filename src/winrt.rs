@@ -1284,6 +1284,16 @@ unsafe fn fill_gamepad_reading(out: *mut u8) {
             if !LOGGED.swap(true, Ordering::Relaxed) {
                 wlog!("[winrt] joystick {id} found through winmm (assumed DualSense/DualShock layout)");
             }
+            // XB1_INPUT_LOG=1 prints the raw state whenever it changes, to map an unknown pad.
+            if std::env::var_os("XB1_INPUT_LOG").is_some() {
+                static LAST: std::sync::Mutex<[u32; 8]> = std::sync::Mutex::new([0; 8]);
+                let now = [j.x, j.y, j.z, j.r, j.u, j.v, j.buttons, j.pov];
+                let mut last = LAST.lock().unwrap();
+                if *last != now {
+                    wlog!("[input] joystick {id}: x {} y {} z {} r {} u {} v {} buttons {:#x} pov {}", j.x, j.y, j.z, j.r, j.u, j.v, j.buttons, j.pov);
+                    *last = now;
+                }
+            }
             let bmap = [(1u32, 16u32), (2, 32), (0, 64), (3, 128), (4, 4096), (5, 8192), (9, 4), (8, 8), (10, 16384), (11, 32768)];
             for (b, bit) in bmap {
                 if j.buttons & (1 << b) != 0 {
