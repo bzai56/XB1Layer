@@ -493,3 +493,17 @@ Sonic Mania (1.0.4.2, unpacked) now boots under the layer and runs through its i
 ### Frame pacing
 
 Titles are written for the console's 60 Hz output (sync interval 1 = 60 frames a second), but a desktop vsync only paces to the monitor, so Sonic Mania ran too fast on a faster display. `limit_frame_rate` (src/display.rs, after every `Present1`) now sleeps to the next 1/60 s slot (coarse sleep, then a short spin); measured 60 to 62 frames per second over 5 seconds. `XB1_FPS=<n>` sets another rate, `XB1_FPS=0` turns the limit off.
+
+### Input works: the `GamepadReading` layout
+
+The title's per-frame poll (`title+0x254e30`) queries the controller element for the gamepad interface, calls slot 6 (`get_Id`, a UINT64 hashed with xor of its halves and compared with the stored id), zeroes 36 bytes on its stack, calls slot 8 (`GetCurrentReading(GamepadReading*)`) and reads the struct directly:
+
+| offset | field |
+|---|---|
+| 0x00 | timestamp (u64) |
+| 0x08 | buttons (u32): Menu 4, View 8, A 16, B 32, X 64, Y 128, DPad up 256, down 512, left 1024, right 2048, left shoulder 4096, right shoulder 8192, left thumbstick 16384, right thumbstick 32768 |
+| 0x0C / 0x10 | left / right trigger (f32, 0..1) |
+| 0x14 / 0x18 | left stick x / y (f32, -1..1) |
+| 0x1C / 0x20 | right stick x / y (f32) |
+
+`fill_gamepad_reading` (src/winrt.rs) fills it from the first XInput pad and, while the layer's window has the focus, the keyboard: arrows = d-pad, Z / X / A / S = A / B / X / Y, Enter = Menu, Backspace = View, Q / W = shoulders. One stand-in controller is now always present (`XB1_NO_GAMEPAD=1` removes it). Confirmed by the user playing with the keyboard.

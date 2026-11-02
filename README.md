@@ -7,7 +7,7 @@ An experimental compatibility layer for running Xbox One (GDK/XDK "Durango") x64
 **Status: early prototype. Sonic Mania plays its intro and logo sequence with picture and sound; the game is playable.** It loads and starts unpacked Xbox One titles and runs them through startup into their main loop. Sonic Mania runs, presents every frame to a native window and plays sound, and the window shows the game. Forza Horizon 3 boots into its main loop but never presents. The goal is a layer that runs titles without graphical glitches; it is not there.
 
 ## What works
-- **Sonic Mania boots and runs**: it starts, plays its intro, logo sequence and menus with picture (desktop D3D11 through the layer's proxy device) and sound (XAudio2) in a native window. No input yet, so it cannot be played.
+- **Sonic Mania boots and runs**: it starts, plays its intro, logo sequence and menus with picture (desktop D3D11 through the layer's proxy device) and sound (XAudio2) in a native window. Input works: an XInput gamepad, or the keyboard (arrows, Z/X/A/S = A/B/X/Y, Enter = Menu, Backspace = View, Q/W = shoulders) while the window has focus.
 - Manual PE64 mapping (headers, sections, base relocations)
 - Import resolution against real Windows DLLs
 - Logging stubs for unresolved imports (console-only DLLs such as `d3d11_x.dll`, `xg_x.dll`)

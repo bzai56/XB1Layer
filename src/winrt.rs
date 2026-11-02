@@ -743,7 +743,19 @@ struct GenericObj {
 
 unsafe extern "system" fn generic_qi(this: *mut c_void, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
     let o = unsafe { &*(this as *const GenericObj) };
-    wlog!("[winrt] {}::QueryInterface({:?}) -> self", o.class, unsafe { *iid });
+    wlog_rare!("[winrt] {}::QueryInterface({:?}) -> self", o.class, unsafe { *iid });
+    if unsafe { *iid } == GUID::from_u128(0x9776FF56_9BFD_4581_AD45_B645BBA526D6) {
+        // Where the title polls its gamepad: log the caller's offsets in the title image.
+        static LOGS: AtomicU32 = AtomicU32::new(0);
+        if LOGS.fetch_add(1, Ordering::Relaxed) < 2 {
+            unsafe extern "system" { fn RtlCaptureStackBackTrace(skip: u32, count: u32, frames: *mut *mut c_void, hash: *mut u32) -> u16; }
+            let mut frames = [ptr::null_mut::<c_void>(); 6];
+            let n = unsafe { RtlCaptureStackBackTrace(0, 6, frames.as_mut_ptr(), ptr::null_mut()) } as usize;
+            let base = crate::IMG_BASE.load(Ordering::Relaxed);
+            let rvas: Vec<String> = frames[..n].iter().map(|f| format!("{:#x}", (*f as usize).wrapping_sub(base))).collect();
+            wlog!("[winrt] gamepad QueryInterface called from title+{rvas:?}");
+        }
+    }
     o.refs.fetch_add(1, Ordering::AcqRel);
     unsafe { *out = this };
     HRESULT(0)
@@ -951,7 +963,7 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
     // `Controller` statics slot 6 is the controller list, an IVectorView<IController> (the title
     // calls `get_Size` and `GetAt(index, &out)` on it). Empty for now: no controllers connected.
     if (o.class == "Windows.Xbox.Input.Controller" || o.class == "Windows.Xbox.Input.Gamepad") && N == 6 && is_writable(arg1) {
-        let count = if std::env::var_os("XB1_GAMEPAD").is_some() { 1 } else { 0 };
+        let count = if std::env::var_os("XB1_NO_GAMEPAD").is_some() { 0 } else { 1 };
         let list = create_vector_view("Windows.Xbox.Input.Controller.Controllers", &o.iid, count);
         unsafe { *(arg1 as *mut *mut c_void) = list };
         wlog!("[winrt] {} slot 6 (Controllers) -> an empty vector view", o.class);
@@ -1020,11 +1032,11 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         wlog!("[winrt] controller slot 6 -> the shared user element");
         return HRESULT(0);
     }
-    // Slot 8 on a controller element is polled every frame with an out-pointer and nothing is ever
-    // called on what it returns, so it is probably `get_Id` (a UINT64): a stable id.
+    // Slot 8 on the gamepad interface is `GetCurrentReading(GamepadReading* out)`: a 36-byte struct
+    // (timestamp u64, buttons u32, left and right trigger f32, left and right stick x/y f32), decoded
+    // from the title's poll at title+0x254e30 (it zeroes the struct, calls slot 8, then reads it).
     if o.class.starts_with("Windows.Xbox.Input.Controller.Controllers (element") && !o.class.contains('#') && N == 8 && is_writable(arg1) {
-        unsafe { ptr::write_unaligned(arg1 as *mut u64, 1) };
-        wlog_rare!("[winrt] controller slot 8 -> id 1");
+        unsafe { fill_gamepad_reading(arg1 as *mut u8) };
         return HRESULT(0);
     }
     if is_writable(arg1) {
@@ -1160,6 +1172,72 @@ fn vector_view_vtbl() -> *const usize {
 /// A vector-view stand-in holding `size` generic elements. The size is stored in `kind` (kinds 0
 /// to 2 are taken by the other generic objects, so the vtable, not the kind, selects behavior).
 /// The one signed-in user element (see `vector_view_get_at`).
+/// Fills a `GamepadReading` from the first XInput pad and, while the layer's window has the focus,
+/// the keyboard (arrows = d-pad, Z/X/A/S = A/B/X/Y, Enter = Menu, Backspace = View, Q/W = shoulders).
+unsafe fn fill_gamepad_reading(out: *mut u8) {
+    #[repr(C)]
+    #[derive(Default)]
+    struct XInputState {
+        packet: u32,
+        buttons: u16,
+        lt: u8,
+        rt: u8,
+        lx: i16,
+        ly: i16,
+        rx: i16,
+        ry: i16,
+    }
+    unsafe extern "system" {
+        fn LoadLibraryA(name: *const u8) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+        fn GetAsyncKeyState(key: i32) -> i16;
+        fn GetForegroundWindow() -> *mut c_void;
+        fn GetWindowThreadProcessId(window: *mut c_void, pid: *mut u32) -> u32;
+        fn GetCurrentProcessId() -> u32;
+    }
+    static XINPUT: OnceLock<usize> = OnceLock::new();
+    static STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let get_state = *XINPUT.get_or_init(|| unsafe {
+        let m = LoadLibraryA(b"xinput1_4.dll ".as_ptr());
+        if m.is_null() { 0 } else { GetProcAddress(m, b"XInputGetState ".as_ptr()) as usize }
+    });
+    let mut pad = XInputState::default();
+    if get_state != 0 {
+        let f: unsafe extern "system" fn(u32, *mut XInputState) -> u32 = unsafe { std::mem::transmute(get_state) };
+        if unsafe { f(0, &mut pad) } != 0 {
+            pad = XInputState::default();
+        }
+    }
+    // XInput button bit -> GamepadButtons bit (Menu 4, View 8, A 16, B 32, X 64, Y 128, DPad up 256,
+    // down 512, left 1024, right 2048, shoulders 4096/8192, thumbsticks 16384/32768).
+    let map = [(0x10u16, 4u32), (0x20, 8), (0x1000, 16), (0x2000, 32), (0x4000, 64), (0x8000, 128), (1, 256), (2, 512), (4, 1024), (8, 2048), (0x100, 4096), (0x200, 8192), (0x40, 16384), (0x80, 32768)];
+    let mut buttons = 0u32;
+    for (x, bit) in map {
+        if pad.buttons & x != 0 {
+            buttons |= bit;
+        }
+    }
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut pid) };
+    if pid == unsafe { GetCurrentProcessId() } {
+        let keys = [(0x0Du8 as i32, 4u32), (0x08, 8), (b'Z' as i32, 16), (b'X' as i32, 32), (b'A' as i32, 64), (b'S' as i32, 128), (0x26, 256), (0x28, 512), (0x25, 1024), (0x27, 2048), (b'Q' as i32, 4096), (b'W' as i32, 8192)];
+        for (key, bit) in keys {
+            if unsafe { GetAsyncKeyState(key) } < 0 {
+                buttons |= bit;
+            }
+        }
+    }
+    let axis = |v: i16| (v as f32 / 32768.0).clamp(-1.0, 1.0);
+    let r: [f32; 6] = [pad.lt as f32 / 255.0, pad.rt as f32 / 255.0, axis(pad.lx), axis(pad.ly), axis(pad.rx), axis(pad.ry)];
+    unsafe {
+        ptr::write_unaligned(out as *mut u64, STAMP.fetch_add(16_667, Ordering::Relaxed));
+        ptr::write_unaligned(out.add(8) as *mut u32, buttons);
+        for (i, v) in r.iter().enumerate() {
+            ptr::write_unaligned(out.add(12 + i * 4) as *mut f32, *v);
+        }
+    }
+}
+
 fn shared_user() -> *mut c_void {
     static USER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let mut u = USER.load(Ordering::Acquire);

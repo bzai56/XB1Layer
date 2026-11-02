@@ -6,7 +6,7 @@ The goal is a layer that runs many Xbox One titles on Windows x64 without graphi
 
 ## Next up: Sonic Mania (in order)
 
-1. **Input for Sonic Mania.** The intro, logos and menus render; next make it playable: a gamepad (the `Windows.Xbox.Input.Controller` list is still empty) and keyboard mapped to console input.
+1. **Play through and hunt glitches.** Input works (XInput pad or keyboard); play the whole game and compare every screen with the original.
 2. **Hunt glitches.** Compare with the expected output, fix formats, blending, sampling and de-tiling that look wrong.
 3. **Later screens.** Play through to gameplay and check textures, blending and the 16-bit screen format on every screen.
 
