@@ -179,7 +179,7 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
             // Only indices with direct evidence forward: 11 and 23 (SetShader with NULL), 14 and 15
             // (Map/Unmap). Index 8 was assumed to be PSSetShaderResources and is called as
             // (pointer, 0, 0x76b40), so the console table is not a plain copy of the desktop one.
-            if slot > 3 && (log_all || !EMBED_VERIFIED.contains(&slot)) {
+            if slot > 3 && ((log_all && slot != 14 && slot != 15) || !EMBED_VERIFIED.contains(&slot)) {
                 continue;
             }
             let entry = match slot {

@@ -411,3 +411,27 @@ With `XB1_D3D_DEBUG=1`: forwarding console 8 as `PSSetShader` gives "First param
 The first bytes of every `CreateVertexShader`/`CreatePixelShader` bytecode are `DXBC`, and the desktop device creates them (`hr=0`). No GCN translator is needed for this title; the problem is only how the console binds them. Experiment: treating console 8 as `PSSetShader(*(a2))` made the debug layer accept a shader but report garbage class-instance counts, and the following draws had no vertex shader bound and primitive topology 0, then the title crashed (read of 0, execute of 0). So the shader/topology binding calls (console 8, 11 with real arguments, the topology call near 23 to 25) take arguments shaped differently from the desktop ones. The next step is to log the raw arguments of every index from 0 to 63 during the first frame (not only the unmapped ones) and decode them against the title's disassembly around `title+0x214b47` and `title+0x214cbd`.
 
 `XB1_LOG_ALL=1` (src/gpu.rs) keeps only slots 0 to 3 of the embedded context table and logs every other index with its raw arguments. First attempt: Sonic then crashes with a NULL execute early (an index the title needs to return a result, probably Map/Unmap 14 and 15, now returns nothing), so the knob needs 14 and 15 kept forwarded before it yields the full first-frame call list.
+
+### Sonic Mania: one frame of embedded context calls (decoded)
+
+With `XB1_LOG_ALL=1` (Map/Unmap still forwarded), the same sequence repeats every frame. Index = (offset - 0x3E0) / 8; `*` = argument is a pointer to a variable holding the object.
+
+| order | index | arguments | meaning |
+|---|---|---|---|
+| 1 | 32 | `(1, *rtv, dsv)` | `OMSetRenderTargets` |
+| 2 | 43 | `(1, *viewport)` | `RSSetViewports` |
+| 3 | 49 | `(rtv, color*)` | `ClearRenderTargetView` |
+| 4 | 52 | `(dsv, 3, ..)` | `ClearDepthStencilView` |
+| 5 | 42 | `(state)` | `RSSetState` |
+| 6 | 35 | `(state, 1)` | `OMSetDepthStencilState` |
+| 7 | 34 | `(state, NULL, 0xFFFFFFFF)` | `OMSetBlendState` |
+| 8 | 10 | `(0, 1, *sampler)` | `PSSetSamplers` |
+| 9 | 23 | `(0, this, *sampler)` | unknown (arguments look shifted by one) |
+| 10 | 18 | `(0, 1, *buffer)` | `IASetVertexBuffers` |
+| 11 | 19 | `(0, buffer, 0)` | index buffer: the first argument is `0`, the buffer is the second (a console format enum before the buffer, not a DXGI format after it) |
+| 12 | 7 | `(0, 1, *cb)` | `VSSetConstantBuffers` |
+| 13 | 16 | `(0, 1, *cb)` | `PSSetConstantBuffers` |
+| 14 | 8 | `(*obj, 0, 0x76b40)` | shader or resource bind, object passed by address |
+| 15 | 12 | `(0x600000000, 0, 0x76b40)` | draw (`edx` = 0; the high half is garbage) |
+
+Notes: indices 34, 35, 42, 43, 49, 52 are one slot behind the desktop table (constant shift from 32 on). No `VSSetShader` (11), `IASetPrimitiveTopology` or `PSSetShaderResources` shows up in the first three frames, so shaders, topology and texture views are bound by index 8, 19, 23 and the draw itself, with console-specific argument shapes. The 0x76b40 constant on 8 and 12 is the same register-base family as the PM4 bases. Next: disassemble `title+0x214c8d..0x214f28` to see how index 8's argument is built, and treat index 19's first argument as the index format.
