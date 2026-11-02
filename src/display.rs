@@ -207,6 +207,9 @@ unsafe extern "system" fn create_for_core_window(this: *mut c_void, device: *mut
         let vt = if sc.is_null() { 0 } else { unsafe { *(sc as *const usize) } };
         eprintln!("[display] swap chain object {sc:p}, vtable {vt:#x}");
         unsafe { patch_present1(sc) };
+        if crate::VCCORLIB110.load(std::sync::atomic::Ordering::Relaxed) {
+            unsafe { *out = crate::gpu::wrap_dxgi(sc, false) };
+        }
     }
     hr
 }

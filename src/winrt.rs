@@ -1540,7 +1540,7 @@ pub fn try_activation_factory(class: &str, iid: &GUID, out: *mut *mut c_void) ->
     }
     // `Package.Current` fails in a process without package identity (this one), but the title
     // reads it at startup (IPackageStatics slot 6), so it gets a logging stand-in.
-    if class == "Windows.ApplicationModel.Package" {
+    if class == "Windows.ApplicationModel.Package" || class == "Windows.ApplicationModel.Store.CurrentApp" {
         unsafe { *out = create_generic(class, iid) };
         wlog!("[winrt] generic stand-in for {class} (iid {iid:?})");
         return Some(HRESULT(0));

@@ -1191,6 +1191,13 @@ static CONTENT_DRIVE: Mutex<Option<Vec<u16>>> = Mutex::new(None);
 /// from `g:\media\...` (the console's content drive). An existing `G:` is left alone.
 fn map_content_drive(dir: &Path) {
     use std::os::windows::ffi::OsStrExt;
+    // A bare file name has an empty parent: use the full path of the current folder then.
+    let dir = &if dir.as_os_str().is_empty() {
+        std::env::current_dir().unwrap_or_default()
+    } else {
+        let full = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        std::path::PathBuf::from(full.display().to_string().trim_start_matches(r"\\?\"))
+    };
     let name: Vec<u16> = vec![b'G' as u16, b':' as u16, 0];
     let mut buf = [0u16; 512];
     let got = unsafe { QueryDosDeviceW(name.as_ptr(), buf.as_mut_ptr(), 512) } as usize;
@@ -1210,7 +1217,7 @@ fn map_content_drive(dir: &Path) {
         println!("mapped G: to {}", dir.display());
         *CONTENT_DRIVE.lock().unwrap() = Some(target);
     } else {
-        println!("could not map G: to the title folder");
+        println!("could not map G: to {} (error {})", dir.display(), unsafe { GetLastError() });
     }
 }
 
@@ -1705,9 +1712,15 @@ extern "system" fn xb_get_proc_address(module: *mut c_void, name: *const i8) -> 
     p
 }
 
+/// Set when the title links the Visual C++ 2012 runtime (`vccorlib110`) instead of the 2015+ one.
+static VCCORLIB110: AtomicBool = AtomicBool::new(false);
+
 /// Imports we implement ourselves instead of forwarding to Windows.
 fn override_for(dll: &str, func: &str) -> Option<usize> {
-    if dll.eq_ignore_ascii_case("vccorlib140.dll") && func.starts_with("?GetActivationFactoryByPCWSTR") {
+    if (dll.eq_ignore_ascii_case("vccorlib140.dll") || dll.eq_ignore_ascii_case("vccorlib110.dll")) && func.starts_with("?GetActivationFactoryByPCWSTR") {
+        if dll.eq_ignore_ascii_case("vccorlib110.dll") {
+            VCCORLIB110.store(true, Ordering::Relaxed);
+        }
         return Some(xb_get_activation_factory as usize);
     }
     if dll.eq_ignore_ascii_case("d3d11_x.dll") && func == "D3D11XCreateDeviceX" {
@@ -1938,7 +1951,7 @@ extern "system" fn xb_get_activation_factory(name: *const u16, guid: *const u8, 
         }
     }
     let real: extern "system" fn(*const u16, *const u8, *mut *mut c_void) -> i32 = unsafe {
-        let m = LoadLibraryA(c"vccorlib140.dll".as_ptr());
+        let m = LoadLibraryA(if VCCORLIB110.load(Ordering::Relaxed) { c"vccorlib110.dll".as_ptr() } else { c"vccorlib140.dll".as_ptr() });
         std::mem::transmute(GetProcAddress(m, c"?GetActivationFactoryByPCWSTR@@YAJPEAXAEAVGuid@Platform@@PEAPEAX@Z".as_ptr()))
     };
     let hr = real(name, guid, out);

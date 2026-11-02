@@ -540,7 +540,7 @@ unsafe extern "system" fn proxy_qi(this: *mut c_void, iid: *const GUID, out: *mu
             p.refs.fetch_add(1, Ordering::AcqRel);
             unsafe { *out = this };
         } else {
-            unsafe { *out = real_out };
+            unsafe { *out = if iid == IID_IDXGI_DEVICE1 && crate::VCCORLIB110.load(Ordering::Relaxed) { wrap_dxgi(real_out, true) } else { real_out } };
         }
         return HRESULT(0);
     }
@@ -2018,4 +2018,55 @@ pub extern "system" fn create_device_x(params: *const u8, out_device: *mut *mut 
             e.code().0
         }
     }
+}
+
+/// `IDXGIDevice1`. The older console DXGI interfaces have one more method than the desktop's,
+/// ahead of `GetParent`: Minecraft calls `GetAdapter(&out)` through vtable slot 8 of the device
+/// (desktop 7; desktop slot 8 is `CreateSurface`, which answers `DXGI_ERROR_INVALID_CALL`) and
+/// `GetParent(iid, &out)` through slot 7 of the adapter (desktop 6). So DXGI objects handed to the
+/// title are wrapped: console slot n from 7 on forwards to desktop slot n - 1, and the objects
+/// returned by `GetAdapter` / `GetParent` are wrapped the same way.
+const IID_IDXGI_DEVICE1: GUID = GUID::from_u128(0x77db970f_6276_48ba_ba28_070143b4392c);
+
+/// Layout of a wrapper: `[vtable, real object]`.
+fn real_of(wrapper: *mut c_void) -> *mut c_void {
+    unsafe { *((wrapper as *const usize).add(1)) as *mut c_void }
+}
+
+unsafe extern "system" fn dxgi_get_parent_wrapped(this: *mut c_void, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    let real = real_of(this);
+    let f: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(6))) };
+    let hr = unsafe { f(real, iid, out) };
+    if hr.0 == 0 {
+        unsafe { *out = wrap_dxgi(*out, false) };
+    }
+    hr
+}
+
+unsafe extern "system" fn dxgi_get_adapter_wrapped(this: *mut c_void, out: *mut *mut c_void) -> HRESULT {
+    let real = real_of(this);
+    let f: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(7))) };
+    let hr = unsafe { f(real, out) };
+    if hr.0 == 0 {
+        unsafe { *out = wrap_dxgi(*out, false) };
+    }
+    hr
+}
+
+pub fn wrap_dxgi(real: *mut c_void, device: bool) -> *mut c_void {
+    const SLOTS: usize = 40;
+    let thunks = unsafe { VirtualAlloc(ptr::null_mut(), 4096 * 2, 0x3000, 0x40) } as *mut u8;
+    assert!(!thunks.is_null(), "thunk allocation failed");
+    let vtbl: &'static mut [usize; SLOTS] = Box::leak(Box::new([0usize; SLOTS]));
+    for (s, entry) in vtbl.iter_mut().enumerate() {
+        let desktop = if s >= 7 { s - 1 } else { s };
+        *entry = forward_thunk(unsafe { thunks.add(s * 32) }, desktop);
+    }
+    vtbl[7] = dxgi_get_parent_wrapped as usize;
+    if device {
+        vtbl[8] = dxgi_get_adapter_wrapped as usize;
+    }
+    let obj: &'static mut [usize; 2] = Box::leak(Box::new([vtbl.as_ptr() as usize, real as usize]));
+    glog!("[gpu] DXGI object {real:p} wrapped (device: {device}): console slots 7 and up are desktop n - 1");
+    obj.as_mut_ptr() as *mut c_void
 }

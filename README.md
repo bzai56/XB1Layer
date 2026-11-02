@@ -18,7 +18,7 @@ An experimental compatibility layer for running Xbox One (GDK/XDK "Durango") x64
 
 ## What does not work
 - **Forza Horizon 3 kiosk demo** (retired): booted into its main loop but never drew or presented. It writes AMD PM4 command packets that nothing decodes, uses placed textures with console tiling that is not de-tiled, and its D3D11X present path (`DXGIXPresentArray`, `DXGIXSetVLineNotification`) is still a logging stub.
-- **Other titles**: untested. Console context-table indices 23 and 24 to 31 are unidentified, and anything not evidenced by a logged call only logs.
+- **Minecraft Xbox One Edition (1.2.0.0)**: boots to window, device and swap chain creation, then fails on the older console D3D11/DXGI interface layout (see FINDINGS). **Other titles**: untested. Console context-table indices 23 and 24 to 31 are unidentified, and anything not evidenced by a logged call only logs.
 - D3D12.X titles are not supported.
 
 ## Build and run
