@@ -214,6 +214,10 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
                 v.push((index_of(EMBED_TABLE + console_slot * 8), p));
                 continue;
             }
+            if console_slot == 43 {
+                v.push((index_of(EMBED_TABLE + 43 * 8), ctx_viewports as usize));
+                continue;
+            }
             if console_slot == 12 {
                 v.push((index_of(EMBED_TABLE + 12 * 8), ctx_draw_indexed as usize));
                 continue;
@@ -1037,6 +1041,19 @@ unsafe extern "system" fn ctx_draw_indexed(this: *mut c_void, count: u32, start:
     unsafe { f(real, count, start, 0) };
 }
 
+/// Console index 43: `RSSetViewports(count, viewports)`; the first calls log the rectangles.
+unsafe extern "system" fn ctx_viewports(this: *mut c_void, count: u32, vp: *const f32) {
+    static LOGS: AtomicU32 = AtomicU32::new(0);
+    if LOGS.fetch_add(1, Ordering::Relaxed) < 6 && !vp.is_null() && count >= 1 {
+        let v = unsafe { std::slice::from_raw_parts(vp, 6) };
+        glog!("[gpu] RSSetViewports({count}): x {} y {} w {} h {} depth {}..{}", v[0], v[1], v[2], v[3], v[4], v[5]);
+    }
+    let real = unsafe { real_context(this) };
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const f32) =
+        unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(44))) };
+    unsafe { f(real, count, vp) };
+}
+
 /// Console index 8: `(pointer to a variable holding a view, ..)` -> `PSSetShaderResources(0, 1, views)`.
 unsafe extern "system" fn ctx_ps_srv(this: *mut c_void, views: *const *mut c_void) {
     if views.is_null() || (views as usize) % 8 != 0 {
@@ -1045,6 +1062,19 @@ unsafe extern "system" fn ctx_ps_srv(this: *mut c_void, views: *const *mut c_voi
     static LOGS: AtomicU32 = AtomicU32::new(0);
     if LOGS.fetch_add(1, Ordering::Relaxed) < 6 {
         glog!("[gpu] console 8 object {:p} is {}", unsafe { *views }, qi_kind(unsafe { *views }));
+        // SRV::GetResource (slot 7), then Texture2D::GetDesc (slot 10): [width, height, mips, array, format, ...]
+        let srv = unsafe { *views };
+        let vt = unsafe { *(srv as *const *const usize) };
+        let get_res: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = unsafe { std::mem::transmute(*vt.add(7)) };
+        let mut res = ptr::null_mut();
+        unsafe { get_res(srv, &mut res) };
+        if !res.is_null() {
+            let mut d = [0u32; 11];
+            let rvt = unsafe { *(res as *const *const usize) };
+            let gd: unsafe extern "system" fn(*mut c_void, *mut u32) = unsafe { std::mem::transmute(*rvt.add(10)) };
+            unsafe { gd(res, d.as_mut_ptr()) };
+            glog!("[gpu]   its texture desc {:x?}", d);
+        }
     }
     restore_object_vtable(unsafe { *views });
     let real = unsafe { real_context(this) };
