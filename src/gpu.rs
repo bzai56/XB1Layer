@@ -175,6 +175,17 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
         assert!(!thunks.is_null(), "thunk allocation failed");
         let mut v = Vec::new();
         let index_of = |offset: usize| (offset - EMBED_BASE) / 8;
+        // Titles of the older XDK (Visual C++ 2012 runtime) have another embedded table: it is two
+        // slots behind the desktop one at the indices seen so far. Only evidenced indices forward.
+        if crate::VCCORLIB110.load(Ordering::Relaxed) {
+            if !log_all {
+                for (console_slot, desktop_slot) in OLD_SDK_EXTRA.iter().copied() {
+                    let thunk = forward_context_thunk(unsafe { thunks.add((128 + console_slot) * 32) }, desktop_slot);
+                    v.push((index_of(EMBED_TABLE + console_slot * 8), thunk));
+                }
+            }
+            return v;
+        }
         for slot in 0..=EMBED_FORWARD_MAX {
             // Only indices with direct evidence forward: 11 and 23 (SetShader with NULL), 14 and 15
             // (Map/Unmap). Index 8 was assumed to be PSSetShaderResources and is called as
@@ -523,6 +534,7 @@ fn is_d3d11_family(iid: &GUID, kind: Kind) -> bool {
 unsafe extern "system" fn proxy_qi(this: *mut c_void, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
     let p = unsafe { &*(this as *const Proxy) };
     let iid = unsafe { *iid };
+    glog!("[gpu] {}: QueryInterface({iid:?})", kind_name(p.kind));
     if iid == IUnknown::IID {
         p.refs.fetch_add(1, Ordering::AcqRel);
         unsafe { *out = this };
@@ -540,7 +552,7 @@ unsafe extern "system" fn proxy_qi(this: *mut c_void, iid: *const GUID, out: *mu
             p.refs.fetch_add(1, Ordering::AcqRel);
             unsafe { *out = this };
         } else {
-            unsafe { *out = if iid == IID_IDXGI_DEVICE1 && crate::VCCORLIB110.load(Ordering::Relaxed) { wrap_dxgi(real_out, true) } else { real_out } };
+            unsafe { *out = if iid == IID_IDXGI_DEVICE1 && crate::VCCORLIB110.load(Ordering::Relaxed) { wrap_dxgi(real_out, 1) } else { real_out } };
         }
         return HRESULT(0);
     }
@@ -1522,7 +1534,7 @@ unsafe fn create_view(this: *mut c_void, slot: usize, name: &str, resource: *mut
     }
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, *mut *mut c_void) -> HRESULT =
         unsafe { std::mem::transmute(*((*(p.real as *const *const usize)).add(slot))) };
-    let hr = unsafe { f(p.real, resource, desc, out) };
+    let hr = unsafe { f(p.real, unwrap_object(resource), desc, out) };
     if hr.0 >= 0 && !out.is_null() {
         // Once per kind: the vtable of the created view, to identify unknown objects by vtable.
         static SEEN: [AtomicU32; 16] = [const { AtomicU32::new(0) }; 16];
@@ -2038,7 +2050,7 @@ unsafe extern "system" fn dxgi_get_parent_wrapped(this: *mut c_void, iid: *const
     let f: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(6))) };
     let hr = unsafe { f(real, iid, out) };
     if hr.0 == 0 {
-        unsafe { *out = wrap_dxgi(*out, false) };
+        unsafe { *out = wrap_dxgi(*out, 0) };
     }
     hr
 }
@@ -2048,25 +2060,64 @@ unsafe extern "system" fn dxgi_get_adapter_wrapped(this: *mut c_void, out: *mut 
     let f: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(7))) };
     let hr = unsafe { f(real, out) };
     if hr.0 == 0 {
-        unsafe { *out = wrap_dxgi(*out, false) };
+        unsafe { *out = wrap_dxgi(*out, 0) };
     }
     hr
 }
 
-pub fn wrap_dxgi(real: *mut c_void, device: bool) -> *mut c_void {
+unsafe extern "system" fn dxgi_get_buffer_wrapped(this: *mut c_void, index: u32, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    let real = real_of(this);
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const GUID, *mut *mut c_void) -> HRESULT = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(9))) };
+    let hr = unsafe { f(real, index, iid, out) };
+    if hr.0 == 0 {
+        unsafe { *out = wrap_dxgi(*out, 3) };
+    }
+    hr
+}
+
+/// Wraps an object so the older console vtable layout reaches the desktop methods. `kind`: 0 plain
+/// DXGI object (slots 7 and up shift by one), 1 the DXGI device (also `GetAdapter` at slot 8),
+/// 2 a swap chain (also `GetBuffer` at slot 10, results wrapped as resources), 3 a D3D11 resource
+/// (the resource interfaces carry two more methods than the desktop: slots 9 and up shift by two;
+/// seen as `Texture2D::GetDesc` through slot 12).
+pub fn wrap_dxgi(real: *mut c_void, kind: u8) -> *mut c_void {
     const SLOTS: usize = 40;
     let thunks = unsafe { VirtualAlloc(ptr::null_mut(), 4096 * 2, 0x3000, 0x40) } as *mut u8;
     assert!(!thunks.is_null(), "thunk allocation failed");
     let vtbl: &'static mut [usize; SLOTS] = Box::leak(Box::new([0usize; SLOTS]));
     for (s, entry) in vtbl.iter_mut().enumerate() {
-        let desktop = if s >= 7 { s - 1 } else { s };
+        let desktop = match kind {
+            3 if s >= 9 => s - 2,
+            3 => s,
+            _ if s >= 7 => s - 1,
+            _ => s,
+        };
         *entry = forward_thunk(unsafe { thunks.add(s * 32) }, desktop);
     }
-    vtbl[7] = dxgi_get_parent_wrapped as usize;
-    if device {
+    if kind != 3 {
+        vtbl[7] = dxgi_get_parent_wrapped as usize;
+    }
+    if kind == 1 {
         vtbl[8] = dxgi_get_adapter_wrapped as usize;
     }
+    if kind == 2 {
+        vtbl[10] = dxgi_get_buffer_wrapped as usize;
+    }
     let obj: &'static mut [usize; 2] = Box::leak(Box::new([vtbl.as_ptr() as usize, real as usize]));
-    glog!("[gpu] DXGI object {real:p} wrapped (device: {device}): console slots 7 and up are desktop n - 1");
+    WRAPPERS.lock().unwrap().push((obj.as_ptr() as usize, real as usize));
+    glog!("[gpu] object {real:p} wrapped as kind {kind} (0 DXGI, 1 DXGI device, 2 swap chain, 3 resource)");
     obj.as_mut_ptr() as *mut c_void
 }
+
+/// Wrapper objects made by `wrap_dxgi`, mapped to the real object they forward to.
+static WRAPPERS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// The real object behind a wrapper, or the pointer itself when it is not one.
+pub fn unwrap_object(p: *mut c_void) -> *mut c_void {
+    WRAPPERS.lock().unwrap().iter().find(|(w, _)| *w == p as usize).map(|(_, r)| *r as *mut c_void).unwrap_or(p)
+}
+
+/// `(console index, desktop slot)` pairs seen in Minecraft Xbox One Edition (older XDK), from logged
+/// calls: 31 is called as (1, &rtv, dsv) = `OMSetRenderTargets` (desktop 33); 42 as (1, &viewport) =
+/// `RSSetViewports` (desktop 44).
+const OLD_SDK_EXTRA: [(usize, usize); 2] = [(31, 33), (42, 44)];

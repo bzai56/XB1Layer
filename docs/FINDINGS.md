@@ -566,3 +566,10 @@ First pass on the Legacy Console Edition build (4J Studios, built with Visual C+
 ## Content drive bug
 
 `map_content_drive` was given an empty folder whenever the title was started by its bare file name (`xb1layer.exe SonicMania.exe --run`), so the `DefineDosDevice` call failed with error 123 and `G:` stayed pointing at whatever an earlier run had left. The folder is now made absolute, and the failure message prints the folder and error. This is not what stops Forza: it still fails the same way with the right `G:`.
+
+### Minecraft Xbox One Edition: D3D11 layout of the older XDK
+
+- **Resources:** `ID3D11Texture2D::GetDesc` is called through vtable slot 12 (desktop 10), so resource interfaces are two slots longer from slot 9 on. `GetBuffer` results from the swap chain are now wrapped as such (`wrap_dxgi(.., 3)`: console slot n from 9 forwards to desktop n - 2) and `create_view` hands the real resource to the desktop (`unwrap_object`). The title's render-target and depth-stencil views now create.
+- **Embedded context table is two slots behind the desktop one** (Sonic Mania's is one behind): console 31 is called as `(1, &rtv, dsv)` = `OMSetRenderTargets` (desktop 33) and console 42 as `(1, &viewport)` = `RSSetViewports` (desktop 44). `OLD_SDK_EXTRA` in `src/gpu.rs` forwards just these two when the title links `vccorlib110`; every other index only logs (use `XB1_LOG_ALL=1` to log all of them).
+- **Where it stops now:** device slot 41 is called with `(&x, view, view)` (a console-only device method, still a logging stub) and then title+`0x56098b` calls a QueryInterface on a title-owned global object at `0x1409713d8` (the object whose vtable points at the title's own QI routine) that reads from address `-1`. Not resolved: the global is expected to be filled by the missing slot-41 method.
+- Sonic Mania was re-run after these changes and presents frames as before.
