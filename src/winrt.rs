@@ -1272,9 +1272,17 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         wlog!("[winrt] {} slot 7 (get_Size) -> 0", o.class);
         return HRESULT(0);
     }
+    // A container's slot 6 starts an operation as `(object, object, handle, 0, Operation** out)` (title call site
+    // `0x59ce2c`): the out pointer is the fifth argument, on the stack, and the first register arguments are an object
+    // (not a handler). The wrapper the title builds around the result crashed on NULL (`0x2d4a86`) when nothing was written.
+    if o.class == "Windows.Xbox.Storage.ConnectedStorageSpace#slot6#slot8#slot9" && N == 6 && looks_like_com_object(arg1) && (_a4 as usize) % 8 == 0 && is_writable(_a4 as *mut c_void) && !in_layer_image(_a4 as *mut c_void) {
+        unsafe { *(_a4 as *mut *mut c_void) = create_generic(&format!("{}#slot{N}", o.class), &o.iid) };
+        wlog!("[winrt] {} slot {N}: (object, object, h, 0, out) -> an async operation through the fifth argument", o.class);
+        return HRESULT(0);
+    }
     // Storage operations started with `(object, 0, Operation** out)` (title call site 0x5a8eee): the out pointer
     // is the third argument, and the result is an asynchronous operation (its `put_Completed` is handled above).
-    if o.class.starts_with("Windows.Xbox.Storage.ConnectedStorageSpace#") && (N >= 7 || (N == 6 && o.class == "Windows.Xbox.Storage.ConnectedStorageSpace#slot6#slot8#slot9")) && looks_like_com_object(arg1) && arg2.is_null() && (a3 as usize) % 8 == 0 && is_writable(a3) && !in_layer_image(a3) {
+    if o.class.starts_with("Windows.Xbox.Storage.ConnectedStorageSpace#") && N >= 7 && looks_like_com_object(arg1) && arg2.is_null() && (a3 as usize) % 8 == 0 && is_writable(a3) && !in_layer_image(a3) {
         unsafe { *(a3 as *mut *mut c_void) = create_generic(&format!("{}#slot{N}", o.class), &o.iid) };
         wlog!("[winrt] {} slot {N}: (object, 0, out) -> an async operation", o.class);
         return HRESULT(0);
