@@ -309,6 +309,16 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                 for f in frames[..n].iter().map(|f| *f as usize).filter(|f| *f >= base && *f < base + size).take(8) {
                     rlog!("  caller title+{:#x}", f - base);
                 }
+                // The unwinder stops early in leaf thunks: also list the title addresses found on the raw stack.
+                let rsp = *(ctx0.add(0x98) as *const usize);
+                let mut words = [0usize; 96];
+                let mut got = 0usize;
+                ReadProcessMemory(GetCurrentProcess(), rsp as *const c_void, words.as_mut_ptr() as *mut c_void, 96 * 8, &mut got);
+                for (i, w) in words.iter().enumerate().take(got / 8) {
+                    if *w >= base && *w < base + size {
+                        rlog!("  stack+{:#x}: title+{:#x}", i * 8, *w - base);
+                    }
+                }
                 return -1;
             }
             // Single-step after a repeating watchpoint: put the breakpoints back.

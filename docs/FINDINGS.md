@@ -692,3 +692,10 @@ Pressing A on "Play Game" (hold the key for about 200 ms; a 1 ms `SendKeys` pres
 - Current stop: crash at `title+0x53be0e`, in the title's input mapping code (`mov edx,[rcx+rdx*4]` with `rcx = table[3]` garbage), reached right after the storage chain. Not yet known whether a layer write corrupted that table or the table is never filled for a fourth pad; to check next.
 - The storage objects are still generic stand-ins whose shapes are guessed from call sites; the result of `GetForUser`'s operation (the real space) and the container/blob calls need proper semantics (and a place to keep saves) for worlds to be created and listed.
 
+### Minecraft: the input-table crash is bad profile settings
+
+- The crash at `title+0x53be0e` reads `table[3]` of an input-mapping table that has 3 entries (count byte at `+0x585` of the input manager at `title+0xa74320`). The index comes from a mapping byte stored at `+0x548 + pad` by a setter at `0x53d8f4` (hardware write watch, `XB1_HWBP="rbx+0x548"` at a watch site on the reading instruction).
+- The setter is called from the settings-changed switch at `0x7ce90` (case at `0x7d08a`) as `(settings[6] >> 4) & 3`, where `settings = [this + pad*8 + 0x1f8]` is the per-player profile settings block. A value of 3 is not a valid mapping, so that block holds data that was never initialized or loaded (the title does not apply its defaults), not a mapping the layer wrote.
+- The block is the game's saved profile, which comes from the storage API whose operations are still stand-ins that complete without any data. Next step: find the profile read (container/blob read after the `(name, out)` calls) and either return "no data" in the shape the title handles (so it applies defaults) or back it with a real file store.
+- Debug aid: the `XB1_HWBP` report now also lists title addresses found on the raw stack, because the unwinder stops in leaf thunks.
+
