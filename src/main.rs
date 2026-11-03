@@ -450,10 +450,18 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                                 "r8" => 0xB8, "r9" => 0xC0, "r10" => 0xC8, "r11" => 0xD0, "r12" => 0xD8, "r13" => 0xE0,
                                 "r14" => 0xE8, "r15" => 0xF0, _ => continue,
                             };
+                            // "reg+off>off2=v": read the qword at reg+off first, then write at that value + off2.
+                            let (off, off2) = match off.split_once('>') {
+                                Some((a, b)) => (a, Some(b)),
+                                None => (off, None),
+                            };
                             let off = usize::from_str_radix(off.trim_start_matches("0x"), 16).unwrap_or(0);
                             let v = u8::from_str_radix(val.trim_start_matches("0x"), 16).unwrap_or(0);
-                            let p = (reg(slot) as usize).wrapping_add(off) as *mut u8;
-                            *p = v;
+                            let mut p = (reg(slot) as usize).wrapping_add(off);
+                            if let Some(o2) = off2 {
+                                p = *(p as *const usize) + usize::from_str_radix(o2.trim_start_matches("0x"), 16).unwrap_or(0);
+                            }
+                            *(p as *mut u8) = v;
                             rlog!("  poked {item}");
                         }
                     }
