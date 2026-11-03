@@ -707,3 +707,11 @@ Pressing A on "Play Game" (hold the key for about 200 ms; a 1 ms `SendKeys` pres
 - Views created through the older SDK's `CreateShaderResourceView` and its siblings are now given a vtable shifted by one slot from 8 on, in place, since the console view has one more method before `GetDesc`. Before, the title's `GetResource` (console slot 8) ran the desktop `GetDesc`, returned nothing and crashed at `0x2b8f14`.
 - Not done: nothing is saved (the storage stand-ins hold no data), Create New World not tried.
 
+### Minecraft: Create New World opens its setup screen
+
+- Create New World now reaches the setup screen (World Name, Game Mode, Difficulty, Texture Packs, Online Game, More Options, Create New World), verified by screenshot, no exception in the run.
+- Fixes needed on the way: storage operations started as `(object, 0, Operation** out)` return their operation through the third argument (call site `0x5a8eee`); `Windows.Xbox.System.User` objects' `(NULL name, out)` calls (`0x2ca99a`) write the object to the second argument; `SystemUI` slot 11 (`0x539859`, the system keyboard) returns its operation through the fifth argument and its result (slot 8) is an HSTRING, now the default world name "New World".
+- Startup crashes at `0x53be0e` and `0x2caa0e` appeared in roughly one run in six before the fixes above and did not occur in 12 later runs (6 with a 5 ms and 6 with a 300 ms async completion delay), so they are timing dependent and the delay is not their cause. Not fully understood.
+- Debug aids: `XB1_NW_TRACE=1` prints the title call site of generic stand-in calls that write nothing; `XB1_ASYNC_DELAY_MS` sets the async completion delay.
+- Not tried yet: pressing Create New World (the world itself).
+

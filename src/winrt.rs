@@ -941,7 +941,7 @@ fn complete_later(handler: *mut c_void, op: *mut c_void) {
     }
     let (h, o) = (handler as usize, op as usize);
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::thread::sleep(std::time::Duration::from_millis(std::env::var("XB1_ASYNC_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(5)));
         crate::ensure_tls_on_current_thread();
         unsafe {
             let handler = h as *mut c_void;
@@ -1018,7 +1018,7 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
     // The object `SystemUI` slot 10 returns is an async operation: slot 6 is `put_Completed(handler)`
     // (one argument; the second register holds the object's own vtable pointer, so the event-add path
     // would write a token over vtable slot 0, which crashed with "execute of 0xb").
-    if (o.class == "Windows.Xbox.UI.SystemUI#slot10" || o.class == "Windows.Xbox.Storage.ConnectedStorageSpace#slot8" || o.class == "Windows.Xbox.Storage.ConnectedStorageSpace#slot6" || o.class.starts_with("Microsoft.Xbox.Services.XboxLiveContext#slot6#slot")) && N == 6 {
+    if (o.class == "Windows.Xbox.UI.SystemUI#slot10" || o.class == "Windows.Xbox.UI.SystemUI#slot11" || o.class == "Windows.Xbox.Storage.ConnectedStorageSpace#slot8" || o.class == "Windows.Xbox.Storage.ConnectedStorageSpace#slot6" || o.class.starts_with("Microsoft.Xbox.Services.XboxLiveContext#slot6#slot")) && N == 6 {
         // Complete at once: the game waits for the handler (AsyncStatus::Completed = 1).
         if looks_like_com_object(arg1) {
             let vt = unsafe { *(arg1 as *const *const usize) };
@@ -1026,6 +1026,21 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
             let hr = unsafe { invoke(arg1, this, 1) };
             wlog!("[winrt] SystemUI async operation: put_Completed -> handler Invoke(Completed) = {:#x}", hr.0 as u32);
         }
+        return HRESULT(0);
+    }
+    // The operation `SystemUI` slot 11 started: its result (slot 8, `GetResults(HSTRING*)`) is the text entered in the
+    // system keyboard (read as a string by the title right after Create New World; a stand-in object there crashed
+    // in the C runtime). The default world name stands in for what a player would type.
+    if o.class == "Windows.Xbox.UI.SystemUI#slot11" && N == 8 && (arg1 as usize) % 8 == 0 && is_writable(arg1) && !in_layer_image(arg1) {
+        unsafe { *(arg1 as *mut HSTRING) = HSTRING::from("New World") };
+        wlog!("[winrt] SystemUI keyboard result -> \"New World\"");
+        return HRESULT(0);
+    }
+    // `SystemUI` statics slot 11 (title call site 0x539859, reached from Create New World) takes its out pointer
+    // as the fifth argument (on the stack) and returns an asynchronous operation like slot 10.
+    if o.class == "Windows.Xbox.UI.SystemUI" && N == 11 && (a5 as usize) % 8 == 0 && is_writable(a5) && !in_layer_image(a5) {
+        unsafe { *(a5 as *mut *mut c_void) = create_generic("Windows.Xbox.UI.SystemUI#slot11", &o.iid) };
+        wlog!("[winrt] SystemUI slot 11 -> an async operation through the fifth argument");
         return HRESULT(0);
     }
     // `SystemUI` statics slot 10 is `(user, 0, Object** out)` (title call site 0x26ac25, reached when a
@@ -1105,6 +1120,13 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         return HRESULT(0);
     }
     // The result of an Xbox Live asynchronous operation is a collection (title loop at 0x30ec99:
+    if o.class == "Windows.Xbox.UI.SystemUI" {
+        unsafe extern "system" { fn RtlCaptureStackBackTrace(skip: u32, count: u32, frames: *mut *mut c_void, hash: *mut u32) -> u16; }
+        let mut frames = [ptr::null_mut::<c_void>(); 1];
+        unsafe { RtlCaptureStackBackTrace(1, 1, frames.as_mut_ptr(), ptr::null_mut()) };
+        let (base, _) = crate::image_range();
+        wlog!("[winrt] SystemUI slot {N} from title+{:#x} args {arg1:p} {arg2:p} {a3:p} {:#x} {a5:p}", (frames[0] as usize).wrapping_sub(base), _a4);
+    }
     if o.class.starts_with("Windows.Xbox.Storage.") && std::env::var_os("XB1_STORAGE_TRACE").is_some() {
         unsafe extern "system" { fn RtlCaptureStackBackTrace(skip: u32, count: u32, frames: *mut *mut c_void, hash: *mut u32) -> u16; }
         let mut frames = [ptr::null_mut::<c_void>(); 2];
@@ -1231,6 +1253,13 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         wlog!("[winrt] {} slot 7 (get_Size) -> 0", o.class);
         return HRESULT(0);
     }
+    // Storage operations started with `(object, 0, Operation** out)` (title call site 0x5a8eee): the out pointer
+    // is the third argument, and the result is an asynchronous operation (its `put_Completed` is handled above).
+    if o.class.starts_with("Windows.Xbox.Storage.ConnectedStorageSpace#") && N >= 7 && looks_like_com_object(arg1) && arg2.is_null() && (a3 as usize) % 8 == 0 && is_writable(a3) && !in_layer_image(a3) {
+        unsafe { *(a3 as *mut *mut c_void) = create_generic(&format!("{}#slot{N}", o.class), &o.iid) };
+        wlog!("[winrt] {} slot {N}: (object, 0, out) -> an async operation", o.class);
+        return HRESULT(0);
+    }
     // Storage objects: `Get/Create(name, Object** out)` where the name is a string whose pointer is
     // not always recognizable as an HSTRING header (title call site 0x599190): the object goes to the
     // second argument, and the first is never written.
@@ -1309,6 +1338,19 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         wlog!("[winrt] {} (iid {:?}): slot {N} called with out-param {arg1:p} -> returned a new stand-in object", o.class, o.iid);
         HRESULT(0)
     } else {
+        // `(NULL name, Object** out)` (title call site 0x2ca99a): the object goes to the second argument.
+        if o.class.starts_with("Windows.Xbox.System.User") && arg1.is_null() && (arg2 as usize) % 8 == 0 && is_writable(arg2) && !in_layer_image(arg2) {
+            unsafe { *(arg2 as *mut *mut c_void) = create_generic(&format!("{}#slot{N}", o.class), &o.iid) };
+            wlog!("[winrt] {} slot {N}: (NULL, out) -> a stand-in object", o.class);
+            return HRESULT(0);
+        }
+        if o.class.starts_with("Windows.Xbox.System.User") || std::env::var_os("XB1_NW_TRACE").is_some() {
+            unsafe extern "system" { fn RtlCaptureStackBackTrace(skip: u32, count: u32, frames: *mut *mut c_void, hash: *mut u32) -> u16; }
+            let mut frames = [ptr::null_mut::<c_void>(); 1];
+            unsafe { RtlCaptureStackBackTrace(1, 1, frames.as_mut_ptr(), ptr::null_mut()) };
+            let (base, _) = crate::image_range();
+            wlog!("[winrt] {} slot {N} (not writable) from title+{:#x} args {arg1:p} {arg2:p} {a3:p}", o.class, (frames[0] as usize).wrapping_sub(base));
+        }
         wlog!("[winrt] {} (iid {:?}): slot {N} called (arg1={arg1:p}, not writable) -> S_OK, nothing written", o.class, o.iid);
         HRESULT(0)
     }
