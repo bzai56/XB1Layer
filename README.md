@@ -2,31 +2,33 @@
 
 An experimental compatibility layer for running Xbox One (GDK/XDK "Durango") x64 titles on Windows x64.
 
-**The aim is to be compatible with a wide range of Xbox One games**, not one title. Anything specific to a single title is a stand-in to be replaced by a general implementation. **Sonic Mania** is the first title that runs, followed by Minecraft Xbox One Edition's menu, chosen because it is simple (plain D3D11 2D renderer, XAudio2). The Forza Horizon 3 kiosk demo that was used to find the first console API needs is retired; the next target is a full Forza Horizon game (2, 3 or 4) once a dump is available.
+**The aim is to be compatible with a wide range of Xbox One games**, not one title. Anything specific to a single title is a stand-in to be replaced by a general implementation. **Sonic Mania** is the first title that runs, and **Minecraft Xbox One Edition** (1.2.0.0) is the second: both were chosen because they are simple (plain D3D11, XAudio2). The Forza Horizon 3 kiosk demo that was used to find the first console API needs is retired; the next target is a full Forza Horizon game (2, 3 or 4) once a dump is available.
 
-**Status: early prototype. Sonic Mania is playable with picture, sound and input.** The layer loads unpacked Xbox One titles, runs them through startup into their main loop, and presents their frames in a native window. The goal is a layer that runs titles without graphical glitches; it is not there yet. Only Sonic Mania has been checked for that, and only the parts played so far (intro, menus and the early part of the first zone).
+**Status: early prototype. Sonic Mania is playable and Minecraft Xbox One Edition loads and renders a world, both with picture, sound and input.** The layer loads unpacked Xbox One titles, runs them through startup into their main loop, and presents their frames in a native window. The goal is a layer that runs titles without graphical glitches; it is not there yet. Only these two titles have been tried, and only the parts played so far (Sonic Mania: intro, menus and the early part of the first zone; Minecraft: the menus and the first minutes of a generated world, judged by eye).
 
 ## What works
 - **Sonic Mania** boots and plays: intro, logos, menus and the first zone, with picture (desktop D3D11 through the layer's proxy device, 60 FPS limiter) and sound (XAudio2). No graphical glitches seen in what was played. Not yet tested: later zones, special stages, two-player split screen, DualSense over USB.
-- **Input** (Sonic Mania): an XInput gamepad, a DualSense (USB or Bluetooth, read directly through HID, Bluetooth verified), or the keyboard (arrows, Z/X/A/S = A/B/X/Y, Enter = Menu, Backspace = View, Q/W = shoulders) while the window has focus.
+- **Input**: an XInput gamepad, a DualSense (USB or Bluetooth, read directly through HID; Bluetooth verified in both titles), or the keyboard while the window has focus: arrows = d-pad, Z/X/A/S = A/B/X/Y, Enter = Menu, Backspace = View, Q/W = shoulders, I/K/J/L = left stick, numpad 8/5/4/6 = right stick, R/E = left/right trigger.
 - **Loader**: manual PE64 loader, import report, `kernelx.dll` forwarded to `kernel32.dll`, DLLs next to the title searched first, the title's own console DLLs mapped by the layer.
 - **Process bootstrap**: exception tables, PEB image base, per-thread static TLS, console `VirtualAlloc` flag handling, `XMem*` and `TitleMemoryStatus`, `G:` mapped to the title folder.
 - **WinRT shell** (`src/winrt.rs`): own `CoreApplication`, view, window and dispatcher run the title's lifecycle; console-only `Windows.Xbox.*` and `Microsoft.Xbox.*` classes are served by stand-ins (one signed-in user, a gamepad, `SystemUI`, strings, event subscriptions) whose method shapes come from call sites.
 - **Graphics** (`src/gpu.rs`, `src/display.rs`): `D3D11XCreateDeviceX` and plain `D3D11CreateDevice` return proxy device and context objects over a real desktop device. The console's embedded context function table is decoded where evidenced (including the packed `DrawIndexed` and the state the title keeps in the context object instead of calling bind methods). The swap chain is redirected to a native window. `XB1_D3D_DEBUG=1` turns on the D3D11 debug layer.
 - **Audio**: proxy for the console extension of `MMDeviceEnumerator`, console audio HAL stand-ins.
-- **Diagnostics**: crash-proof ring trace (`--ring=`, `tools\read-ring.ps1`), `--watch-sites`, `--test-d3d`, per-call GPU logging.
+- **Diagnostics**: crash-proof ring trace (`--ring=`, `tools\read-ring.ps1`), `--watch-sites`, hardware write watches (`XB1_HWBP*`), a sampling profiler (`XB1_PROFILE=1`), `--test-d3d`, per-call GPU logging.
 
-- **Minecraft Xbox One Edition (1.2.0.0, an older XDK)** boots and shows its **main menu** (panorama, logo, buttons, text, controller prompts) with sound; the layer wraps its older DXGI/D3D11 interface layout and maps its embedded context calls (see FINDINGS). **Keyboard input works in its menu** (arrows, Z = A); **Play Game** opens the Start Game / Join Game screen and its world list; Create New World loads a world that renders in 3D with the HUD (60 FPS in a release build; the camera turns with the right stick; nothing is saved yet); the world itself, the rest of the embedded calls and the dialog draw order are not done yet.
+- **Minecraft Xbox One Edition (1.2.0.0, an older XDK)**: the main menu, Play Game, Start Game and Create New World work, and a generated world renders in 3D with the HUD at 60 FPS in a release build (about 3,200 draw calls per frame). Keyboard and DualSense input work (the user confirmed every control), and the game has sound. The layer wraps this XDK's older DXGI/D3D11 layout and its embedded context calls, completes its storage, Xbox Live and system-keyboard operations, hands the game zeroed heap blocks (it relies on them), and carries one guarded compatibility patch (it keeps the default options when the stand-in storage returns a blank profile). Details in [FINDINGS](docs/FINDINGS.md).
 
 ## What does not work
 - **Forza Horizon 3 kiosk demo** (retired): booted into its main loop but never drew or presented. It writes AMD PM4 command packets that nothing decodes, uses placed textures with console tiling that is not de-tiled, and its D3D11X present path (`DXGIXPresentArray`, `DXGIXSetVLineNotification`) is still a logging stub.
+- **Minecraft**: nothing is saved (the storage stand-ins keep no data); the Minecraft store button reportedly crashes the game (user report, not investigated); Join Game and anything online are untested; dialogs were seen with the menu text drawn through them (not re-checked); the 3D picture has only been looked at, not compared with a console; the topology of draws is partly guessed; a startup crash in the input table (`0x53be0e`) hit about half of the runs before the zeroed-allocation fix and none in 10 runs since.
 - **Other titles**: untested. Console context-table indices 23 and 24 to 31 are unidentified, and anything not evidenced by a logged call only logs.
 - D3D12.X titles are not supported.
 
 ## Build and run
-Requires Rust (MSVC toolchain, x64).
+Requires Rust (MSVC toolchain, x64). Use a release build to play: the debug build is several times slower (in Minecraft the difference between a playable and an unplayable frame rate).
 
 ```
+cargo build --release                      # use target\release\xb1layer.exe to play
 cargo build
 cargo run -- path\to\title.exe            # load only, print import summary
 cargo run -- path\to\title.exe --imports  # also list every stubbed import, grouped by DLL
@@ -35,7 +37,7 @@ cargo run -- path\to\title.exe --run      # also run the entry point
 
 For example, Sonic Mania, from its own folder: `xb1layer.exe "SonicMania.exe" --run`.
 
-Debug flags for `--run`: `--watch=N`, `--trace-api`, `--trace-heap`, `--iat`, `--ring=`, `--watch-sites=`. Environment: `XB1_D3D_DEBUG=1` (D3D11 debug layer), `XB1_LOG_ALL=1` (log every context call instead of forwarding), `XB1_FPS=<n>` (frame limit, default 60, 0 = off), `XB1_NO_GAMEPAD=1`, `XB1_INPUT_LOG=1` (print raw joystick changes to map an unknown pad), `XB1_NO_EXTEND=1`, `XB1_NO_MIRROR=1`, `XB1_STALL_MS=n` (hold a thread n ms at a `--watch-sites` hit), `XB1_PROFILE=1` (sample which module the presenting thread is in), `XB1_DS_LOG=1` (print DualSense stick values). See [Architecture](docs/ARCHITECTURE.md#debugging-aids).
+Debug flags for `--run`: `--watch=N`, `--trace-api`, `--trace-heap`, `--iat`, `--ring=`, `--watch-sites=`. Environment switches (the full list, with what each does, is in [Architecture](docs/ARCHITECTURE.md#debugging-aids)): `XB1_D3D_DEBUG=1` (D3D11 debug layer), `XB1_FPS=<n>` (frame limit, default 60, 0 = off), `XB1_PROFILE=1` (which module the presenting thread is in), `XB1_DS_LOG=1` (DualSense stick values), `XB1_NO_COMPAT=1` (turn the per-title patches off), `XB1_LOG_ALL=1`, `XB1_CTX_TRACE=n`, `XB1_STORAGE_TRACE=1`, `XB1_HWBP=...`.
 
 Run a title from its own folder so relative paths resolve.
 
@@ -54,5 +56,5 @@ Contributions are welcome. The biggest open problems are mapping the rest of the
 
 ## Docs
 - [Architecture](docs/ARCHITECTURE.md)
-- [Findings](docs/FINDINGS.md) (Forza Horizon 3 kiosk demo and Sonic Mania notes)
+- [Findings](docs/FINDINGS.md) (a chronological log: the Forza Horizon 3 kiosk demo, Sonic Mania and Minecraft; later sections correct earlier ones)
 - [Roadmap](docs/ROADMAP.md)

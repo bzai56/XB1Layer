@@ -81,6 +81,30 @@ Some imports are implemented by us instead of forwarded to Windows:
 | `GetActivationFactoryByPCWSTR` (vccorlib140) | Routes WinRT class lookups to the shell layer (`Windows.Xbox.*`, `Microsoft.Xbox.*` and `Windows.ApplicationModel.Package`, which fails without package identity, get stand-ins) |
 | `DXGIXPresentArray`, `DXGIXSetVLineNotification` (d3d11_x) | Logging stubs |
 | `ExitProcess`, `TerminateProcess` | Log the caller, then forward |
+| `??2@YAPEAX_K@Z`, `??_U@YAPEAX_K@Z`, `malloc` (`MSVCR110`) | Return zeroed blocks (see Heap) |
+| `D3D11CreateDevice` (`d3d11_x`), `GetActivationFactoryByPCWSTR` (`vccorlib110`) | Same handling as the `vccorlib140` / `D3D11XCreateDeviceX` versions; `vccorlib110` also marks an older-XDK title |
+
+### Older-XDK titles (Minecraft; `vccorlib110`)
+A title that imports `vccorlib110.dll` / `MSVCR110.dll` is built with an older XDK; `override_for` sets the `VCCORLIB110` flag when it sees the import and the layer switches the behaviors below. Everything here comes from call sites and logged arguments of Minecraft Xbox One Edition 1.2.0.0, not from documentation ([FINDINGS.md](FINDINGS.md) has the evidence).
+- **DXGI and D3D11 objects have a different layout.** Objects handed to the title are wrapped (`wrap_dxgi(real, kind)`: 0 DXGI object, 1 DXGI device, 2 swap chain, 3 resource, 4 view) with one vtable of forward thunks per kind and one wrapper per real object (hash maps `WRAPPERS` and `WRAPPER_OF`); binding calls turn a wrapper back into the real object (`unwrap_object`). The shifts: DXGI console slot n >= 7 is desktop n - 1 (`GetParent` 7, device `GetAdapter` 8, swap chain `Present` 9 and `GetBuffer` 10); resources: console 12 is `GetDesc` (desktop 10), console 8 to 10 are desktop 7 to 9; views: slot >= 8 is n - 1 (`GetResource` is 8). Views created through the device get their own vtable shifted in place (`shift_view_vtable`); the device's `GetImmediateContext` is slot 41.
+- **The embedded context table maps non-monotonically.** Console index to desktop slot: 13 `Map` (the console shape `Map(res, sub, type, flags, void** data)` returns the data pointer, `ctx_map_old`), 14 `Unmap`, 31 `OMSetRenderTargets`, 87 `OMGetRenderTargets` (results wrapped), 42 `RSSetViewports`, 43 scissor rectangles, 33 / 34 / 41 blend, depth-stencil and rasterizer state, 46 `UpdateSubresource`, 51 `ClearDepthStencilView`, 17 `IASetVertexBuffers`, 18 `IASetIndexBuffer(format, buffer, **byte offset**)` (the offset matters: one index buffer holds many meshes; format 0 is 16-bit), 6 / 15 constant buffers, 7 / 9 pixel-shader resources and samplers, 23 / 24 the vertex-shader pair, 11 a packed `DrawIndexed` (`count << 32 | start`, sets a triangle list), 12 a plain `Draw` (4 vertices are drawn as a triangle strip, others as a list: guessed, the title's topology is not read). Index 104 (`+0x740`) takes only `this` and sets dirty bits; it only logs. The inlined state cache (`+0x178`, `+0x180`, `+0x188`) works as for Sonic Mania.
+- **Extended vtables.** Objects the title calls console-only methods on get a copy of their vtable with logging stubs after the real entries (`extend_object`, `extend_resource`): states created through device slots 20 to 23 (slot 8 is `GetDesc`), resources (slot 12 is `GetDesc`, slot 13 on 2D textures returns width and height). The real and extended vtables are kept in hash maps (`ExtendedVtables`); an object that already carries an extension is never extended again (the runtime returns the same object for an identical state description, and layering extensions leaked about nine vtables per frame, which made the game slower the longer it ran). A bound state gets its real vtable back for the desktop call and its extension afterwards.
+- **Draw cost.** A world frame is about 3,200 draw calls, each through the proxy; the per-call lookups are hash maps and the environment checks are cached, which is what keeps it at 60 FPS in a release build.
+
+### Input (`src/winrt.rs`, `src/dualsense.rs`)
+`fill_gamepad_reading` fills the console's 40-byte `GamepadReading` (buttons, two triggers, four stick axes) from the first XInput pad and, when there is none, the legacy joystick API (winmm) and a DualSense read straight through HID (`src/dualsense.rs`: USB report 0x01, Bluetooth reports 0x01 and 0x31; `XB1_DS_LOG=1` prints stick changes); the keyboard is added while the layer's window has the focus (arrows, Z/X/A/S, Enter, Backspace, Q/W, I/K/J/L left stick, numpad 8/5/4/6 right stick, R/E triggers). The older SDK needs two objects: `IGamepad` (`082E402C`, `GetCurrentReading` on slot 8) and `IController` (`9776FF56`, id, type string `Windows.Xbox.Input.Gamepad`, user); `generic_qi` routes the IIDs, and a thread (`raise_input_events`) raises the registered controller events.
+
+### Asynchronous operations and the stand-in services
+Console WinRT operations are `IAsyncOperation` objects the title hooks with `put_Completed(handler)` (slot 6, one argument) and reads with slot 8. The generic stand-in cannot tell that from an event subscription (`add_Event(handler, &token)`), so classes known to be operations (`SystemUI#slot10` / `#slot11`, Xbox Live operations, everything under `Windows.Xbox.Storage.` whose slot 6 has a layer-owned or NULL second register) complete: the handler is invoked with `Completed` on a short-lived thread 5 ms after `put_Completed` returns (`complete_later`; a console runs it later on another thread, and calling it inline let other threads read half-built state; `XB1_ASYNC_DELAY_MS`, `XB1_ASYNC_INLINE=1`). Result shapes found so far: user `IsGuest` / `IsSignedIn` booleans (slots 10 / 11), the `GetForUser` storage factory, `(name, out)` and `(object, 0, out)` creators, an operation whose out pointer is the fifth argument (on the stack), empty collections (`get_Size` 0) for storage queries, Xbox Live results and the chat session, a one-item collection for the user's display information whose four string getters return HSTRINGs, the system keyboard (returns the default world name), and `ConnectedStorageSpace` objects that keep **no data**. Nothing the title writes is stored and every read finds nothing, which is why the per-title patch below exists. `XB1_STORAGE_TRACE=1` logs every storage stand-in call with its call site, `XB1_NW_TRACE=1` the calls that wrote nothing.
+
+### Heap
+The console hands out zeroed memory and Minecraft relies on it (a settings block was read before it was filled: random controller mappings, crashes on the first button press). The `operator new`, `operator new[]` and `malloc` of `MSVCR110` are overridden (`xb_operator_new`, `xb_operator_new_array`, `xb_malloc`) to call the real function and zero the block.
+
+### Per-title compatibility patches (`main.rs`)
+Two byte-guarded patches (they apply only if the original bytes at a fixed RVA match; `XB1_NO_COMPAT=1` turns them off; `XB1_PATCH="0xRVA=hex;..."` writes bytes for experiments): `patch_filesys_storage` (a Forza Horizon 3 `CFileSys` object that nothing provides) and `patch_profile_copy` (Minecraft: the storage manager copies the loaded profile over the default options at `title+0x5a8b4a`; the stand-in storage returns a blank record, so the copy is skipped when option bytes 1 to 6 are all zero). These are workarounds for missing services, not general behavior; a real connected-storage backend would replace the second.
+
+### Profiler
+`XB1_PROFILE=1` (`src/profile.rs`): a thread suspends the presenting thread every 2 ms, reads its instruction pointer and counts the module it is in; every 5 s it prints the shares and the busiest addresses (title RVAs, and layer offsets that can be looked up in a linker map: `cargo rustc --release -- -C link-arg=/MAP:file`). It found the leak that made Minecraft slow.
 
 ### Debugging aids
 | Flag | Effect |
@@ -102,6 +126,30 @@ Some imports are implemented by us instead of forwarded to Windows:
 | `XB1_NO_EXTEND=1`, `XB1_NO_MIRROR=1` (environment) | Disable resource vtable extension / placement-buffer mirroring, to rule them out |
 | `--heapcheck` | With `--watch`, polls `HeapValidate`. Experimental: it takes the heap lock and can stall a title that is itself stuck in the heap |
 
+Environment switches (all optional; `XB1_*`):
+| Variable | Effect |
+|----------|--------|
+| `XB1_D3D_DEBUG` | Desktop device with the debug layer |
+| `XB1_FPS=n` | Frame limit (default 60, 0 = off) |
+| `XB1_LOG_ALL` | Log every context call instead of forwarding (except slots 0 to 3, 14, 15) |
+| `XB1_CTX_TRACE=n`, `XB1_TRACE_FRAME=n` | Trace the first n logged context calls, starting at the n-th Present |
+| `XB1_DRAW_TRACE=n` | Log the first n draws (count, start, bound index buffer size, format, offset) from `XB1_TRACE_FRAME` on |
+| `XB1_READBACK` | Report how many back buffer pixels are not black |
+| `XB1_DEFAULT_STATES`, `XB1_NO_EXTEND`, `XB1_NO_MIRROR` | Rule out state binding, vtable extension and placement-buffer mirroring |
+| `XB1_NO_DEFERRED`, `XB1_TEST_DEFERRED`, `XB1_DEFERRED_ON_HELPER` | Deferred-context experiments (creation is serialized by default) |
+| `XB1_NO_GAMEPAD`, `XB1_INPUT_LOG`, `XB1_DS_LOG`, `XB1_AUTOPRESS` | Pad reading off / raw joystick changes / DualSense sticks / timed button presses |
+| `XB1_NO_INPUT_EVENTS`, `XB1_NO_USER_EVENTS`, `XB1_WINDOW_EVENTS`, `XB1_WINDOW_EVENT_VALUE` | Event raising experiments (window events close Minecraft: do not use) |
+| `XB1_ASYNC_DELAY_MS`, `XB1_ASYNC_INLINE` | Async completion delay (default 5) / inline completion |
+| `XB1_STORAGE_TRACE`, `XB1_NW_TRACE` | Log storage stand-in calls with call sites / stand-in calls that write nothing |
+| `XB1_NO_HEAP_OUT` | Leave out-parameters that are not on the stack alone |
+| `XB1_NO_COMPAT`, `XB1_PATCH` | Per-title patches off / write bytes into the title |
+| `XB1_PROFILE` | Sampling profiler (above) |
+| `XB1_STALL_MS=n` | Hold a thread n ms at a `--watch-sites` hit |
+| `XB1_PEEK="reg+off:len;reg+off>off2:len"`, `XB1_POKE="reg+off>off2=v"` | At a `--watch-sites` hit: print memory at a register plus offset (optionally through a pointer) / write a byte |
+| `XB1_HWBP="reg+off"`, `XB1_HWBP_RVA=0xrva`, `XB1_HWBP_FOLLOW` | Hardware write breakpoint on a field at a watch-site hit / on a fixed title address from the start / then on the object the written pointer points at; reports the writer and its stack |
+| `XB1_FILES`, `XB1_DUMP_STACK`, `XB1_BT` | Log file calls / dump the raw stack on a crash / backtrace on a crash |
+| `XB1_BIG_ALLOCS`, `XB1_MAX_ALLOC_MB`, `XB1_TITLE_MEM_MB`, `XB1_LAUNCH_ARGS`, `XB1_SWAP_EFFECT`, `XB1_DUMP_CMD`, `XB1_VTABLES`, `XB1_PROBE_GUEST`, `XB1_ALL_THREADS`, `XB1_NO_COREAPP_9FF` | Older experiments (Forza Horizon 3 era), see the source |
+
 `ntdll!NtTerminateProcess` is hooked (16-byte trampoline) so every process exit logs its status and callers, and `CreateThread` routines and returns are logged. Hooking `NtCreateThreadEx` hung the run and is disabled.
 
 `tools\run-title.ps1 -Title <exe> -Seconds N -Ring` builds the command line, runs the title from its own folder with a timeout, and prints the exit code and stderr. The crash logger also reports MSVC C++ throws (`0xE06D7363`, first 30), which shows where a title throws.
@@ -109,7 +157,9 @@ Some imports are implemented by us instead of forwarded to Windows:
 The crash logger is a vectored exception handler that reports `title+RVA`, registers, access-violation target, memory-region state and return-address-looking stack values. It allocates nothing, because the title may have crashed inside the heap. It cannot see fast-fails (`int 0x29`), which bypass exception dispatch.
 
 ## Known limitations
-- Threads not created through the title's `CreateThread` import (thread pools, fibers) do not get static TLS.
+- Threads not created through the title's `CreateThread` import (thread pools, fibers) do not get static TLS unless the layer installs it (its own helper threads call `ensure_tls_on_current_thread`, and must hand the loader's array back before they end or the heap is corrupted).
+- The storage stand-ins hold no data, so nothing a title saves survives; the status of what runs is in the README.
+- Some console behaviors are guessed from one call site (draw topology, option meanings, result shapes); every such guess is named in [FINDINGS.md](FINDINGS.md).
 - Only one TLS callback pass, for the main thread; thread attach/detach callbacks are not run.
 - Image memory is RWX instead of per-section protections.
 - No delay-load imports or loader-list registration.

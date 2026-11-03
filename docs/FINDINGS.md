@@ -1,6 +1,6 @@
 # Findings
 
-The first sections are about the Forza Horizon 3 kiosk demo (retired as a test title); the Sonic Mania sections follow, then notes on input and frame pacing.
+This is a chronological log, not a summary: sections are in the order the work happened, and later ones correct earlier ones (look for **Update** lines). The first sections are about the Forza Horizon 3 kiosk demo (retired as a test title); the Sonic Mania sections follow, then notes on input and frame pacing, the full Forza Horizon 3 run, and the Minecraft Xbox One Edition sections (the last ones are the current state of that title). The README has the short status.
 
 ## Forza Horizon 3 kiosk demo
 
@@ -694,6 +694,8 @@ Pressing A on "Play Game" (hold the key for about 200 ms; a 1 ms `SendKeys` pres
 
 ### Minecraft: the input-table crash is bad profile settings
 
+**Update:** the settings block was dirty heap memory, not data from storage: the crash (and its dependence on timing) is explained and fixed in the section on the first-press crash (zeroed `operator new`/`malloc`); the later camera problem is a different cause (a blank profile copied over the defaults, see the last section). Read this section as the investigation, not the conclusion.
+
 - The crash at `title+0x53be0e` reads `table[3]` of an input-mapping table that has 3 entries (count byte at `+0x585` of the input manager at `title+0xa74320`). The index comes from a mapping byte stored at `+0x548 + pad` by a setter at `0x53d8f4` (hardware write watch, `XB1_HWBP="rbx+0x548"` at a watch site on the reading instruction).
 - The setter is called from the settings-changed switch at `0x7ce90` (case at `0x7d08a`) as `(settings[6] >> 4) & 3`, where `settings = [this + pad*8 + 0x1f8]` is the per-player profile settings block. A value of 3 is not a valid mapping, so that block holds data that was never initialized or loaded (the title does not apply its defaults), not a mapping the layer wrote.
 - The block is the game's saved profile, which comes from the storage API whose operations are still stand-ins that complete without any data. Next step: find the profile read (container/blob read after the `(name, out)` calls) and either return "no data" in the shape the title handles (so it applies defaults) or back it with a real file store.
@@ -711,9 +713,9 @@ Pressing A on "Play Game" (hold the key for about 200 ms; a 1 ms `SendKeys` pres
 
 - Create New World now reaches the setup screen (World Name, Game Mode, Difficulty, Texture Packs, Online Game, More Options, Create New World), verified by screenshot, no exception in the run.
 - Fixes needed on the way: storage operations started as `(object, 0, Operation** out)` return their operation through the third argument (call site `0x5a8eee`); `Windows.Xbox.System.User` objects' `(NULL name, out)` calls (`0x2ca99a`) write the object to the second argument; `SystemUI` slot 11 (`0x539859`, the system keyboard) returns its operation through the fifth argument and its result (slot 8) is an HSTRING, now the default world name "New World".
-- Startup crashes at `0x53be0e` and `0x2caa0e` appeared in roughly one run in six before the fixes above and did not occur in 12 later runs (6 with a 5 ms and 6 with a 300 ms async completion delay), so they are timing dependent and the delay is not their cause. Not fully understood.
+- **Update:** the `0x53be0e` crash was dirty heap memory (fixed later by zeroed allocations); `0x2caa0e` was the user collection size (fixed in the Create New World sections). Original note: startup crashes at `0x53be0e` and `0x2caa0e` appeared in roughly one run in six before the fixes above and did not occur in 12 later runs (6 with a 5 ms and 6 with a 300 ms async completion delay), so they are timing dependent and the delay is not their cause. Not fully understood.
 - Debug aids: `XB1_NW_TRACE=1` prints the title call site of generic stand-in calls that write nothing; `XB1_ASYNC_DELAY_MS` sets the async completion delay.
-- Not tried yet: pressing Create New World (the world itself).
+- Not tried at this point: pressing Create New World (the world itself); done in the sections below (a world loads and renders).
 
 ### Minecraft: pressing Create New World (partial)
 

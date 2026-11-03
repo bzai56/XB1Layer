@@ -1,12 +1,12 @@
 # Roadmap
 
-The goal is a layer that runs many Xbox One titles on Windows x64 without graphical glitches. Today Sonic Mania is playable; no other title draws yet. Details of each item are in [FINDINGS.md](FINDINGS.md).
+The goal is a layer that runs many Xbox One titles on Windows x64 without graphical glitches. Today Sonic Mania is playable and Minecraft Xbox One Edition loads and renders a world at 60 FPS (release build); no other title has been tried. Details of each item are in [FINDINGS.md](FINDINGS.md).
 
-**Focus: Sonic Mania, then a full Forza Horizon.** Sonic Mania is far simpler than Forza (plain D3D11 device, about eleven context calls a frame, XAudio2) and now renders and plays. The Forza Horizon 3 kiosk demo is retired; the next big target is a full Forza Horizon 2, 3 or 4 dump supplied by the user.
+**Focus: harden what runs, then a full Forza Horizon.** Sonic Mania and Minecraft are far simpler than Forza (plain D3D11 device, XAudio2). The Forza Horizon 3 kiosk demo is retired; the next big target is a full Forza Horizon 2, 3 or 4 dump supplied by the user.
 
 ## Next up (in order)
 
-0. **Minecraft Xbox One Edition:** the main menu renders, keyboard input works and Play Game opens the Start Game / Join Game screen. Next: the squares on that screen, the dialog draw order, the unmapped embedded context calls, the topology (currently guessed), then entering a world.
+0. **Minecraft Xbox One Edition:** a world loads and plays at 60 FPS. Next, in order: a real connected-storage backend (saves; it would replace the profile-copy patch and report a missing profile as missing), the store button crash (user report, not investigated), the unmapped embedded context calls and the guessed topology, the dialog draw order, a long play session (memory, threads), Join Game, and a comparison of the 3D picture with a console (sky, water, lighting, transparency).
 
 1. **Play Sonic Mania through and hunt glitches.** Later zones, special stages, two-player split screen, DualSense over USB; compare every screen with the original (formats, blending, sampling).
 2. **Get the full Forza Horizon 3 past its zip-mount crash** (NULL read at title+`0x1b04f7f`, see FINDINGS), then check whether its shaders are DXBC or GCN microcode, which decides the size of the graphics job. FH4 probably needs D3D12.X (unverified).
@@ -19,6 +19,8 @@ The goal is a layer that runs many Xbox One titles on Windows x64 without graphi
 ## Open problems
 
 - The `0x87D` exit under the debug layer (`XB1_D3D_DEBUG=1`): a NULL-execute in a thread, then termination. Unexplained.
+- Minecraft: the input-table startup crash (`0x53be0e`, dirty heap memory read as a controller mapping) is fixed by zeroed `operator new`/`malloc`, but other title code may read uninitialized memory the console would have zeroed; the zeroing is global for the older runtime. Also unexplained: the one C++ throw (`0xe06d7363`) logged in a long run.
+- Minecraft: asynchronous storage operations are completed on a short thread 5 ms after `put_Completed` (as a console would), and their result shapes were found one call site at a time; a general model of the connected-storage API would replace those guesses.
 - Console `ICoreWindow` layout: pin down the members, then raise window events (activation, size, visibility, input).
 - The two `CoreApplication` console extension interfaces (`42A6A529`, `9FF3799E`) and the real shapes of `PackageTransferManager`.
 - Device slot 73 and context `+0xA08` / `+0x4E0`.
@@ -48,3 +50,5 @@ The goal is a layer that runs many Xbox One titles on Windows x64 without graphi
 - Xbox user list (one user), event subscriptions, strings, `Package.Current`, `Store.Product`, `XboxLiveConfiguration`, and a one-gamepad controller list.
 - Diagnostics: ring trace, `--watch-sites`, `--patch-fastfail`, `--test-d3d`, D3D11 debug layer mode, exit and thread logging.
 - Sonic Mania: first picture, packed `DrawIndexed`, inlined state cache, SystemUI stand-in, 60 FPS limiter, input (XInput, DualSense over HID, keyboard).
+- Minecraft Xbox One Edition (older XDK, `vccorlib110`): older DXGI/D3D11 interface layout wrapped, embedded context table mapped (draws, index buffer with byte offset, viewports, states, map), main menu, input (IGamepad/IController, DualSense, keyboard sticks), Xbox Live and storage operations, system keyboard, Create New World and a rendered world, zeroed heap blocks, in-world frame rate fixed (a leak in the layer, 60 FPS), a guarded compatibility patch for the blank profile.
+- Diagnostics added: `XB1_PROFILE` sampler, hardware write watches (`XB1_HWBP`, `XB1_HWBP_RVA`, `XB1_HWBP_FOLLOW`), `XB1_STORAGE_TRACE`, `XB1_NW_TRACE`, `XB1_TRACE_FRAME`/`XB1_DRAW_TRACE`, `XB1_DS_LOG`.
