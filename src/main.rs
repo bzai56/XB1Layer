@@ -1817,6 +1817,17 @@ fn override_for(dll: &str, func: &str) -> Option<usize> {
             _ => {}
         }
     }
+    // The console hands out zeroed memory from its heap and the title relies on it (Minecraft's player settings block is
+    // read before it is filled: reused desktop heap memory gave a random controller mapping and a crash on the first
+    // button press), so the C++ `operator new` of the older runtime returns zeroed blocks.
+    if dll.to_ascii_lowercase().starts_with("msvcr110") {
+        match func {
+            "??2@YAPEAX_K@Z" => return Some(xb_operator_new as usize),
+            "??_U@YAPEAX_K@Z" => return Some(xb_operator_new_array as usize),
+            "malloc" => return Some(xb_malloc as usize),
+            _ => {}
+        }
+    }
     if func == "CoCreateInstance" {
         return Some(xb_co_create_instance as usize);
     }
@@ -2010,6 +2021,49 @@ extern "system" fn xb_create_file_w(name: *const u16, access: u32, share: u32, s
 
 /// C++/CX `GetActivationFactoryByPCWSTR(class_name, guid, out)`: looks up a WinRT class factory.
 /// Passed through to the real vccorlib140; logs the class name and the HRESULT.
+/// `operator new(size_t)` of MSVCR110 with the block zeroed (see `override_for`).
+extern "system" fn xb_operator_new(size: usize) -> *mut c_void {
+    zeroed_new(size, c"??2@YAPEAX_K@Z")
+}
+
+/// `operator new[](size_t)` of MSVCR110 with the block zeroed.
+extern "system" fn xb_operator_new_array(size: usize) -> *mut c_void {
+    zeroed_new(size, c"??_U@YAPEAX_K@Z")
+}
+
+/// `malloc` of MSVCR110 with the block zeroed.
+extern "system" fn xb_malloc(size: usize) -> *mut c_void {
+    zeroed_new(size, c"malloc")
+}
+
+fn zeroed_new(size: usize, name: &std::ffi::CStr) -> *mut c_void {
+    static NEW: AtomicUsize = AtomicUsize::new(0);
+    static NEW_ARRAY: AtomicUsize = AtomicUsize::new(0);
+    static MALLOC: AtomicUsize = AtomicUsize::new(0);
+    let slot = match name.to_bytes() {
+        b"??2@YAPEAX_K@Z" => &NEW,
+        b"malloc" => &MALLOC,
+        _ => &NEW_ARRAY,
+    };
+    let mut f = slot.load(Ordering::Relaxed);
+    if f == 0 {
+        unsafe {
+            let m = GetModuleHandleA(c"MSVCR110.dll".as_ptr());
+            f = if m.is_null() { 0 } else { GetProcAddress(m, name.as_ptr()) as usize };
+        }
+        slot.store(f, Ordering::Relaxed);
+    }
+    if f == 0 {
+        return ptr::null_mut();
+    }
+    let real: extern "system" fn(usize) -> *mut c_void = unsafe { std::mem::transmute(f) };
+    let p = real(size);
+    if !p.is_null() {
+        unsafe { ptr::write_bytes(p as *mut u8, 0, size) };
+    }
+    p
+}
+
 extern "system" fn xb_get_activation_factory(name: *const u16, guid: *const u8, out: *mut *mut c_void) -> i32 {
     if !guid.is_null() && !out.is_null() {
         let class = wide_to_string(name);

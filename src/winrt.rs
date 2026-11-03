@@ -1290,7 +1290,7 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
     // Storage objects: `Get/Create(name, Object** out)` where the name is a string whose pointer is
     // not always recognizable as an HSTRING header (title call site 0x599190): the object goes to the
     // second argument, and the first is never written.
-    if o.class.starts_with("Windows.Xbox.Storage.ConnectedStorageSpace#") && (N == 9 || (N >= 7 && (arg1.is_null() || looks_like_hstring_header(arg1)))) && (arg2 as usize) % 8 == 0 && is_writable(arg2) && !in_layer_image(arg2) {
+    if o.class.starts_with("Windows.Xbox.Storage.ConnectedStorageSpace#") && o.class != "Windows.Xbox.Storage.ConnectedStorageSpace#slot6#slot8#slot6" && (N == 9 || (N >= 7 && (arg1.is_null() || looks_like_hstring_header(arg1)))) && (arg2 as usize) % 8 == 0 && is_writable(arg2) && !in_layer_image(arg2) {
         unsafe { *(arg2 as *mut *mut c_void) = create_generic(&format!("{}#slot{N}", o.class), &o.iid) };
         wlog!("[winrt] {} slot {N}: (name, out) -> a stand-in object", o.class);
         return HRESULT(0);
@@ -1682,7 +1682,21 @@ unsafe fn fill_gamepad_reading(out: *mut u8) {
         }
     }
     let axis = |v: i16| (v as f32 / 32768.0).clamp(-1.0, 1.0);
-    let r: [f32; 6] = extra_axes.unwrap_or([pad.lt as f32 / 255.0, pad.rt as f32 / 255.0, axis(pad.lx), axis(pad.ly), axis(pad.rx), axis(pad.ry)]);
+    let mut r: [f32; 6] = extra_axes.unwrap_or([pad.lt as f32 / 255.0, pad.rt as f32 / 255.0, axis(pad.lx), axis(pad.ly), axis(pad.rx), axis(pad.ry)]);
+    // Keyboard sticks (while the window has the focus): I/K/J/L = left stick up/down/left/right, numpad 8/5/4/6 = right
+    // stick, E = right trigger, R = left trigger; used when no pad is moving a stick.
+    if pid == unsafe { GetCurrentProcessId() } {
+        let down = |k: i32| unsafe { GetAsyncKeyState(k) } < 0;
+        let dir = |plus: i32, minus: i32| (down(plus) as i32 - down(minus) as i32) as f32;
+        let (lx, ly) = (dir(b'L' as i32, b'J' as i32), dir(b'I' as i32, b'K' as i32));
+        let (rx, ry) = (dir(0x66, 0x64), dir(0x68, 0x65));
+        if lx != 0.0 { r[2] = lx; }
+        if ly != 0.0 { r[3] = ly; }
+        if rx != 0.0 { r[4] = rx; }
+        if ry != 0.0 { r[5] = ry; }
+        if down(b'R' as i32) { r[0] = 1.0; }
+        if down(b'E' as i32) { r[1] = 1.0; }
+    }
     unsafe {
         ptr::write_unaligned(out as *mut u64, STAMP.fetch_add(16_667, Ordering::Relaxed));
         ptr::write_unaligned(out.add(8) as *mut u32, buttons);

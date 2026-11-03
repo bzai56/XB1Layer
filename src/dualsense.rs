@@ -164,6 +164,16 @@ fn reader() {
                 logged = true;
             }
             if let Some(s) = parse(&buf[..n as usize]) {
+                // XB1_DS_LOG=1: print the sticks and triggers when one moves, to check which stick a pad's axes land on.
+                static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *LOG.get_or_init(|| std::env::var_os("XB1_DS_LOG").is_some()) {
+                    static LAST: Mutex<[f32; 6]> = Mutex::new([0.0; 6]);
+                    let mut last = LAST.lock().unwrap();
+                    if s.1.iter().zip(last.iter()).any(|(a, b)| (a - b).abs() > 0.15) {
+                        eprintln!("[ds] LT {:.2} RT {:.2} | left stick x {:.2} y {:.2} | right stick x {:.2} y {:.2} | raw bytes 1..8 = {:02x?}", s.1[0], s.1[1], s.1[2], s.1[3], s.1[4], s.1[5], &buf[1..9.min(n as usize)]);
+                        *last = s.1;
+                    }
+                }
                 *STATE.lock().unwrap() = Some(s);
             }
         }

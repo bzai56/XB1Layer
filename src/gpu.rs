@@ -1027,7 +1027,7 @@ fn extend_object(obj: *mut c_void, real_slots: usize) {
 
 /// `(object, creating device slot)` for shaders and input layouts, so a bind call can tell which
 /// kind of object it was handed (the console binds them all through one method).
-static CREATED_KINDS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+static CREATED_KINDS: std::sync::Mutex<Option<std::collections::HashMap<usize, usize>>> = std::sync::Mutex::new(None);
 
 fn restore_object_vtable(obj: *mut c_void) {
     if obj.is_null() || (obj as usize) % 8 != 0 {
@@ -1047,7 +1047,7 @@ unsafe fn real_context(this: *mut c_void) -> *mut c_void {
 /// Console index 19 (called `(0, object, 0)` before each draw): binds a shader or an input layout.
 /// Dispatches on the creating device slot: 11 layout, 12 VS, 13 GS, 15 PS, 16 HS, 17 DS.
 unsafe extern "system" fn ctx_bind_object(this: *mut c_void, _a2: usize, obj: *mut c_void, _a4: usize) {
-    let kind = CREATED_KINDS.lock().unwrap().iter().rev().find(|(o, _)| *o == obj as usize).map(|(_, k)| *k);
+    let kind = CREATED_KINDS.lock().unwrap().as_ref().and_then(|m| m.get(&(obj as usize)).copied());
     static LOGS: AtomicU32 = AtomicU32::new(0);
     if LOGS.fetch_add(1, Ordering::Relaxed) < 12 {
         glog!("[gpu] bind object {obj:p} kind {kind:?} real {}", qi_kind(obj));
@@ -1263,7 +1263,7 @@ unsafe extern "system" fn device_create_extended<const SLOT: usize>(this: *mut c
                 if crate::VCCORLIB110.load(Ordering::Relaxed) && (20..=23).contains(&SLOT) {
                     older_sdk_state_get_desc(unsafe { *out });
                 }
-                CREATED_KINDS.lock().unwrap().push((unsafe { *out } as usize, SLOT));
+                CREATED_KINDS.lock().unwrap().get_or_insert_with(Default::default).insert(unsafe { *out } as usize, SLOT);
             }
         }
     }
@@ -1401,7 +1401,7 @@ fn apply_inlined_state(this: *mut c_void, real: *mut c_void) {
         if obj < 0x10000 || obj % 8 != 0 {
             continue;
         }
-        let kind = CREATED_KINDS.lock().unwrap().iter().rev().find(|(o, _)| *o == obj).map(|(_, k)| *k);
+        let kind = CREATED_KINDS.lock().unwrap().as_ref().and_then(|m| m.get(&obj).copied());
         let Some(kind) = kind else { continue };
         restore_object_vtable(obj as *mut c_void);
         bound[i] = kind;
@@ -1432,7 +1432,8 @@ extern "system" fn sync_before_draw(this: *mut c_void) {
     DRAWS_SINCE_PRESENT.fetch_add(1, Ordering::Relaxed);
     let real = unsafe { (*(this as *const Proxy)).real };
     apply_inlined_state(this, real);
-    if env_flag("XB1_NO_MIRROR") {
+    static NO_MIRROR: OnceLock<bool> = OnceLock::new();
+    if *NO_MIRROR.get_or_init(|| env_flag("XB1_NO_MIRROR")) {
         return;
     }
     let Ok(mut placed) = PLACED_BUFFERS.try_lock() else { return };
@@ -1600,6 +1601,14 @@ fn extend_resource(obj: *mut c_void, is_texture2d: bool) {
         }
         if is_texture2d {
             v[13] = texture_slot_13 as usize;
+        }
+        if crate::VCCORLIB110.load(Ordering::Relaxed) {
+            // Older XDK: one more method sits before `GetDesc` (console 12, desktop 10), and the resource methods
+            // 8 to 10 are the desktop ones from 7 to 9. Slot 12 was only logged, so `GetDesc` left the title's
+            // description uninitialized and the next `CreateTexture2D` failed (E_INVALIDARG, crash at `0x56022c`).
+            // Only slot 12 is added: slots 8 to 10 stay as they were because the layer itself calls slot 10 as
+            // `GetDesc` on these objects.
+            v[12] = unsafe { *((orig as *const usize).add(10)) };
         }
         std::mem::forget(arena);
         let leaked: &'static [usize] = Vec::leak(v);
@@ -2285,47 +2294,65 @@ unsafe extern "system" fn dxgi_get_buffer_wrapped(this: *mut c_void, index: u32,
 /// seen as `Texture2D::GetDesc` through slot 12).
 pub fn wrap_dxgi(real: *mut c_void, kind: u8) -> *mut c_void {
     const SLOTS: usize = 40;
-    let thunks = unsafe { VirtualAlloc(ptr::null_mut(), 4096 * 2, 0x3000, 0x40) } as *mut u8;
-    assert!(!thunks.is_null(), "thunk allocation failed");
-    let vtbl: &'static mut [usize; SLOTS] = Box::leak(Box::new([0usize; SLOTS]));
-    for (s, entry) in vtbl.iter_mut().enumerate() {
-        let desktop = match kind {
-            3 if s >= 12 => s - 2,
-            3 if (8..=10).contains(&s) => s - 1,
-            3 => s,
-            4 if s >= 8 => s - 1,
-            4 => s,
-            _ if s >= 7 => s - 1,
-            _ => s,
-        };
-        *entry = forward_thunk(unsafe { thunks.add(s * 32) }, desktop);
+    if let Some(w) = WRAPPER_OF.lock().unwrap().as_ref().and_then(|m| m.get(&(real as usize, kind))) {
+        return *w as *mut c_void;
     }
-    if kind < 3 {
-        vtbl[7] = dxgi_get_parent_wrapped as usize;
+    // One vtable per kind (the thunks do not depend on the object).
+    static VTBLS: std::sync::Mutex<[usize; 8]> = std::sync::Mutex::new([0; 8]);
+    let vtbl_ptr = {
+        let mut tables = VTBLS.lock().unwrap();
+        if tables[kind as usize & 7] == 0 {
+            let thunks = unsafe { VirtualAlloc(ptr::null_mut(), 4096 * 2, 0x3000, 0x40) } as *mut u8;
+            assert!(!thunks.is_null(), "thunk allocation failed");
+            let vtbl: &'static mut [usize; SLOTS] = Box::leak(Box::new([0usize; SLOTS]));
+            for (s, entry) in vtbl.iter_mut().enumerate() {
+                let desktop = match kind {
+                    3 if s >= 12 => s - 2,
+                    3 if (8..=10).contains(&s) => s - 1,
+                    3 => s,
+                    4 if s >= 8 => s - 1,
+                    4 => s,
+                    _ if s >= 7 => s - 1,
+                    _ => s,
+                };
+                *entry = forward_thunk(unsafe { thunks.add(s * 32) }, desktop);
+            }
+            if kind < 3 {
+                vtbl[7] = dxgi_get_parent_wrapped as usize;
+            }
+            if kind == 1 {
+                vtbl[8] = dxgi_get_adapter_wrapped as usize;
+            }
+            if kind == 2 {
+                vtbl[10] = dxgi_get_buffer_wrapped as usize;
+                vtbl[9] = dxgi_present_wrapped as usize;
+            }
+            vtbl[0] = wrapped_qi as usize;
+            if kind == 4 {
+                vtbl[8] = view_get_resource_wrapped as usize;
+            }
+            tables[kind as usize & 7] = vtbl.as_ptr() as usize;
+        }
+        tables[kind as usize & 7]
+    };
+    let obj: &'static mut [usize; 3] = Box::leak(Box::new([vtbl_ptr, real as usize, kind as usize]));
+    WRAPPERS.lock().unwrap().get_or_insert_with(Default::default).insert(obj.as_ptr() as usize, real as usize);
+    WRAPPER_OF.lock().unwrap().get_or_insert_with(Default::default).insert((real as usize, kind), obj.as_ptr() as usize);
+    static LOGS: AtomicU32 = AtomicU32::new(0);
+    if LOGS.fetch_add(1, Ordering::Relaxed) < 40 {
+        glog!("[gpu] object {real:p} wrapped as kind {kind} (0 DXGI, 1 DXGI device, 2 swap chain, 3 resource)");
     }
-    if kind == 1 {
-        vtbl[8] = dxgi_get_adapter_wrapped as usize;
-    }
-    if kind == 2 {
-        vtbl[10] = dxgi_get_buffer_wrapped as usize;
-        vtbl[9] = dxgi_present_wrapped as usize;
-    }
-    vtbl[0] = wrapped_qi as usize;
-    if kind == 4 {
-        vtbl[8] = view_get_resource_wrapped as usize;
-    }
-    let obj: &'static mut [usize; 3] = Box::leak(Box::new([vtbl.as_ptr() as usize, real as usize, kind as usize]));
-    WRAPPERS.lock().unwrap().push((obj.as_ptr() as usize, real as usize));
-    glog!("[gpu] object {real:p} wrapped as kind {kind} (0 DXGI, 1 DXGI device, 2 swap chain, 3 resource)");
     obj.as_mut_ptr() as *mut c_void
 }
 
 /// Wrapper objects made by `wrap_dxgi`, mapped to the real object they forward to.
-static WRAPPERS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+static WRAPPERS: std::sync::Mutex<Option<std::collections::HashMap<usize, usize>>> = std::sync::Mutex::new(None);
+/// `(real object, kind)` -> wrapper, so the same real object is always wrapped once.
+static WRAPPER_OF: std::sync::Mutex<Option<std::collections::HashMap<(usize, u8), usize>>> = std::sync::Mutex::new(None);
 
 /// The real object behind a wrapper, or the pointer itself when it is not one.
 pub fn unwrap_object(p: *mut c_void) -> *mut c_void {
-    WRAPPERS.lock().unwrap().iter().find(|(w, _)| *w == p as usize).map(|(_, r)| *r as *mut c_void).unwrap_or(p)
+    WRAPPERS.lock().unwrap().as_ref().and_then(|m| m.get(&(p as usize))).map(|r| *r as *mut c_void).unwrap_or(p)
 }
 
 /// `(console index, desktop slot)` pairs seen in Minecraft Xbox One Edition (older XDK), from logged
@@ -2460,7 +2487,7 @@ unsafe extern "system" fn dxgi_present_wrapped(this: *mut c_void, sync: u32, fla
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed);
     let drawn = DRAWS_SINCE_PRESENT.swap(0, Ordering::Relaxed);
     if frame < 6 || frame % 300 == 0 {
-        glog!("[gpu] frame {frame}: {drawn} draw call(s) since the last Present (last: indexed {} count {} start {})", LAST_DRAW[0].load(Ordering::Relaxed), LAST_DRAW[1].load(Ordering::Relaxed), LAST_DRAW[2].load(Ordering::Relaxed));
+        glog!("[gpu] frame {frame} at {:.1}s: {drawn} draw call(s) since the last Present (last: indexed {} count {} start {})", { static T0: OnceLock<std::time::Instant> = OnceLock::new(); T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f32() }, LAST_DRAW[0].load(Ordering::Relaxed), LAST_DRAW[1].load(Ordering::Relaxed), LAST_DRAW[2].load(Ordering::Relaxed));
     }
     if frame == 150 {
         report_context_changes();
@@ -2578,7 +2605,8 @@ unsafe extern "system" fn ctx_clear_dsv_old(this: *mut c_void, dsv: *mut c_void,
 /// title's state objects are the reason nothing shows.
 unsafe extern "system" fn ctx_state_old<const DESK: usize>(this: *mut c_void, state: *mut c_void, a3: usize, a4: usize) {
     let real = unsafe { real_context(this) };
-    let state = if env_flag("XB1_DEFAULT_STATES") { ptr::null_mut() } else { unwrap_object(state) };
+    static DEFAULT_STATES: OnceLock<bool> = OnceLock::new();
+    let state = if *DEFAULT_STATES.get_or_init(|| env_flag("XB1_DEFAULT_STATES")) { ptr::null_mut() } else { unwrap_object(state) };
     if !state.is_null() {
         restore_object_vtable(state);
     }
