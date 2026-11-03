@@ -919,6 +919,40 @@ fn looks_like_hstring_header(p: *mut c_void) -> bool {
     flags == 1 && len > 0 && len < 4096 && is_readable_ptr((data & !7) as *mut c_void)
 }
 
+/// Completes an asynchronous operation after `put_Completed` has returned, on its own thread, as the
+/// runtime does (the title sets up its state around the call and does not expect the handler to run
+/// before it returns). The handler and operation are kept referenced.
+fn complete_later(handler: *mut c_void, op: *mut c_void) {
+    if std::env::var_os("XB1_ASYNC_INLINE").is_some() {
+        unsafe {
+            let vt = *(handler as *const *const usize);
+            let invoke: unsafe extern "system" fn(*mut c_void, *mut c_void, i32) -> HRESULT = std::mem::transmute(*vt.add(3));
+            invoke(handler, op, 1);
+        }
+        return;
+    }
+    unsafe {
+        let add_ref = |p: *mut c_void| {
+            let vt = *(p as *const *const usize);
+            let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(1));
+            f(p);
+        };
+        add_ref(handler);
+    }
+    let (h, o) = (handler as usize, op as usize);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        crate::ensure_tls_on_current_thread();
+        unsafe {
+            let handler = h as *mut c_void;
+            let vt = *(handler as *const *const usize);
+            let invoke: unsafe extern "system" fn(*mut c_void, *mut c_void, i32) -> HRESULT = std::mem::transmute(*vt.add(3));
+            invoke(handler, o as *mut c_void, 1);
+        }
+        crate::restore_loader_tls();
+    });
+}
+
 /// Any method of a stand-in object. The signature is unknown, so the first argument after
 /// `this` is treated as a possible out-parameter: if it points at writable memory, a new
 /// stand-in object is stored there and the call reports success (the common shape of a
@@ -1071,6 +1105,13 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         return HRESULT(0);
     }
     // The result of an Xbox Live asynchronous operation is a collection (title loop at 0x30ec99:
+    if o.class.starts_with("Windows.Xbox.Storage.") && std::env::var_os("XB1_STORAGE_TRACE").is_some() {
+        unsafe extern "system" { fn RtlCaptureStackBackTrace(skip: u32, count: u32, frames: *mut *mut c_void, hash: *mut u32) -> u16; }
+        let mut frames = [ptr::null_mut::<c_void>(); 2];
+        unsafe { RtlCaptureStackBackTrace(1, 2, frames.as_mut_ptr(), ptr::null_mut()) };
+        let (base, _) = crate::image_range();
+        eprintln!("[storage] {} slot {N} arg1={arg1:p} arg2={arg2:p} a3={a3:p} from title+{:#x} / {:#x}", o.class, (frames[0] as usize).wrapping_sub(base), (frames[1] as usize).wrapping_sub(base));
+    }
     // slot 7 is `get_Size(uint*)`, slot 6 `GetAt`); there is no Xbox Live data, so it is empty.
     if o.class.starts_with("Microsoft.Xbox.Services.XboxLiveContext#") && o.class.ends_with("#slot8") && N == 7 && (arg1 as usize) % 4 == 0 && is_writable(arg1) {
         unsafe { *(arg1 as *mut u32) = 0 };
@@ -1183,10 +1224,17 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         wlog!("[winrt] {} slot {N}: (object, out) -> a stand-in object", o.class);
         return HRESULT(0);
     }
+    // The result of a storage query (a `GetResults` output other than the space itself) is a collection whose
+    // slot 7 is `get_Size(uint*)` (title loop at 0x594386); there is nothing stored, so it is empty.
+    if o.class.starts_with("Windows.Xbox.Storage.ConnectedStorageSpace#") && o.class.ends_with("#slot8") && o.class != "Windows.Xbox.Storage.ConnectedStorageSpace#slot6#slot8" && N == 7 && (arg1 as usize) % 4 == 0 && is_writable(arg1) && !in_layer_image(arg1) {
+        unsafe { *(arg1 as *mut u32) = 0 };
+        wlog!("[winrt] {} slot 7 (get_Size) -> 0", o.class);
+        return HRESULT(0);
+    }
     // Storage objects: `Get/Create(name, Object** out)` where the name is a string whose pointer is
     // not always recognizable as an HSTRING header (title call site 0x599190): the object goes to the
     // second argument, and the first is never written.
-    if o.class.starts_with("Windows.Xbox.Storage.ConnectedStorageSpace#") && N == 9 && (arg2 as usize) % 8 == 0 && is_writable(arg2) && !in_layer_image(arg2) {
+    if o.class.starts_with("Windows.Xbox.Storage.ConnectedStorageSpace#") && (N == 9 || (N >= 7 && (arg1.is_null() || looks_like_hstring_header(arg1)))) && (arg2 as usize) % 8 == 0 && is_writable(arg2) && !in_layer_image(arg2) {
         unsafe { *(arg2 as *mut *mut c_void) = create_generic(&format!("{}#slot{N}", o.class), &o.iid) };
         wlog!("[winrt] {} slot {N}: (name, out) -> a stand-in object", o.class);
         return HRESULT(0);
@@ -1211,10 +1259,8 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         // `put_Completed(handler)` of a storage operation: one argument, so the second register still
         // holds the object's own vtable pointer (in the layer's image); an event add would have a token pointer.
         if o.class.starts_with("Windows.Xbox.Storage.") && N == 6 && in_layer_image(arg2) {
-            let vt = unsafe { *(arg1 as *const *const usize) };
-            let invoke: unsafe extern "system" fn(*mut c_void, *mut c_void, i32) -> HRESULT = unsafe { std::mem::transmute(*vt.add(3)) };
-            let hr = unsafe { invoke(arg1, this, 1) };
-            wlog!("[winrt] {} slot 6: put_Completed -> handler Invoke(Completed) = {:#x}", o.class, hr.0 as u32);
+            complete_later(arg1, this);
+            wlog!("[winrt] {} slot 6: put_Completed -> handler Invoke(Completed) queued", o.class);
             return HRESULT(0);
         }
         if o.class.starts_with("Windows.Xbox.Storage.") {

@@ -699,3 +699,11 @@ Pressing A on "Play Game" (hold the key for about 200 ms; a 1 ms `SendKeys` pres
 - The block is the game's saved profile, which comes from the storage API whose operations are still stand-ins that complete without any data. Next step: find the profile read (container/blob read after the `(name, out)` calls) and either return "no data" in the shape the title handles (so it applies defaults) or back it with a real file store.
 - Debug aid: the `XB1_HWBP` report now also lists title addresses found on the raw stack, because the unwinder stops in leaf thunks.
 
+### Minecraft: the Start Game list works
+
+- Start Game now shows its list: Create New World, Play Tutorial and the Halo, Mass Effect and Skyrim worlds (title-bundled), with "No Games Found" on the Join side. No exceptions in a 30 s run (verified by screenshot).
+- The input-table crash was not profile data after all: the settings block held plausible values (`00 ea ea ff 68 54 ...`, mapping 1); the value 3 came from a thread race. The title expects an async operation's completion handler to run after `put_Completed` returns, on another thread; calling it inline let other threads read half-initialized state (several different crashes depending on timing). Handlers of storage operations now run on a short-lived thread 5 ms later (`complete_later`; `XB1_ASYNC_INLINE=1` goes back to inline).
+- More storage shapes: `(name, out)` with a NULL (empty) name is also slot 11, not only 9; the result of a storage query is a collection whose slot 7 is `get_Size`, now 0 (nothing saved yet). `XB1_STORAGE_TRACE=1` logs every storage stand-in call with its title call site.
+- Views created through the older SDK's `CreateShaderResourceView` and its siblings are now given a vtable shifted by one slot from 8 on, in place, since the console view has one more method before `GetDesc`. Before, the title's `GetResource` (console slot 8) ran the desktop `GetDesc`, returned nothing and crashed at `0x2b8f14`.
+- Not done: nothing is saved (the storage stand-ins hold no data), Create New World not tried.
+

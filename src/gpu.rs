@@ -1685,6 +1685,34 @@ unsafe extern "system" fn device_create_texture3d(this: *mut c_void, desc: *cons
 /// rejected with `E_INVALIDARG` (the console accepted descriptions that do not match their
 /// resource, for example a plain 2D dimension on a multisampled texture, or an all-zero one),
 /// the view is retried with no description, which makes D3D derive it from the resource.
+/// Older XDK: views have one more method before `GetDesc` (console 9, desktop 8), so a view's own vtable is
+/// replaced in place by one shifted by one from slot 8 on (`GetResource` console 8 = desktop 7). The object
+/// keeps its identity, so bind calls need no unwrapping.
+fn shift_view_vtable(obj: *mut c_void) {
+    if obj.is_null() || !crate::VCCORLIB110.load(Ordering::Relaxed) {
+        return;
+    }
+    static SHIFTED: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+    let orig = unsafe { *(obj as *const usize) };
+    let mut map = SHIFTED.lock().unwrap();
+    if map.iter().any(|(_, e)| *e == orig) {
+        return; // already shifted
+    }
+    let ext = if let Some((_, e)) = map.iter().find(|(o, _)| *o == orig) {
+        *e
+    } else {
+        let mut v = vec![0usize; 40];
+        for i in 0..40 {
+            let src = if i >= 8 { i - 1 } else { i };
+            v[i] = unsafe { *((orig as *const usize).add(src)) };
+        }
+        let leaked: &'static [usize] = Vec::leak(v);
+        map.push((orig, leaked.as_ptr() as usize));
+        leaked.as_ptr() as usize
+    };
+    unsafe { *(obj as *mut usize) = ext };
+}
+
 unsafe fn create_view(this: *mut c_void, slot: usize, name: &str, resource: *mut c_void, desc: *const c_void, out: *mut *mut c_void) -> HRESULT {
     static FALLBACKS: AtomicU32 = AtomicU32::new(0);
     let p = unsafe { &*(this as *const Proxy) };
@@ -1701,6 +1729,7 @@ unsafe fn create_view(this: *mut c_void, slot: usize, name: &str, resource: *mut
         unsafe { std::mem::transmute(*((*(p.real as *const *const usize)).add(slot))) };
     let hr = unsafe { f(p.real, unwrap_object(resource), desc, out) };
     if hr.0 >= 0 && !out.is_null() {
+        shift_view_vtable(unsafe { *out });
         // Once per kind: the vtable of the created view, to identify unknown objects by vtable.
         static SEEN: [AtomicU32; 16] = [const { AtomicU32::new(0) }; 16];
         if SEEN[slot & 15].fetch_add(1, Ordering::Relaxed) == 0 {
@@ -1717,6 +1746,7 @@ unsafe fn create_view(this: *mut c_void, slot: usize, name: &str, resource: *mut
             glog!("[gpu] {name}: description rejected ({}), retry with no description -> {:#x}", safe_dump(desc as u64, 16), retry.0 as u32);
         }
         if retry.0 >= 0 {
+            shift_view_vtable(unsafe { *out });
             return retry;
         }
         // Second fallback (shader resource views of 2D textures): a description built from the
