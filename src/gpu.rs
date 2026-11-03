@@ -985,7 +985,20 @@ unsafe extern "system" fn context_ext_212(this: *mut c_void, count: usize, a: *m
 // give the result an extended vtable: its real slots, then logging stubs. The number of real slots
 // differs per type (ID3D11DeviceChild has 7; states and queries add a few).
 
-static EXTENDED_OBJECT_VTABLES: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+/// Extended vtables of created objects: real vtable -> extended copy and back, so a lookup does not scan.
+#[derive(Default)]
+struct ExtendedVtables {
+    by_orig: std::collections::HashMap<usize, usize>,
+    by_ext: std::collections::HashMap<usize, usize>,
+}
+
+impl ExtendedVtables {
+    fn len(&self) -> usize {
+        self.by_orig.len()
+    }
+}
+
+static EXTENDED_OBJECT_VTABLES: std::sync::Mutex<Option<ExtendedVtables>> = std::sync::Mutex::new(None);
 
 /// Older XDK: the console's state objects have one more slot before `GetDesc` (8), so the extended
 /// vtable's slot 8 is the desktop `GetDesc` (7).
@@ -994,7 +1007,7 @@ fn older_sdk_state_get_desc(obj: *mut c_void) {
         return;
     }
     let ext = unsafe { *(obj as *const usize) } as *mut usize;
-    let orig = EXTENDED_OBJECT_VTABLES.lock().unwrap().iter().find(|(_, e)| *e == ext as usize).map(|(o, _)| *o);
+    let orig = EXTENDED_OBJECT_VTABLES.lock().unwrap().as_ref().and_then(|m| m.by_ext.get(&(ext as usize)).copied());
     if let Some(orig) = orig {
         unsafe { *ext.add(8) = *(orig as *const usize).add(7) };
     }
@@ -1005,8 +1018,17 @@ fn extend_object(obj: *mut c_void, real_slots: usize) {
         return;
     }
     let orig = unsafe { *(obj as *const usize) };
-    let mut map = EXTENDED_OBJECT_VTABLES.lock().unwrap();
-    let ext = if let Some((_, e)) = map.iter().find(|(k, _)| *k == orig) {
+    let mut guard = EXTENDED_OBJECT_VTABLES.lock().unwrap();
+    let map = guard.get_or_insert_with(Default::default);
+    if map.len() > 4096 {
+        return; // a runaway list means the objects are not D3D objects; extending them only costs time
+    }
+    // The runtime hands back the same object for an identical state description, and that object already carries
+    // an extended vtable; extending the extension each time leaked about nine vtables per frame.
+    if map.by_ext.contains_key(&orig) {
+        return;
+    }
+    let ext = if let Some(e) = map.by_orig.get(&orig) {
         *e
     } else {
         let mut arena = ArgArena::new();
@@ -1019,7 +1041,8 @@ fn extend_object(obj: *mut c_void, real_slots: usize) {
         }
         std::mem::forget(arena);
         let leaked: &'static [usize] = Vec::leak(v);
-        map.push((orig, leaked.as_ptr() as usize));
+        map.by_orig.insert(orig, leaked.as_ptr() as usize);
+        map.by_ext.insert(leaked.as_ptr() as usize, orig);
         leaked.as_ptr() as usize
     };
     unsafe { *(obj as *mut usize) = ext };
@@ -1029,15 +1052,17 @@ fn extend_object(obj: *mut c_void, real_slots: usize) {
 /// kind of object it was handed (the console binds them all through one method).
 static CREATED_KINDS: std::sync::Mutex<Option<std::collections::HashMap<usize, usize>>> = std::sync::Mutex::new(None);
 
-fn restore_object_vtable(obj: *mut c_void) {
+/// Puts the real vtable back on an extended object. Returns whether the object had been extended.
+fn restore_object_vtable(obj: *mut c_void) -> bool {
     if obj.is_null() || (obj as usize) % 8 != 0 {
-        return;
+        return false;
     }
     let current = unsafe { *(obj as *const usize) };
-    let map = EXTENDED_OBJECT_VTABLES.lock().unwrap();
-    if let Some((orig, _)) = map.iter().find(|(_, e)| *e == current) {
-        unsafe { *(obj as *mut usize) = *orig };
+    if let Some(orig) = EXTENDED_OBJECT_VTABLES.lock().unwrap().as_ref().and_then(|m| m.by_ext.get(&current).copied()) {
+        unsafe { *(obj as *mut usize) = orig };
+        return true;
     }
+    false
 }
 
 unsafe fn real_context(this: *mut c_void) -> *mut c_void {
@@ -2471,6 +2496,7 @@ unsafe extern "system" fn view_get_resource_wrapped(this: *mut c_void, out: *mut
 /// `IDXGISwapChain::Present(sync, flags)` as the older SDK calls it (console slot 9, desktop 8).
 unsafe extern "system" fn dxgi_present_wrapped(this: *mut c_void, sync: u32, flags: u32) -> HRESULT {
     let real = real_of(this);
+    crate::profile::start_for_current_thread();
     if std::env::var_os("XB1_READBACK").is_some() {
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
@@ -2487,7 +2513,7 @@ unsafe extern "system" fn dxgi_present_wrapped(this: *mut c_void, sync: u32, fla
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed);
     let drawn = DRAWS_SINCE_PRESENT.swap(0, Ordering::Relaxed);
     if frame < 6 || frame % 300 == 0 {
-        glog!("[gpu] frame {frame} at {:.1}s: {drawn} draw call(s) since the last Present (last: indexed {} count {} start {})", { static T0: OnceLock<std::time::Instant> = OnceLock::new(); T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f32() }, LAST_DRAW[0].load(Ordering::Relaxed), LAST_DRAW[1].load(Ordering::Relaxed), LAST_DRAW[2].load(Ordering::Relaxed));
+        glog!("[gpu] frame {frame} at {:.1}s: {drawn} draw call(s) since the last Present (last: indexed {} count {} start {}; {} extended vtables)", { static T0: OnceLock<std::time::Instant> = OnceLock::new(); T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f32() }, LAST_DRAW[0].load(Ordering::Relaxed), LAST_DRAW[1].load(Ordering::Relaxed), LAST_DRAW[2].load(Ordering::Relaxed), EXTENDED_OBJECT_VTABLES.lock().unwrap().as_ref().map_or(0, |m| m.len()));
     }
     if frame == 150 {
         report_context_changes();
@@ -2607,13 +2633,13 @@ unsafe extern "system" fn ctx_state_old<const DESK: usize>(this: *mut c_void, st
     let real = unsafe { real_context(this) };
     static DEFAULT_STATES: OnceLock<bool> = OnceLock::new();
     let state = if *DEFAULT_STATES.get_or_init(|| env_flag("XB1_DEFAULT_STATES")) { ptr::null_mut() } else { unwrap_object(state) };
-    if !state.is_null() {
-        restore_object_vtable(state);
-    }
+    let was_extended = if state.is_null() { false } else { restore_object_vtable(state) };
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, usize, usize) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(DESK))) };
     unsafe { f(real, state, a3, a4) };
     // The title keeps calling methods on the state object (GetDesc), so it gets its extended vtable back.
-    if !state.is_null() {
+    // Only objects that were extended get their extension back; extending every object that is bound added about
+    // nine vtables per frame (16000 after two minutes), each scanned linearly on every bind and call.
+    if was_extended {
         extend_object(state, 8);
         older_sdk_state_get_desc(state);
     }

@@ -16,7 +16,7 @@ An experimental compatibility layer for running Xbox One (GDK/XDK "Durango") x64
 - **Audio**: proxy for the console extension of `MMDeviceEnumerator`, console audio HAL stand-ins.
 - **Diagnostics**: crash-proof ring trace (`--ring=`, `tools\read-ring.ps1`), `--watch-sites`, `--test-d3d`, per-call GPU logging.
 
-- **Minecraft Xbox One Edition (1.2.0.0, an older XDK)** boots and shows its **main menu** (panorama, logo, buttons, text, controller prompts) with sound; the layer wraps its older DXGI/D3D11 interface layout and maps its embedded context calls (see FINDINGS). **Keyboard input works in its menu** (arrows, Z = A); **Play Game** opens the Start Game / Join Game screen and its world list; Create New World loads a world that renders in 3D with the HUD (about 20 to 40 FPS in a release build, below 60; nothing is saved yet); the world itself, the rest of the embedded calls and the dialog draw order are not done yet.
+- **Minecraft Xbox One Edition (1.2.0.0, an older XDK)** boots and shows its **main menu** (panorama, logo, buttons, text, controller prompts) with sound; the layer wraps its older DXGI/D3D11 interface layout and maps its embedded context calls (see FINDINGS). **Keyboard input works in its menu** (arrows, Z = A); **Play Game** opens the Start Game / Join Game screen and its world list; Create New World loads a world that renders in 3D with the HUD (60 FPS in a release build; nothing is saved yet; look sensitivity needs a workaround, see FINDINGS); the world itself, the rest of the embedded calls and the dialog draw order are not done yet.
 
 ## What does not work
 - **Forza Horizon 3 kiosk demo** (retired): booted into its main loop but never drew or presented. It writes AMD PM4 command packets that nothing decodes, uses placed textures with console tiling that is not de-tiled, and its D3D11X present path (`DXGIXPresentArray`, `DXGIXSetVLineNotification`) is still a logging stub.
@@ -35,7 +35,7 @@ cargo run -- path\to\title.exe --run      # also run the entry point
 
 For example, Sonic Mania, from its own folder: `xb1layer.exe "SonicMania.exe" --run`.
 
-Debug flags for `--run`: `--watch=N`, `--trace-api`, `--trace-heap`, `--iat`, `--ring=`, `--watch-sites=`. Environment: `XB1_D3D_DEBUG=1` (D3D11 debug layer), `XB1_LOG_ALL=1` (log every context call instead of forwarding), `XB1_FPS=<n>` (frame limit, default 60, 0 = off), `XB1_NO_GAMEPAD=1`, `XB1_INPUT_LOG=1` (print raw joystick changes to map an unknown pad), `XB1_NO_EXTEND=1`, `XB1_NO_MIRROR=1`, `XB1_STALL_MS=n` (hold a thread n ms at a `--watch-sites` hit). See [Architecture](docs/ARCHITECTURE.md#debugging-aids).
+Debug flags for `--run`: `--watch=N`, `--trace-api`, `--trace-heap`, `--iat`, `--ring=`, `--watch-sites=`. Environment: `XB1_D3D_DEBUG=1` (D3D11 debug layer), `XB1_LOG_ALL=1` (log every context call instead of forwarding), `XB1_FPS=<n>` (frame limit, default 60, 0 = off), `XB1_NO_GAMEPAD=1`, `XB1_INPUT_LOG=1` (print raw joystick changes to map an unknown pad), `XB1_NO_EXTEND=1`, `XB1_NO_MIRROR=1`, `XB1_STALL_MS=n` (hold a thread n ms at a `--watch-sites` hit), `XB1_PROFILE=1` (sample which module the presenting thread is in), `XB1_DS_LOG=1` (print DualSense stick values). See [Architecture](docs/ARCHITECTURE.md#debugging-aids).
 
 Run a title from its own folder so relative paths resolve.
 

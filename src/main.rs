@@ -10,6 +10,7 @@
 mod display;
 mod dualsense;
 mod gpu;
+mod profile;
 mod tlsdll;
 mod winrt;
 
