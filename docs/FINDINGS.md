@@ -715,3 +715,9 @@ Pressing A on "Play Game" (hold the key for about 200 ms; a 1 ms `SendKeys` pres
 - Debug aids: `XB1_NW_TRACE=1` prints the title call site of generic stand-in calls that write nothing; `XB1_ASYNC_DELAY_MS` sets the async completion delay.
 - Not tried yet: pressing Create New World (the world itself).
 
+### Minecraft: pressing Create New World (partial)
+
+- Two more fixes found on the way to the world: an out-parameter that is not pointer-aligned is a value getter (`uint*`, `bool*`), so the generic stand-in writes 0 there instead of an object pointer (a misaligned pointer write panicked the layer: "misaligned pointer dereference"); `ChatManager` session slot 23 is a collection the title walks with `get_Size`/`GetAt` (loop at `0x2cc790`) and is now an empty vector view (before, the unwritten size made the loop run on garbage until the C runtime crashed at `ucrtbase+0xee2bb`).
+- Not confirmed: after these fixes the sequence was interrupted by an unrelated startup crash (`0x53be0e`) and then by the machine being in use, so what Create New World does next has not been seen. Sonic Mania was not re-run after these two changes.
+- The startup crash did not occur in 28 plain runs (waits of 13 to 25 s, with and without `XB1_NO_GAMEPAD`); it has only appeared in interactive sessions, so it is not tied to the pad reader.
+

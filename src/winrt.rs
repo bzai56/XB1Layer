@@ -1246,6 +1246,14 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         wlog!("[winrt] {} slot {N}: (object, out) -> a stand-in object", o.class);
         return HRESULT(0);
     }
+    // `ChatManager` session slot 23 returns a collection the title walks with `get_Size` and `GetAt` (loop at
+    // `0x2cc790`); without chat users it is an empty vector view. The generic stand-in left the size unwritten and the
+    // loop ran on garbage until the C runtime crashed.
+    if o.class == "Microsoft.Xbox.GameChat.ChatManager#slot6" && N == 23 && (arg1 as usize) % 8 == 0 && is_writable(arg1) && !in_layer_image(arg1) {
+        unsafe { *(arg1 as *mut *mut c_void) = create_vector_view("Microsoft.Xbox.GameChat.ChatManager#slot6#slot23", &o.iid, 0) };
+        wlog!("[winrt] {} slot 23 -> an empty vector view", o.class);
+        return HRESULT(0);
+    }
     // The result of a storage query (a `GetResults` output other than the space itself) is a collection whose
     // slot 7 is `get_Size(uint*)` (title loop at 0x594386); there is nothing stored, so it is empty.
     if o.class.starts_with("Windows.Xbox.Storage.ConnectedStorageSpace#") && o.class.ends_with("#slot8") && o.class != "Windows.Xbox.Storage.ConnectedStorageSpace#slot6#slot8" && N == 7 && (arg1 as usize) % 4 == 0 && is_writable(arg1) && !in_layer_image(arg1) {
@@ -1330,6 +1338,15 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
     };
     if (std::env::var_os("XB1_NO_HEAP_OUT").is_some() || o.class == "Microsoft.Xbox.Services.Presence.PresenceData") && !on_stack && is_writable(arg1) {
         wlog!("[winrt] {} slot {N}: out-parameter {arg1:p} is not on the stack, left alone", o.class);
+        return HRESULT(0);
+    }
+    // A pointer that is not 8-aligned cannot be an `Object**`: it is a value getter (`uint*`, `bool*`), so zero is
+    // written (a pointer write there panicked on the misalignment).
+    if is_writable(arg1) && (arg1 as usize) % 8 != 0 && !in_layer_image(arg1) {
+        unsafe {
+            if (arg1 as usize) % 4 == 0 { *(arg1 as *mut u32) = 0 } else { *(arg1 as *mut u8) = 0 }
+        }
+        wlog!("[winrt] {} slot {N}: out-parameter {arg1:p} is not pointer-aligned -> value 0", o.class);
         return HRESULT(0);
     }
     if is_writable(arg1) {
