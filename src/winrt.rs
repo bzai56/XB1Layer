@@ -1212,7 +1212,10 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
     // The title reads a string (a Platform::String it hands to a wstring constructor) from slot 6
     // of the object that slot 9 of a signed-in user returns; a stand-in object there faults in
     // `Data()`. Taken to be the gamertag, so it gets a real HSTRING.
-    if o.class.starts_with("Windows.Xbox.System.User.Users (element") && o.class.ends_with("#slot9") && N >= 6 && is_writable(arg1) {
+    // The same string comes from slots 6, 8, 9 and 10 of the user display information reached through slots 7 and 6 (slot 7 is the gamerscore, a number) (title call
+    // site 0x2cae55 concatenates it; a stand-in object crashed the C runtime's copy right after Create New World).
+    let user_string = o.class.starts_with("Windows.Xbox.System.User.Users (element") && (o.class.ends_with("#slot9") && N >= 6 || o.class.ends_with("#slot7#slot6") && matches!(N, 6 | 8 | 9 | 10));
+    if user_string && is_writable(arg1) {
         unsafe { *(arg1 as *mut *mut c_void) = std::mem::transmute::<HSTRING, *mut c_void>(HSTRING::from("XB1Layer Player")) };
         wlog!("[winrt] {}: slot {N} -> HSTRING \"XB1Layer Player\"", o.class);
         return HRESULT(0);
@@ -1254,6 +1257,14 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         wlog!("[winrt] {} slot 23 -> an empty vector view", o.class);
         return HRESULT(0);
     }
+    // The object slot 7 of a user returns is a one-item collection (display information): slot 7 is `get_Size(uint*)`
+    // and slot 6 `GetAt(index, T** out)` (loop at `0x2ca99a`). The generic stand-in wrote an object pointer as the size,
+    // so the loop asked for items past the end and a NULL one crashed the title at `0x2caa0e`.
+    if o.class.starts_with("Windows.Xbox.System.User.Users (element") && o.class.ends_with("#slot7") && !o.class.ends_with("#slot7#slot7") && N == 7 && (arg1 as usize) % 4 == 0 && is_writable(arg1) && !in_layer_image(arg1) {
+        unsafe { *(arg1 as *mut u32) = 1 };
+        wlog!("[winrt] {} slot 7 (get_Size) -> 1", o.class);
+        return HRESULT(0);
+    }
     // The result of a storage query (a `GetResults` output other than the space itself) is a collection whose
     // slot 7 is `get_Size(uint*)` (title loop at 0x594386); there is nothing stored, so it is empty.
     if o.class.starts_with("Windows.Xbox.Storage.ConnectedStorageSpace#") && o.class.ends_with("#slot8") && o.class != "Windows.Xbox.Storage.ConnectedStorageSpace#slot6#slot8" && N == 7 && (arg1 as usize) % 4 == 0 && is_writable(arg1) && !in_layer_image(arg1) {
@@ -1263,7 +1274,7 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
     }
     // Storage operations started with `(object, 0, Operation** out)` (title call site 0x5a8eee): the out pointer
     // is the third argument, and the result is an asynchronous operation (its `put_Completed` is handled above).
-    if o.class.starts_with("Windows.Xbox.Storage.ConnectedStorageSpace#") && N >= 7 && looks_like_com_object(arg1) && arg2.is_null() && (a3 as usize) % 8 == 0 && is_writable(a3) && !in_layer_image(a3) {
+    if o.class.starts_with("Windows.Xbox.Storage.ConnectedStorageSpace#") && (N >= 7 || (N == 6 && o.class == "Windows.Xbox.Storage.ConnectedStorageSpace#slot6#slot8#slot9")) && looks_like_com_object(arg1) && arg2.is_null() && (a3 as usize) % 8 == 0 && is_writable(a3) && !in_layer_image(a3) {
         unsafe { *(a3 as *mut *mut c_void) = create_generic(&format!("{}#slot{N}", o.class), &o.iid) };
         wlog!("[winrt] {} slot {N}: (object, 0, out) -> an async operation", o.class);
         return HRESULT(0);
@@ -1295,7 +1306,7 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         }
         // `put_Completed(handler)` of a storage operation: one argument, so the second register still
         // holds the object's own vtable pointer (in the layer's image); an event add would have a token pointer.
-        if o.class.starts_with("Windows.Xbox.Storage.") && N == 6 && in_layer_image(arg2) {
+        if o.class.starts_with("Windows.Xbox.Storage.") && N == 6 && (in_layer_image(arg2) || arg2.is_null()) {
             complete_later(arg1, this);
             wlog!("[winrt] {} slot 6: put_Completed -> handler Invoke(Completed) queued", o.class);
             return HRESULT(0);

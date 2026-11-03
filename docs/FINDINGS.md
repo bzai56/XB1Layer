@@ -721,3 +721,13 @@ Pressing A on "Play Game" (hold the key for about 200 ms; a 1 ms `SendKeys` pres
 - Not confirmed: after these fixes the sequence was interrupted by an unrelated startup crash (`0x53be0e`) and then by the machine being in use, so what Create New World does next has not been seen. Sonic Mania was not re-run after these two changes.
 - The startup crash did not occur in 28 plain runs (waits of 13 to 25 s, with and without `XB1_NO_GAMEPAD`); it has only appeared in interactive sessions, so it is not tied to the pad reader.
 
+### Minecraft: pressing Create New World, current stop
+
+Pressing the button (verified by log, no screenshot of the result) now goes through these steps, each fixed in turn:
+- the user's display information (`User` slot 7, then slot 6) is read as strings (slots 6, 8, 9, 10; slot 7 is a number, the gamerscore): they now return HSTRINGs; before, an object there crashed the C runtime's copy in a string concatenation (`ucrtbase+0xee2bb`, call site `0x2cae55`);
+- the object `User` slot 7 returns is a one-item collection: slot 7 is `get_Size` (now 1), slot 6 `GetAt`; before, the size was an object pointer and the loop at `0x2ca99a` ran past the end (`0x2caa0e`);
+- a storage container's slot 6 with `(object, 0, out)` starts an operation (call site `0x59ce2f`), and a storage operation's `put_Completed` may arrive with a NULL second register.
+
+Current stop: crash at `title+0x2d4a86` (`mov r8,[rcx]` with `rcx = [wrapper+0x20]` NULL), in the title's continuation helper (`0x2d4a00`) that wraps a storage operation and hooks a handler on it. The operation it wraps is NULL, so some earlier storage call that should have returned an operation (or whose out pointer is elsewhere) returned nothing. The operation-start fix above fires (logged) and does not change this, so the missing operation comes from another call. Next: trace every storage call from the container creation to this point with `XB1_STORAGE_TRACE=1` and `XB1_NW_TRACE=1` and compare with the call sequence in the title around `0x59ce2f`.
+Sonic Mania was last verified before the string fixes (3 Present1, no exceptions); it has not been re-run after them.
+
