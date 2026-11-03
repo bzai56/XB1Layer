@@ -310,6 +310,15 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                 for f in frames[..n].iter().map(|f| *f as usize).filter(|f| *f >= base && *f < base + size).take(8) {
                     rlog!("  caller title+{:#x}", f - base);
                 }
+                // XB1_HWBP_FOLLOW=1: after the first report the watch moves to the object the written pointer points at
+                // (its first eight bytes), to see who fills and overwrites it afterwards.
+                static FOLLOWED: AtomicBool = AtomicBool::new(false);
+                if std::env::var_os("XB1_HWBP_FOLLOW").is_some() && new > 0x10000 && new % 8 == 0 && !FOLLOWED.swap(true, Ordering::Relaxed) {
+                    *(ctx0.add(0x48) as *mut u64) = new;
+                    HWBP_ADDR.store(new as usize, Ordering::Relaxed);
+                    arm_hwbp_all_threads(new as usize);
+                    rlog!("[hwbp] now watching the object at {new:#x}");
+                }
                 // The unwinder stops early in leaf thunks: also list the title addresses found on the raw stack.
                 let rsp = *(ctx0.add(0x98) as *const usize);
                 let mut words = [0usize; 96];
@@ -920,6 +929,14 @@ unsafe fn bootstrap(base: *mut u8, size: usize, tls: (u32, u32), exc: (u32, u32)
     IMG_BASE.store(base as usize, Ordering::Relaxed);
     IMG_SIZE.store(size, Ordering::Relaxed);
     AddVectoredExceptionHandler(1, crash_logger);
+    // XB1_HWBP_RVA=0xa5ee08: arm the hardware write breakpoint on a fixed title address from the start (threads
+    // created later get it in their trampoline), to see who writes a global the title sets early.
+    if let Some(rva) = std::env::var("XB1_HWBP_RVA").ok().and_then(|v| usize::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
+        let addr = base as usize + rva;
+        HWBP_ADDR.store(addr, Ordering::Relaxed);
+        unsafe { arm_hwbp_on(GetCurrentThread(), addr) };
+        rlog!("hardware write breakpoint armed from the start on title+{rva:#x}");
+    }
     if let Ok(spec) = std::env::var("XB1_HWBP") {
         let _ = HWBP_SPEC.set(spec);
     }
@@ -1406,6 +1423,60 @@ unsafe fn patch_filesys_storage(base: *mut u8, size: usize) {
     jump.extend_from_slice(&(thunk as u64).to_le_bytes());
     ptr::copy_nonoverlapping(jump.as_ptr(), base.add(SITE), 14);
     println!("compat: CFileSys storage object stubbed (title+{SITE:#x})");
+}
+
+/// Minecraft Xbox One Edition 1.2.0.0: the storage manager copies the loaded player profile (`memcpy(block, buffer, n)`
+/// at `title+0x5a8b4a`) over the default options the game has just set. The layer's storage stand-ins complete the
+/// load without any data, so the buffer is blank and the copy zeroed the look sensitivity and the other options. A record
+/// without any option set means "no saved profile": the copy is skipped and the defaults stay. Applied only if the original
+/// bytes match (`call memcpy; mov rcx,[rdi]; call [rip+disp]`).
+unsafe fn patch_profile_copy(base: *mut u8, size: usize) {
+    const SITE: usize = 0x5a8b4a;
+    const MEMCPY_STUB: usize = 0x6ad62a;
+    if SITE + 14 > size {
+        return;
+    }
+    let site = std::slice::from_raw_parts(base.add(SITE), 14);
+    let rel = i32::from_le_bytes([site[1], site[2], site[3], site[4]]);
+    let target = (SITE as i64 + 5 + rel as i64) as usize;
+    if site[0] != 0xE8 || target != MEMCPY_STUB || site[5..8] != [0x48, 0x8B, 0x0F] || site[8..10] != [0xFF, 0x15] {
+        return;
+    }
+    let disp = i32::from_le_bytes([site[10], site[11], site[12], site[13]]);
+    let slot = base as usize + (SITE as i64 + 14 + disp as i64) as usize; // the IAT slot `call [rip+disp]` uses
+    let thunk = VirtualAlloc(ptr::null_mut(), 96, MEM_COMMIT_RESERVE, PAGE_RWX) as *mut u8;
+    let mut code: Vec<u8> = vec![0x48, 0xB8]; // mov rax, compat_profile_copy
+    code.extend_from_slice(&(compat_profile_copy as usize as u64).to_le_bytes());
+    code.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    code.extend_from_slice(&[0x48, 0x8B, 0x0F]); // mov rcx, [rdi]
+    code.extend_from_slice(&[0x48, 0xB8]); // mov rax, slot
+    code.extend_from_slice(&(slot as u64).to_le_bytes());
+    code.extend_from_slice(&[0xFF, 0x10]); // call [rax]
+    code.extend_from_slice(&[0xFF, 0x25, 0, 0, 0, 0]); // jmp [rip+0]
+    code.extend_from_slice(&((base as u64) + (SITE as u64) + 14).to_le_bytes());
+    ptr::copy_nonoverlapping(code.as_ptr(), thunk, code.len());
+    let mut jump: Vec<u8> = vec![0xFF, 0x25, 0, 0, 0, 0];
+    jump.extend_from_slice(&(thunk as u64).to_le_bytes());
+    ptr::copy_nonoverlapping(jump.as_ptr(), base.add(SITE), 14);
+    println!("compat: profile copy skips a profile record without options (title+{SITE:#x})");
+}
+
+/// `memcpy(dst, src, n)` that leaves `dst` alone when `src` is all zeros (see `patch_profile_copy`).
+extern "system" fn compat_profile_copy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    unsafe {
+        if dst.is_null() || src.is_null() || n == 0 {
+            return dst;
+        }
+        rlog!("[compat] profile copy: {n} bytes, source starts {:02x?}", std::slice::from_raw_parts(src, n.min(8)));
+        // The option bytes (1 to 6) of a saved profile are never all zero (sensitivities, volumes, ...); byte 7 holds a
+        // header value (0x96) even in the blank record the stand-in storage hands back.
+        if n >= 8 && n <= 4096 && std::slice::from_raw_parts(src, n)[1..7].iter().all(|b| *b == 0) {
+            rlog!("[compat] profile record has no options set ({n} bytes): the defaults are kept");
+            return dst;
+        }
+        ptr::copy(src, dst, n);
+    }
+    dst
 }
 
 /// Logs who ends the process, then does it.
@@ -2624,6 +2695,7 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool, dump_iat: bool) -> Res
         }
         if std::env::var_os("XB1_NO_COMPAT").is_none() {
             unsafe { patch_filesys_storage(base, size_of_image) };
+            unsafe { patch_profile_copy(base, size_of_image) };
         }
         // XB1_PATCH="0x142cf6d=b201;0x...=..." (or --patch=...): write bytes into the mapped title
         // before it runs. For experiments and per-title compatibility fixes.

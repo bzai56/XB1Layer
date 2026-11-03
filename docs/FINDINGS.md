@@ -761,3 +761,9 @@ Sonic Mania was last verified before the string fixes (3 Present1, no exceptions
 - The debug build is several times slower than the release build; use `targetelease±layer.exe` to play.
 - Also fixed in the same pass: the right stick not turning the camera (player settings block is all zero; workaround documented above), and `XB1_DS_LOG=1` / `XB1_PROFILE=1` / `XB1_POKE reg+off>off2=v` debug aids.
 
+### Minecraft: look sensitivity fixed with a guarded compat patch
+
+- Root cause (found with the hardware write watch on the settings-block pointer `title+0xa5ee08`, new `XB1_HWBP_RVA` and `XB1_HWBP_FOLLOW`): the title's defaults routine (`0x860f0`, called from `0x189a0c`) does set sensible defaults for every pad (options 0, 1 and 4 = 100, option 2 = 50, ...; the first qword of the block ends as `0x960d003264646401`). Then the storage manager's load-complete handler (`0x5a8ae0`, `memcpy` at `0x5a8b4a`) copies the loaded profile buffer over the block. The layer's storage stand-ins complete that load without any data, so the buffer holds only a header byte (`[7] = 0x96`) and the options (bytes 1 to 6) become zero: look sensitivity 0, so no camera rotation.
+- Patch (in the style of the existing `patch_filesys_storage`, applied only if the original bytes match; `XB1_NO_COMPAT=1` turns it off): the `call memcpy` at `title+0x5a8b4a` goes through `compat_profile_copy`, which skips the copy when bytes 1 to 6 of the loaded record are all zero (a saved profile never has all its options at zero). The defaults stay. Verified: without any `XB1_POKE`, the same right-stick key that did nothing before now turns the camera a long way (two screenshots from one run), no exceptions; the hardware watch shows no overwrite after the defaults.
+- This is a per-title workaround, not storage emulation. The proper fix is a real connected-storage backend that keeps what the title writes and reports a missing profile as missing (not as a successful empty read).
+
