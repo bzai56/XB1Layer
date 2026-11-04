@@ -193,6 +193,10 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
                 v.push((index_of(EMBED_TABLE + 51 * 8), ctx_clear_dsv_old as usize));
                 v.push((index_of(EMBED_TABLE + 43 * 8), ctx_scissor_old as usize));
                 v.push((index_of(EMBED_TABLE + 46 * 8), ctx_update_old as usize));
+                v.push((index_of(EMBED_TABLE + 7 * 8), ctx_ps_srv_old as usize));
+                v.push((index_of(EMBED_TABLE + 6 * 8), ctx_vs_cb_old as usize));
+                v.push((index_of(EMBED_TABLE + 17 * 8), ctx_ia_vb_old as usize));
+                v.push((index_of(EMBED_TABLE + 15 * 8), ctx_ps_cb_old as usize));
                 v.push((index_of(EMBED_TABLE + 44 * 8), ctx_idx44_old as usize));
                 v.push((index_of(EMBED_TABLE + 12 * 8), ctx_draw_old as usize));
                 v.push((index_of(EMBED_TABLE + 31 * 8), ctx_om_set_render_targets_old as usize));
@@ -1175,6 +1179,263 @@ static LAST_IB: AtomicU32 = AtomicU32::new(0);
 static LAST_IB_PTR: AtomicUsize = AtomicUsize::new(0);
 static LAST_IB_ARGS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
 
+/// The constant buffers last bound to each stage (slots 0 to 3), for the trace.
+static LAST_VS_CB: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+static LAST_PS_CB: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+
+fn record_cbs(into: &[AtomicUsize; 4], start: u32, count: u32, buffers: *const *mut c_void) {
+    if buffers.is_null() {
+        return;
+    }
+    for i in 0..(count as usize).min(4) {
+        let slot = start as usize + i;
+        if slot < 4 {
+            into[slot].store(unsafe { *buffers.add(i) } as usize, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Older-XDK embedded index 6 (+0x410): `VSSetConstantBuffers(start, count, buffers)` (desktop 7), forwarded.
+unsafe extern "system" fn ctx_vs_cb_old(this: *mut c_void, start: u32, count: u32, buffers: *const *mut c_void) {
+    record_cbs(&LAST_VS_CB, start, count, buffers);
+    let real = unsafe { real_context(this) };
+    let f: unsafe extern "system" fn(*mut c_void, u32, u32, *const *mut c_void) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(7))) };
+    unsafe { f(real, start, count, buffers) };
+}
+
+/// Older-XDK embedded index 15 (+0x458): `PSSetConstantBuffers(start, count, buffers)` (desktop 16), forwarded.
+unsafe extern "system" fn ctx_ps_cb_old(this: *mut c_void, start: u32, count: u32, buffers: *const *mut c_void) {
+    record_cbs(&LAST_PS_CB, start, count, buffers);
+    let real = unsafe { real_context(this) };
+    let f: unsafe extern "system" fn(*mut c_void, u32, u32, *const *mut c_void) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(16))) };
+    unsafe { f(real, start, count, buffers) };
+}
+
+/// The vertex buffer last bound to slot 0 with its stride and offset (trace only).
+static LAST_VB: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+
+/// Older-XDK embedded index 17 (+0x468): `IASetVertexBuffers(start, count, buffers, strides, offsets)` (desktop 18), forwarded.
+unsafe extern "system" fn ctx_ia_vb_old(this: *mut c_void, start: u32, count: u32, buffers: *const *mut c_void, strides: *const u32, offsets: *const u32) {
+    if start == 0 && count >= 1 && !buffers.is_null() && !strides.is_null() && !offsets.is_null() {
+        LAST_VB[0].store(unsafe { *buffers } as usize, Ordering::Relaxed);
+        LAST_VB[1].store(unsafe { *strides } as usize, Ordering::Relaxed);
+        LAST_VB[2].store(unsafe { *offsets } as usize, Ordering::Relaxed);
+    }
+    let real = unsafe { real_context(this) };
+    let f: unsafe extern "system" fn(*mut c_void, u32, u32, *const *mut c_void, *const u32, *const u32) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(18))) };
+    unsafe { f(real, start, count, buffers, strides, offsets) };
+}
+
+/// The first vertices of the vertex buffer, read back through a staging copy (trace only; slow).
+fn read_vertices(real: *mut c_void) -> String {
+    let buffer = LAST_VB[0].load(Ordering::Relaxed) as *mut c_void;
+    let (stride, offset) = (LAST_VB[1].load(Ordering::Relaxed), LAST_VB[2].load(Ordering::Relaxed));
+    if buffer.is_null() || stride == 0 || stride > 128 {
+        return "no vertex buffer".into();
+    }
+    unsafe {
+        let vt = *(real as *const *const usize);
+        let bvt = *(buffer as *const *const usize);
+        let get_desc: unsafe extern "system" fn(*mut c_void, *mut u32) = std::mem::transmute(*bvt.add(10));
+        let mut d = [0u32; 6];
+        get_desc(buffer, d.as_mut_ptr());
+        let width = d[0] as usize;
+        if width == 0 || width > 16 * 1024 * 1024 || offset >= width {
+            return format!("{width} bytes, offset {offset} (not read)");
+        }
+        let get_device: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = std::mem::transmute(*vt.add(3));
+        let mut device: *mut c_void = ptr::null_mut();
+        get_device(real, &mut device);
+        if device.is_null() {
+            return "no device".into();
+        }
+        let dvt = *(device as *const *const usize);
+        let create: unsafe extern "system" fn(*mut c_void, *const u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(*dvt.add(3));
+        let desc: [u32; 6] = [width as u32, 3, 0, 0x20000, 0, 0];
+        let mut staging: *mut c_void = ptr::null_mut();
+        let mut text = String::new();
+        if create(device, desc.as_ptr(), ptr::null(), &mut staging).0 >= 0 && !staging.is_null() {
+            let copy: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(*vt.add(47));
+            copy(real, staging, buffer);
+            let map: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut [usize; 3]) -> HRESULT = std::mem::transmute(*vt.add(14));
+            let mut mapped = [0usize; 3];
+            if map(real, staging, 0, 1, 0, &mut mapped).0 >= 0 {
+                let base = (mapped[0] + offset) as *const u8;
+                let per = stride / 4;
+                let avail = (width - offset) / stride;
+                text = format!("{width} bytes, stride {stride}, offset {offset}:");
+                for v in 0..avail.min(4) {
+                    let f = std::slice::from_raw_parts(base.add(v * stride) as *const f32, per);
+                    text.push_str(&format!(" v{v} {:?}", f));
+                }
+                let unmap: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*vt.add(15));
+                unmap(real, staging, 0);
+            }
+            let srel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*((*(staging as *const *const usize)).add(2)));
+            srel(staging);
+        }
+        let drel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*dvt.add(2));
+        drel(device);
+        text
+    }
+}
+
+/// Reads back a 2D texture (staging copy) and prints, per band of 16 rows, how many pixels of the first channel are not zero
+/// (trace only; done once per texture size and format). Tells whether an atlas holds data where draws sample it.
+fn trace_texture_bands(real: *mut c_void, tex: *mut c_void, w: u32, h: u32, format: u32) {
+    if format != 61 && format != 28 {
+        return;
+    }
+    let step = if format == 61 { 1usize } else { 4 };
+    unsafe {
+        let vt = *(real as *const *const usize);
+        let get_device: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = std::mem::transmute(*vt.add(3));
+        let mut device: *mut c_void = ptr::null_mut();
+        get_device(real, &mut device);
+        if device.is_null() {
+            return;
+        }
+        let dvt = *(device as *const *const usize);
+        let create: unsafe extern "system" fn(*mut c_void, *const u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(*dvt.add(5));
+        // D3D11_TEXTURE2D_DESC: w, h, mips, array, format, sample count, quality, usage (STAGING 3), bind, cpu (READ 0x20000), misc
+        let desc: [u32; 11] = [w, h, 1, 1, format, 1, 0, 3, 0, 0x20000, 0];
+        let mut staging: *mut c_void = ptr::null_mut();
+        if create(device, desc.as_ptr(), ptr::null(), &mut staging).0 >= 0 && !staging.is_null() {
+            let copy: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(*vt.add(47));
+            copy(real, staging, tex);
+            let map: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut [usize; 3]) -> HRESULT = std::mem::transmute(*vt.add(14));
+            let mut mapped = [0usize; 3];
+            if map(real, staging, 0, 1, 0, &mut mapped).0 >= 0 {
+                let pitch = (mapped[1] & 0xFFFF_FFFF) as usize; // RowPitch is the low half; DepthPitch is packed above it
+                let mut bands = Vec::new();
+                for band in 0..(h as usize / 16) {
+                    let mut nonzero = 0u32;
+                    for row in band * 16..band * 16 + 16 {
+                        let line = std::slice::from_raw_parts((mapped[0] + row * pitch) as *const u8, w as usize * step);
+                        nonzero += line.iter().step_by(step).filter(|b| **b != 0).count() as u32;
+                    }
+                    bands.push(nonzero);
+                }
+                glog!("[gpu]   trace: texture {w}x{h} format {format} non-zero pixels per 16-row band: {bands:?}");
+                let unmap: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*vt.add(15));
+                unmap(real, staging, 0);
+            }
+            let srel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*((*(staging as *const *const usize)).add(2)));
+            srel(staging);
+        }
+        let drel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*dvt.add(2));
+        drel(device);
+    }
+}
+
+/// A checksum of a rectangle of the current render target (8-bit RGBA), read back through a staging copy (trace only).
+fn render_target_checksum(real: *mut c_void, left: usize, top: usize, right: usize, bottom: usize) -> String {
+    let rtv = LAST_RTV.load(Ordering::Relaxed) as *mut c_void;
+    if rtv.is_null() {
+        return "no render target".into();
+    }
+    unsafe {
+        let vt = *(real as *const *const usize);
+        let get_resource: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = std::mem::transmute(*((*(rtv as *const *const usize)).add(7)));
+        let mut res: *mut c_void = ptr::null_mut();
+        get_resource(rtv, &mut res);
+        if res.is_null() {
+            return "no resource".into();
+        }
+        let rvt = *(res as *const *const usize);
+        let get_desc: unsafe extern "system" fn(*mut c_void, *mut u32) = std::mem::transmute(*rvt.add(10));
+        let mut d = [0u32; 11];
+        get_desc(res, d.as_mut_ptr());
+        let (w, h, format) = (d[0], d[1], d[4]);
+        let mut out = format!("{w}x{h} format {format}");
+        if format == 28 || format == 87 {
+            let get_device: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = std::mem::transmute(*vt.add(3));
+            let mut device: *mut c_void = ptr::null_mut();
+            get_device(real, &mut device);
+            if !device.is_null() {
+                let dvt = *(device as *const *const usize);
+                let create: unsafe extern "system" fn(*mut c_void, *const u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(*dvt.add(5));
+                let desc: [u32; 11] = [w, h, 1, 1, format, 1, 0, 3, 0, 0x20000, 0];
+                let mut staging: *mut c_void = ptr::null_mut();
+                if create(device, desc.as_ptr(), ptr::null(), &mut staging).0 >= 0 && !staging.is_null() {
+                    let copy: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(*vt.add(47));
+                    copy(real, staging, res);
+                    let map: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut [usize; 3]) -> HRESULT = std::mem::transmute(*vt.add(14));
+                    let mut mapped = [0usize; 3];
+                    if map(real, staging, 0, 1, 0, &mut mapped).0 >= 0 {
+                        let pitch = (mapped[1] & 0xFFFF_FFFF) as usize;
+                        let (mut sum, mut bright) = (0u64, 0u32);
+                        for y in top.min(h as usize)..bottom.min(h as usize) {
+                            let line = std::slice::from_raw_parts((mapped[0] + y * pitch) as *const u8, w as usize * 4);
+                            for x in left.min(w as usize)..right.min(w as usize) {
+                                let px = &line[x * 4..x * 4 + 4];
+                                sum += px[0] as u64 + px[1] as u64 + px[2] as u64;
+                                if px[0] > 200 && px[1] > 150 && px[2] < 140 { bright += 1; }
+                            }
+                        }
+                        out = format!("{out}: sum {sum}, gold-ish pixels {bright}");
+                        let unmap: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*vt.add(15));
+                        unmap(real, staging, 0);
+                    }
+                    let srel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*((*(staging as *const *const usize)).add(2)));
+                    srel(staging);
+                }
+                let drel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*dvt.add(2));
+                drel(device);
+            }
+        }
+        let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*rvt.add(2));
+        release(res);
+        out
+    }
+}
+
+/// The first 48 bytes of a constant buffer as floats, read back through a staging copy (trace only; slow).
+fn read_constant_buffer(real: *mut c_void, buffer: *mut c_void) -> String {
+    if buffer.is_null() {
+        return "none".into();
+    }
+    unsafe {
+        let vt = *(real as *const *const usize);
+        let bvt = *(buffer as *const *const usize);
+        let get_desc: unsafe extern "system" fn(*mut c_void, *mut u32) = std::mem::transmute(*bvt.add(10));
+        let mut d = [0u32; 6];
+        get_desc(buffer, d.as_mut_ptr());
+        let width = d[0];
+        if width == 0 || width > 65536 {
+            return format!("{width} bytes (not read)");
+        }
+        let get_device: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = std::mem::transmute(*vt.add(3));
+        let mut device: *mut c_void = ptr::null_mut();
+        get_device(real, &mut device);
+        if device.is_null() {
+            return "no device".into();
+        }
+        let dvt = *(device as *const *const usize);
+        let create: unsafe extern "system" fn(*mut c_void, *const u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(*dvt.add(3));
+        let desc: [u32; 6] = [width, 3, 0, 0x20000, 0, 0]; // STAGING, CPU read
+        let mut staging: *mut c_void = ptr::null_mut();
+        let mut text = String::new();
+        if create(device, desc.as_ptr(), ptr::null(), &mut staging).0 >= 0 && !staging.is_null() {
+            let copy: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(*vt.add(47));
+            copy(real, staging, buffer);
+            let map: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut [usize; 3]) -> HRESULT = std::mem::transmute(*vt.add(14));
+            let mut mapped = [0usize; 3];
+            if map(real, staging, 0, 1, 0, &mut mapped).0 >= 0 {
+                let f = std::slice::from_raw_parts(mapped[0] as *const f32, (width as usize / 4).min(12));
+                text = format!("{width} bytes {:?}", f);
+                let unmap: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*vt.add(15));
+                unmap(real, staging, 0);
+            }
+            let srel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*((*(staging as *const *const usize)).add(2)));
+            srel(staging);
+        }
+        let drel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*dvt.add(2));
+        drel(device);
+        text
+    }
+}
+
 /// `XB1_DRAW_TRACE=n` (with `XB1_TRACE_FRAME`): logs the first n draws from that Present on.
 /// `XB1_TRACE_FILE=path`: the draw trace stays off until that file exists (checked once a second at Present).
 static TRACE_TRIGGER: AtomicBool = AtomicBool::new(true);
@@ -1202,6 +1463,40 @@ fn draw_trace(kind: &str, count: u32, start: u32, ctx: *mut c_void) {
                 unsafe { ptr::copy_nonoverlapping((ctx as *const u8).add(0x160), f.as_mut_ptr() as *mut u8, 64) };
             }
             glog!("[gpu] draw #{n} {kind} count {count} start {start} (index buffer bytes {:#x}, format arg {}, offset arg {:#x}) ctx+0x160 {:x?}", LAST_IB.load(Ordering::Relaxed), LAST_IB_ARGS[0].load(Ordering::Relaxed), LAST_IB_ARGS[1].load(Ordering::Relaxed), f);
+            if (n == 18 || n == 19 || n == 60 || n == 100 || n == 140) && !ctx.is_null() {
+                // Before and after the credits text draws (about #19 to #80): the same rectangle of the render target.
+                let real = unsafe { real_context(ctx) };
+                glog!("[gpu]   trace: render target before draw #{n}: {}", render_target_checksum(real, 838, 395, 1088, 441));
+            }
+            if n < 6 && !ctx.is_null() {
+                // The texture bound at slot 0 for the first draws: if it is a 512x512 R8 atlas, are its rows filled?
+                let v = LAST_SRV0.load(Ordering::Relaxed) as *mut c_void;
+                if !v.is_null() {
+                    let real = unsafe { real_context(ctx) };
+                    let vt = unsafe { *(v as *const *const usize) };
+                    let get_resource: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = unsafe { std::mem::transmute(*vt.add(8)) };
+                    let mut res: *mut c_void = ptr::null_mut();
+                    unsafe { get_resource(v, &mut res) };
+                    if !res.is_null() {
+                        let rvt = unsafe { *(res as *const *const usize) };
+                        let gd: unsafe extern "system" fn(*mut c_void, *mut u32) = unsafe { std::mem::transmute(*rvt.add(10)) };
+                        let mut td = [0u32; 11];
+                        unsafe { gd(res, td.as_mut_ptr()) };
+                        glog!("[gpu]   trace: slot 0 texture {}x{} format {}", td[0], td[1], td[4]);
+                        if td[0] == 512 && td[1] == 512 && td[4] == 61 {
+                            trace_texture_bands(real, res, td[0], td[1], td[4]);
+                        }
+                        let release: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { std::mem::transmute(*rvt.add(2)) };
+                        unsafe { release(res) };
+                    }
+                }
+            }
+            if n < 120 && !ctx.is_null() {
+                let real = unsafe { real_context(ctx) };
+                glog!("[gpu]   trace: VS cb0 {}", read_constant_buffer(real, LAST_VS_CB[0].load(Ordering::Relaxed) as *mut c_void));
+                glog!("[gpu]   trace: PS cb0 {}", read_constant_buffer(real, LAST_PS_CB[0].load(Ordering::Relaxed) as *mut c_void));
+                glog!("[gpu]   trace: vertices {}", read_vertices(real));
+            }
         }
     }
 }
@@ -2415,13 +2710,25 @@ pub fn unwrap_object(p: *mut c_void) -> *mut c_void {
 /// `RSSetViewports` (desktop 44); 33 `OMSetBlendState(state, factor, mask)` (35), 34 `OMSetDepthStencilState(state, ref)` (36),
 /// 41 `RSSetState` (43), 43 `RSSetScissorRects` (45), 46 `UpdateSubresource` with the subresource counting 0 to 4 (48),
 /// 51 `ClearDepthStencilView(dsv, 3, ..)` (53), all two behind the desktop; 17 `IASetVertexBuffers` (18), 6 and 15 the VS and PS `SetConstantBuffers` (7, 16), 19 and 20 the PS `SetShaderResources`/`SetSamplers` (8, 10) and 7 the VS resources (25; a guess), 18 the Sonic-shaped `IASetIndexBuffer(format, buffer, offset)`, 10 a packed `DrawIndexed`, 11 `Draw`; 13 is `Map` (see `ctx_map_old`, desktop 14) and 14 `Unmap(res, 0)` (desktop 15).
-const OLD_SDK_EXTRA: [(usize, usize); 8] =
-    [(14, 15), (17, 18), (6, 7), (15, 16), (7, 8), (9, 10), (23, 25), (24, 26)];
+const OLD_SDK_EXTRA: [(usize, usize); 4] =
+    [(14, 15), (9, 10), (23, 25), (24, 26)];
 
 /// Older-XDK embedded index 13 (+0x448): `Map(resource, subresource, map type, flags, void** data)`. The
 /// console returns the data pointer itself; the desktop fills a `D3D11_MAPPED_SUBRESOURCE`
 /// (`[pData, RowPitch, DepthPitch]`). Evidence: called as `(res, 0, 4, 0, &p)` then `*p` is written
 /// and index 14 (+0x450, `Unmap(res, 0)`, desktop 15) follows.
+/// Whether `res` is a 2D texture of 512x512 R8 (format 61): the font atlas the credits text samples (diagnostics only).
+fn is_atlas(res: *mut c_void) -> bool {
+    if res.is_null() || (res as usize) % 8 != 0 {
+        return false;
+    }
+    let vt = unsafe { *(res as *const *const usize) };
+    let get_desc: unsafe extern "system" fn(*mut c_void, *mut u32) = unsafe { std::mem::transmute(*vt.add(10)) };
+    let mut d = [0u32; 11];
+    unsafe { get_desc(res, d.as_mut_ptr()) };
+    d[0] == 512 && d[1] == 512 && d[2] == 1 && d[3] == 1 && d[4] == 61
+}
+
 unsafe extern "system" fn ctx_map_old(this: *mut c_void, res: *mut c_void, sub: u32, map_type: u32, flags: u32, out: *mut *mut c_void) -> HRESULT {
     let real = unsafe { real_context(this) };
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut [usize; 3]) -> HRESULT =
@@ -2434,6 +2741,11 @@ unsafe extern "system" fn ctx_map_old(this: *mut c_void, res: *mut c_void, sub: 
     static LOGS: AtomicU32 = AtomicU32::new(0);
     if hr.0 < 0 && LOGS.fetch_add(1, Ordering::Relaxed) < 6 {
         glog!("[gpu] Map({res:p}, {sub}, {map_type}, {flags:#x}) FAILED hr={:#x}", hr.0 as u32);
+    }
+    static ATLAS_MAPS: AtomicU32 = AtomicU32::new(0);
+    if hr.0 >= 0 && ATLAS_MAPS.load(Ordering::Relaxed) < 30 && is_atlas(res) {
+        ATLAS_MAPS.fetch_add(1, Ordering::Relaxed);
+        glog!("[gpu] Map of the 512x512 R8 atlas {res:p}: sub {sub} type {map_type} flags {flags:#x} -> data {:#x}, row pitch {}, depth pitch {}", mapped[0], mapped[1] & 0xFFFF_FFFF, mapped[1] >> 32);
     }
     hr
 }
@@ -2467,6 +2779,27 @@ unsafe extern "system" fn ctx_om_set_render_targets_old(this: *mut c_void, n: u3
         unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(33))) };
     let mut views = [ptr::null_mut::<c_void>(); 8];
     let count = (n as usize).min(8);
+    if !rtvs.is_null() && n >= 1 {
+        LAST_RTV.store(unwrap_object(unsafe { *rtvs }) as usize, Ordering::Relaxed);
+    }
+    if trace_wanted() {
+        // With the draw trace on: which texture the draws that follow are rendered into.
+        let first = if rtvs.is_null() || n == 0 { ptr::null_mut() } else { unwrap_object(unsafe { *rtvs }) };
+        if first.is_null() {
+            glog!("[gpu]   trace: OMSetRenderTargets({n}) no render target");
+        } else {
+            let get: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = unsafe { std::mem::transmute(*((*(first as *const *const usize)).add(7))) };
+            let mut res: *mut c_void = ptr::null_mut();
+            unsafe { get(first, &mut res) };
+            if res.is_null() {
+                glog!("[gpu]   trace: OMSetRenderTargets({n}) rtv {first:p} (no resource)");
+            } else {
+                glog!("[gpu]   trace: OMSetRenderTargets({n}) rtv {first:p} of {}", qi_resource(res));
+                let rel: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { std::mem::transmute(*((*(res as *const *const usize)).add(2))) };
+                unsafe { rel(res) };
+            }
+        }
+    }
     static OMLOGS: AtomicU32 = AtomicU32::new(0);
     if OMLOGS.fetch_add(1, Ordering::Relaxed) < 12 {
         let first = if rtvs.is_null() { ptr::null_mut() } else { unsafe { *rtvs } };
@@ -2488,6 +2821,22 @@ unsafe extern "system" fn ctx_om_set_render_targets_old(this: *mut c_void, n: u3
         }
     }
     unsafe { f(real, n, if rtvs.is_null() { ptr::null() } else { views.as_ptr() }, unwrap_object(dsv)) };
+    // Apply the title's pixel-shader resources again: a binding made while its resource was still a render target was dropped.
+    // Off by default until it is confirmed on screen: `XB1_SRV_REAPPLY=1` turns it on.
+    static REAPPLY: OnceLock<bool> = OnceLock::new();
+    if *REAPPLY.get_or_init(|| std::env::var_os("XB1_SRV_REAPPLY").is_some()) {
+        let mut saved = [ptr::null_mut::<c_void>(); 16];
+        let mut any = false;
+        for (i, slot) in SAVED_SRV.iter().enumerate() {
+            let v = slot.load(Ordering::Relaxed) as *mut c_void;
+            saved[i] = v;
+            any |= !v.is_null();
+        }
+        if any {
+            let set_srv: unsafe extern "system" fn(*mut c_void, u32, u32, *const *mut c_void) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(8))) };
+            unsafe { set_srv(real, 0, 16, saved.as_ptr()) };
+        }
+    }
 }
 
 fn kind_of(wrapper: *mut c_void) -> u8 {
@@ -2724,6 +3073,46 @@ fn trace_describe(obj: *mut c_void) -> String {
 /// Older-XDK embedded index 46 (+0x550): `UpdateSubresource(resource, subresource, box, data, row pitch, depth pitch)`
 /// (desktop 48), forwarded; with the draw trace on it logs what it is given.
 unsafe extern "system" fn ctx_update_old(this: *mut c_void, dst: *mut c_void, sub: u32, region: *const u32, data: *const c_void, row: u32, depth: u32) {
+    static ATLAS_UPDATES: AtomicU32 = AtomicU32::new(0);
+    if ATLAS_UPDATES.load(Ordering::Relaxed) < 400 && is_atlas(dst) {
+        ATLAS_UPDATES.fetch_add(1, Ordering::Relaxed);
+        let b = if region.is_null() { "whole".to_string() } else { format!("{:?}", unsafe { std::slice::from_raw_parts(region, 6) }) };
+        // How much of the uploaded glyph is not zero (the box is at most 64x64 here).
+        let nonzero = if !region.is_null() && !data.is_null() {
+            let r = unsafe { std::slice::from_raw_parts(region, 6) };
+            let (w, h) = (r[3].saturating_sub(r[0]) as usize, r[4].saturating_sub(r[1]) as usize);
+            if w <= 64 && h <= 64 && row as usize >= w {
+                let mut n = 0usize;
+                for y in 0..h {
+                    let line = unsafe { std::slice::from_raw_parts((data as *const u8).add(y * row as usize), w) };
+                    n += line.iter().filter(|b| **b != 0).count();
+                }
+                format!("{n} of {} bytes non-zero", w * h)
+            } else {
+                "box too large to count".to_string()
+            }
+        } else {
+            "no box".to_string()
+        };
+        glog!("[gpu] UpdateSubresource of the 512x512 R8 atlas {dst:p}: sub {sub} box {b} row pitch {row}: {nonzero}");
+        let seq = ATLAS_UPDATES.load(Ordering::Relaxed);
+        if (seq <= 4 || seq % 60 == 0) && !region.is_null() && !data.is_null() {
+            // The cell as a picture ('.' = 0, '+' below 128, '#' from 128), to see what was uploaded.
+            let r = unsafe { std::slice::from_raw_parts(region, 6) };
+            let (w, h) = (r[3].saturating_sub(r[0]) as usize, r[4].saturating_sub(r[1]) as usize);
+            if w <= 64 && h <= 64 && row as usize >= w {
+                let mut art = String::new();
+                for y in 0..h {
+                    let line = unsafe { std::slice::from_raw_parts((data as *const u8).add(y * row as usize), w) };
+                    art.push('|');
+                    for b in line {
+                        art.push(if *b == 0 { '.' } else if *b < 128 { '+' } else { '#' });
+                    }
+                }
+                glog!("[gpu]   atlas cell #{seq} ({w}x{h}): {art}");
+            }
+        }
+    }
     if trace_wanted() {
         let b = if region.is_null() { "whole".to_string() } else { format!("{:?}", unsafe { std::slice::from_raw_parts(region, 6) }) };
         glog!("[gpu]   trace: UpdateSubresource {} sub {sub} box {b} row pitch {row} depth pitch {depth} data {}", trace_describe(dst), safe_dump(data as u64, 16));
@@ -2741,6 +3130,82 @@ unsafe extern "system" fn ctx_idx44_old(_this: *mut c_void, obj: *mut c_void) {
     if trace_wanted() || FIRST.fetch_add(1, Ordering::Relaxed) < 3 {
         glog!("[gpu]   trace: index 44 (+0x540) with {:p} kind {}", obj, qi_kind(obj));
     }
+}
+
+/// Older-XDK embedded index 7 (+0x418): `PSSetShaderResources(start, count, views)` (desktop 8), forwarded; with the draw
+/// trace on it logs which textures are bound (size and format of the first mip).
+static LAST_SRV0: AtomicUsize = AtomicUsize::new(0);
+/// The pixel-shader resources the title last asked for, per slot (the real views). Desktop Direct3D 11 drops a binding whose
+/// resource is still bound as a render target; the console allows binding it and switching the render target afterwards, so
+/// the bindings are applied again after every render-target change (see `ctx_om_set_render_targets_old`).
+static SAVED_SRV: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
+/// The first render target view last set (real view), for the render-target readback in the trace.
+static LAST_RTV: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "system" fn ctx_ps_srv_old(this: *mut c_void, start: u32, count: u32, views: *const *mut c_void) {
+    if start == 0 && count >= 1 && !views.is_null() {
+        LAST_SRV0.store(unsafe { *views } as usize, Ordering::Relaxed);
+    }
+    if !views.is_null() {
+        for i in 0..(count as usize).min(16) {
+            let slot = start as usize + i;
+            if slot < 16 {
+                SAVED_SRV[slot].store(unwrap_object(unsafe { *views.add(i) }) as usize, Ordering::Relaxed);
+            }
+        }
+    }
+    let real = unsafe { real_context(this) };
+    if trace_wanted() && !views.is_null() && count >= 1 && count <= 16 {
+        for i in 0..count as usize {
+            let v = unsafe { *views.add(i) };
+            if v.is_null() {
+                glog!("[gpu]   trace: PS resource slot {} = NULL", start as usize + i);
+                continue;
+            }
+            // The view's resource (console slot 8 on the shifted vtable), described.
+            let vt = unsafe { *(v as *const *const usize) };
+            let get_resource: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = unsafe { std::mem::transmute(*vt.add(8)) };
+            let mut res: *mut c_void = ptr::null_mut();
+            unsafe { get_resource(v, &mut res) };
+            if res.is_null() {
+                glog!("[gpu]   trace: PS resource slot {} = view {v:p} (no resource)", start as usize + i);
+            } else {
+                let kind = qi_resource(res);
+                glog!("[gpu]   trace: PS resource slot {} = view {v:p} of {kind}", start as usize + i);
+                // The first few 512x512 R8 textures seen with the trace on (the font atlas): are its rows filled?
+                static BANDS: AtomicU32 = AtomicU32::new(0);
+                let rvt0 = unsafe { *(res as *const *const usize) };
+                let gd: unsafe extern "system" fn(*mut c_void, *mut u32) = unsafe { std::mem::transmute(*rvt0.add(10)) };
+                let mut td = [0u32; 11];
+                unsafe { gd(res, td.as_mut_ptr()) };
+                if td[0] == 512 && td[1] == 512 && td[4] == 61 && BANDS.fetch_add(1, Ordering::Relaxed) < 6 {
+                    trace_texture_bands(real, res, td[0], td[1], td[4]);
+                }
+                let rvt = unsafe { *(res as *const *const usize) };
+                let release: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { std::mem::transmute(*rvt.add(2)) };
+                unsafe { release(res) };
+            }
+        }
+    }
+    let mut real_views = [ptr::null_mut::<c_void>(); 16];
+    let n = (count as usize).min(16);
+    if !views.is_null() {
+        for i in 0..n {
+            real_views[i] = unwrap_object(unsafe { *views.add(i) });
+        }
+    }
+    let f: unsafe extern "system" fn(*mut c_void, u32, u32, *const *mut c_void) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(8))) };
+    unsafe { f(real, start, count, if views.is_null() { views } else { real_views.as_ptr() }) };
+}
+
+/// A description of a resource for the trace: a 2D texture's size, mips and format.
+fn qi_resource(res: *mut c_void) -> String {
+    let vt = unsafe { *(res as *const *const usize) };
+    // Texture2D::GetDesc is slot 10 on both the real and the extended vtable; Buffer::GetDesc is also 10 but writes less.
+    let mut d = [0u32; 11];
+    let get_desc: unsafe extern "system" fn(*mut c_void, *mut u32) = unsafe { std::mem::transmute(*vt.add(10)) };
+    unsafe { get_desc(res, d.as_mut_ptr()) };
+    format!("{res:p} desc {:?} (w h mips array format ... usage {} bind {:#x})", &d[..5], d[7], d[8])
 }
 
 unsafe extern "system" fn ctx_scissor_old(this: *mut c_void, count: u32, rects: *const i32) {
@@ -2779,6 +3244,15 @@ unsafe extern "system" fn ctx_state_old<const DESK: usize>(this: *mut c_void, st
     static DEFAULT_STATES: OnceLock<bool> = OnceLock::new();
     let state = if *DEFAULT_STATES.get_or_init(|| env_flag("XB1_DEFAULT_STATES")) { ptr::null_mut() } else { unwrap_object(state) };
     let was_extended = if state.is_null() { false } else { restore_object_vtable(state) };
+    if trace_wanted() && !state.is_null() {
+        // The description of the state being bound (blend 35, depth-stencil 36, rasterizer 43): `GetDesc` is real slot 7.
+        let vt = unsafe { *(state as *const *const usize) };
+        let get_desc: unsafe extern "system" fn(*mut c_void, *mut u32) = unsafe { std::mem::transmute(*vt.add(7)) };
+        let mut d = [0u32; 70];
+        unsafe { get_desc(state, d.as_mut_ptr()) };
+        let (name, n) = match DESK { 35 => ("blend", 10), 36 => ("depth-stencil", 14), _ => ("rasterizer", 11) };
+        glog!("[gpu]   trace: bind {name} {state:p} args {a3:#x} {a4:#x} desc {:x?}", &d[..n]);
+    }
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, usize, usize) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(DESK))) };
     unsafe { f(real, state, a3, a4) };
     // The title keeps calling methods on the state object (GetDesc), so it gets its extended vtable back.
