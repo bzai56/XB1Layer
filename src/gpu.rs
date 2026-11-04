@@ -18,7 +18,7 @@
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::*;
@@ -1085,6 +1085,7 @@ unsafe extern "system" fn ctx_bind_object(this: *mut c_void, _a2: usize, obj: *m
         // IASetIndexBuffer(buffer, DXGI_FORMAT_R16_UINT, 0): the first console argument is a format enum
         let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32) = unsafe { std::mem::transmute(*vt.add(19)) };
         LAST_IB.store(buffer_desc(obj)[0], Ordering::Relaxed);
+        LAST_IB_PTR.store(obj as usize, Ordering::Relaxed);
         LAST_IB_ARGS[0].store(_a2 as u32, Ordering::Relaxed);
         LAST_IB_ARGS[1].store(_a4 as u32, Ordering::Relaxed);
         static IBLOGS: AtomicU32 = AtomicU32::new(0);
@@ -1168,20 +1169,31 @@ unsafe extern "system" fn ctx_ia_vb(this: *mut c_void, start: u32, count: u32, b
 /// Console index 12: `DrawIndexed(count, start)`. The console method has no base-vertex argument, so
 /// `r9` still holds whatever the title left there (`0x76b40`); pass 0.
 static LAST_IB: AtomicU32 = AtomicU32::new(0);
+/// The index buffer object the title bound last (for restoring it after a triangle-fan draw).
+static LAST_IB_PTR: AtomicUsize = AtomicUsize::new(0);
 static LAST_IB_ARGS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
 
 /// `XB1_DRAW_TRACE=n` (with `XB1_TRACE_FRAME`): logs the first n draws from that Present on.
-fn draw_trace(kind: &str, count: u32, start: u32) {
+/// `XB1_TRACE_FILE=path`: the draw trace stays off until that file exists (checked once a second at Present).
+static TRACE_TRIGGER: AtomicBool = AtomicBool::new(true);
+
+fn draw_trace(kind: &str, count: u32, start: u32, ctx: *mut c_void) {
     static LIMIT: OnceLock<(u32, u32)> = OnceLock::new();
     static SEQ: AtomicU32 = AtomicU32::new(0);
     let (limit, from) = *LIMIT.get_or_init(|| {
         let n = |k: &str| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         (n("XB1_DRAW_TRACE"), n("XB1_TRACE_FRAME"))
     });
-    if limit > 0 && FRAMES.load(Ordering::Relaxed) >= from {
+    if limit > 0 && FRAMES.load(Ordering::Relaxed) >= from && TRACE_TRIGGER.load(Ordering::Relaxed) {
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
         if n < limit {
-            glog!("[gpu] draw #{n} {kind} count {count} start {start} (index buffer bytes {:#x}, format arg {}, offset arg {:#x})", LAST_IB.load(Ordering::Relaxed), LAST_IB_ARGS[0].load(Ordering::Relaxed), LAST_IB_ARGS[1].load(Ordering::Relaxed));
+            // The context object's data fields below the function table (`+0x160..+0x1a0`) hold the title's inlined state; a
+            // topology value, if there is one, shows up here as a field that differs between kinds of draw.
+            let mut f = [0u32; 16];
+            if !ctx.is_null() {
+                unsafe { ptr::copy_nonoverlapping((ctx as *const u8).add(0x160), f.as_mut_ptr() as *mut u8, 64) };
+            }
+            glog!("[gpu] draw #{n} {kind} count {count} start {start} (index buffer bytes {:#x}, format arg {}, offset arg {:#x}) ctx+0x160 {:x?}", LAST_IB.load(Ordering::Relaxed), LAST_IB_ARGS[0].load(Ordering::Relaxed), LAST_IB_ARGS[1].load(Ordering::Relaxed), f);
         }
     }
 }
@@ -1190,7 +1202,7 @@ unsafe extern "system" fn ctx_draw_indexed(this: *mut c_void, packed: u64) {
     // The console packs both numbers into one register: index count in the high half, first index
     // in the low half (`0x600000000` = 6 indices from 0, `0x60000001e` = 6 indices from 30).
     let (count, start) = ((packed >> 32) as u32, packed as u32);
-    draw_trace("indexed", count, start);
+    draw_trace("indexed", count, start, this);
     LAST_DRAW[0].store(1, Ordering::Relaxed);
     LAST_DRAW[1].store(count, Ordering::Relaxed);
     LAST_DRAW[2].store(start, Ordering::Relaxed);
@@ -1200,7 +1212,13 @@ unsafe extern "system" fn ctx_draw_indexed(this: *mut c_void, packed: u64) {
     // draw is a triangle list.
     if crate::VCCORLIB110.load(Ordering::Relaxed) {
         let t: unsafe extern "system" fn(*mut c_void, u32) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(24))) };
-        unsafe { t(real, 4) };
+        // The title's own topology (`old_topology`); a fan cannot be indexed here, so 6 and unknown values are a list.
+        let topology = match old_topology(this) {
+            v @ 1..=4 => v,
+            6 => 5,
+            _ => 4,
+        };
+        unsafe { t(real, topology) };
     }
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, i32) =
         unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(12))) };
@@ -2496,6 +2514,12 @@ unsafe extern "system" fn view_get_resource_wrapped(this: *mut c_void, out: *mut
 /// `IDXGISwapChain::Present(sync, flags)` as the older SDK calls it (console slot 9, desktop 8).
 unsafe extern "system" fn dxgi_present_wrapped(this: *mut c_void, sync: u32, flags: u32) -> HRESULT {
     let real = real_of(this);
+    if let Some(path) = std::env::var_os("XB1_TRACE_FILE") {
+        static CHECKED: AtomicU32 = AtomicU32::new(0);
+        if CHECKED.fetch_add(1, Ordering::Relaxed) % 60 == 0 {
+            TRACE_TRIGGER.store(std::path::Path::new(&path).exists(), Ordering::Relaxed);
+        }
+    }
     crate::profile::start_for_current_thread();
     if std::env::var_os("XB1_READBACK").is_some() {
         static N: AtomicU32 = AtomicU32::new(0);
@@ -2523,27 +2547,97 @@ unsafe extern "system" fn dxgi_present_wrapped(this: *mut c_void, sync: u32, fla
 }
 
 /// Older-XDK embedded index 12 (+0x440): `Draw(vertex count, first vertex)` (desktop 13), seen as (4, 0, ..).
+/// The primitive topology of the older-XDK context, kept by the title in its inlined state: bits 9 to 11 of the dword at
+/// `+0x174` (found by comparing draws: `0x5ff` = 2 for the 8-vertex line list, `0x7ff` = 3 for the 5-vertex line strips of
+/// the block outline, `0x9ff` = 4 for indexed triangle lists, `0xdff` = 6 for the 4-vertex quads). 1 to 4 are the
+/// Direct3D 11 values; 6 is the triangle strip of the quads (reading it as a fan broke every menu quad); 5 is assumed to be
+/// a fan, which Direct3D 11 does not have, and has not been seen.
+fn old_topology(ctx: *mut c_void) -> u32 {
+    (unsafe { *((ctx as *const u8).add(0x174) as *const u32) } >> 9) & 7
+}
+
+/// An index buffer holding the triangle-fan indices `0,1,2, 0,2,3, ...` for up to 64 vertices (16-bit).
+fn fan_index_buffer(real: *mut c_void) -> *mut c_void {
+    static BUFFER: AtomicUsize = AtomicUsize::new(0);
+    let b = BUFFER.load(Ordering::Relaxed);
+    if b != 0 {
+        return b as *mut c_void;
+    }
+    let mut indices: Vec<u16> = Vec::new();
+    for i in 1..63u16 {
+        indices.extend_from_slice(&[0, i, i + 1]);
+    }
+    let desc: [u32; 6] = [(indices.len() * 2) as u32, 1, 2, 0, 0, 0]; // IMMUTABLE, INDEX_BUFFER
+    #[repr(C)]
+    struct Init {
+        mem: *const c_void,
+        pitch: u32,
+        slice: u32,
+    }
+    let init = Init { mem: indices.as_ptr() as *const c_void, pitch: 0, slice: 0 };
+    let mut device: *mut c_void = ptr::null_mut();
+    let mut buffer: *mut c_void = ptr::null_mut();
+    unsafe {
+        let get_device: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = std::mem::transmute(*((*(real as *const *const usize)).add(3)));
+        get_device(real, &mut device);
+        if device.is_null() {
+            return ptr::null_mut();
+        }
+        let create: unsafe extern "system" fn(*mut c_void, *const u32, *const Init, *mut *mut c_void) -> HRESULT = std::mem::transmute(*((*(device as *const *const usize)).add(3)));
+        let hr = create(device, desc.as_ptr(), &init, &mut buffer);
+        let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*((*(device as *const *const usize)).add(2)));
+        release(device);
+        if hr.0 < 0 {
+            glog!("[gpu] triangle-fan index buffer failed: {:#x}", hr.0 as u32);
+            return ptr::null_mut();
+        }
+    }
+    BUFFER.store(buffer as usize, Ordering::Relaxed);
+    buffer
+}
+
 unsafe extern "system" fn ctx_draw_old(this: *mut c_void, count: u32, start: u32) {
     static LOGS: AtomicU32 = AtomicU32::new(0);
     if LOGS.fetch_add(1, Ordering::Relaxed) < 4 {
         glog!("[gpu] Draw({count}, {start})");
     }
-    draw_trace("plain", count, start);
+    draw_trace("plain", count, start, this);
     LAST_DRAW[0].store(0, Ordering::Relaxed);
     LAST_DRAW[1].store(count, Ordering::Relaxed);
     LAST_DRAW[2].store(start, Ordering::Relaxed);
     sync_before_draw(this);
     let real = unsafe { real_context(this) };
-    // The topology is console-side state the layer does not read yet: a plain `Draw` of four vertices is a
-    // quad as a triangle strip (the title and logo quads showed as one diagonal triangle as a list).
-    {
-        static COUNTS: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
-        if count < 8 && COUNTS[count as usize].fetch_add(1, Ordering::Relaxed) == 0 {
-            glog!("[gpu] first plain Draw with {count} vertices");
+    let vt = unsafe { *(real as *const *const usize) };
+    let set_topology: unsafe extern "system" fn(*mut c_void, u32) = unsafe { std::mem::transmute(*vt.add(24)) };
+    static COUNTS: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
+    if count < 8 && COUNTS[count as usize].fetch_add(1, Ordering::Relaxed) == 0 {
+        glog!("[gpu] first plain Draw with {count} vertices (topology field {})", old_topology(this));
+    }
+    match old_topology(this) {
+        // Verified by screenshots: 6 is the triangle strip of the 4-vertex quads (reading it as a fan broke every
+        // menu quad); 2, 3 and 4 are the line list, line strip and triangle list.
+        t @ 1..=4 => unsafe { set_topology(real, t) },
+        6 => unsafe { set_topology(real, 5) },
+        5 if (3..=64).contains(&count) => {
+            // A triangle fan: drawn as a triangle list through an index buffer of fan indices, with the title's
+            // own index buffer put back afterwards.
+            let fan = fan_index_buffer(real);
+            if !fan.is_null() {
+                let set_ib: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32) = unsafe { std::mem::transmute(*vt.add(19)) };
+                let draw_indexed: unsafe extern "system" fn(*mut c_void, u32, u32, i32) = unsafe { std::mem::transmute(*vt.add(12)) };
+                unsafe {
+                    set_ib(real, fan, 57, 0); // R16_UINT
+                    set_topology(real, 4);
+                    draw_indexed(real, 3 * (count - 2), 0, start as i32);
+                    let prev = LAST_IB_PTR.load(Ordering::Relaxed) as *mut c_void;
+                    let (fmt, off) = (LAST_IB_ARGS[0].load(Ordering::Relaxed), LAST_IB_ARGS[1].load(Ordering::Relaxed));
+                    set_ib(real, prev, if fmt == 0 { 57 } else { 42 }, off);
+                }
+                return;
+            }
         }
-        let topology: u32 = if count == 4 { 5 } else { 4 }; // TRIANGLESTRIP or TRIANGLELIST
-        let t: unsafe extern "system" fn(*mut c_void, u32) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(24))) };
-        unsafe { t(real, topology) };
+        // Not read from the context (no field, or a fan too large): the earlier guess.
+        _ => unsafe { set_topology(real, if count == 4 { 5 } else { 4 }) },
     }
     let f: unsafe extern "system" fn(*mut c_void, u32, u32) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(13))) };
     unsafe { f(real, count, start) };
