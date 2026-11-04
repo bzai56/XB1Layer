@@ -1177,6 +1177,12 @@ static LAST_IB_ARGS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
 /// `XB1_TRACE_FILE=path`: the draw trace stays off until that file exists (checked once a second at Present).
 static TRACE_TRIGGER: AtomicBool = AtomicBool::new(true);
 
+/// Whether the draw trace is on (`XB1_DRAW_TRACE` set and, with `XB1_TRACE_FILE`, the file present).
+fn trace_wanted() -> bool {
+    static SET: OnceLock<bool> = OnceLock::new();
+    *SET.get_or_init(|| std::env::var_os("XB1_DRAW_TRACE").is_some()) && TRACE_TRIGGER.load(Ordering::Relaxed)
+}
+
 fn draw_trace(kind: &str, count: u32, start: u32, ctx: *mut c_void) {
     static LIMIT: OnceLock<(u32, u32)> = OnceLock::new();
     static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -1231,6 +1237,10 @@ unsafe extern "system" fn ctx_viewports(this: *mut c_void, count: u32, vp: *cons
     if LOGS.fetch_add(1, Ordering::Relaxed) < 6 && !vp.is_null() && count >= 1 {
         let v = unsafe { std::slice::from_raw_parts(vp, 6) };
         glog!("[gpu] RSSetViewports({count}): x {} y {} w {} h {} depth {}..{}", v[0], v[1], v[2], v[3], v[4], v[5]);
+    }
+    if trace_wanted() && !vp.is_null() && count >= 1 {
+        let v = unsafe { std::slice::from_raw_parts(vp, 6) };
+        glog!("[gpu]   trace: viewport({count}) x {} y {} w {} h {} depth {}..{}", v[0], v[1], v[2], v[3], v[4], v[5]);
     }
     let real = unsafe { real_context(this) };
     let f: unsafe extern "system" fn(*mut c_void, u32, *const f32) =
@@ -2701,6 +2711,10 @@ unsafe extern "system" fn ctx_scissor_old(this: *mut c_void, count: u32, rects: 
     if LOGS.fetch_add(1, Ordering::Relaxed) < 6 && !rects.is_null() && count >= 1 {
         let r = unsafe { std::slice::from_raw_parts(rects, 4) };
         glog!("[gpu] RSSetScissorRects({count}): left {} top {} right {} bottom {}", r[0], r[1], r[2], r[3]);
+    }
+    if trace_wanted() && !rects.is_null() && count >= 1 {
+        let r = unsafe { std::slice::from_raw_parts(rects, 4) };
+        glog!("[gpu]   trace: scissor({count}) left {} top {} right {} bottom {}", r[0], r[1], r[2], r[3]);
     }
     let real = unsafe { real_context(this) };
     let f: unsafe extern "system" fn(*mut c_void, u32, *const i32) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(45))) };
