@@ -192,6 +192,8 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
                 v.push((index_of(EMBED_TABLE + 41 * 8), ctx_state_old::<43> as usize));
                 v.push((index_of(EMBED_TABLE + 51 * 8), ctx_clear_dsv_old as usize));
                 v.push((index_of(EMBED_TABLE + 43 * 8), ctx_scissor_old as usize));
+                v.push((index_of(EMBED_TABLE + 46 * 8), ctx_update_old as usize));
+                v.push((index_of(EMBED_TABLE + 44 * 8), ctx_idx44_old as usize));
                 v.push((index_of(EMBED_TABLE + 12 * 8), ctx_draw_old as usize));
                 v.push((index_of(EMBED_TABLE + 31 * 8), ctx_om_set_render_targets_old as usize));
                 v.push((index_of(EMBED_TABLE + 87 * 8), ctx_om_get_render_targets_old as usize));
@@ -2413,8 +2415,8 @@ pub fn unwrap_object(p: *mut c_void) -> *mut c_void {
 /// `RSSetViewports` (desktop 44); 33 `OMSetBlendState(state, factor, mask)` (35), 34 `OMSetDepthStencilState(state, ref)` (36),
 /// 41 `RSSetState` (43), 43 `RSSetScissorRects` (45), 46 `UpdateSubresource` with the subresource counting 0 to 4 (48),
 /// 51 `ClearDepthStencilView(dsv, 3, ..)` (53), all two behind the desktop; 17 `IASetVertexBuffers` (18), 6 and 15 the VS and PS `SetConstantBuffers` (7, 16), 19 and 20 the PS `SetShaderResources`/`SetSamplers` (8, 10) and 7 the VS resources (25; a guess), 18 the Sonic-shaped `IASetIndexBuffer(format, buffer, offset)`, 10 a packed `DrawIndexed`, 11 `Draw`; 13 is `Map` (see `ctx_map_old`, desktop 14) and 14 `Unmap(res, 0)` (desktop 15).
-const OLD_SDK_EXTRA: [(usize, usize); 9] =
-    [(14, 15), (46, 48), (17, 18), (6, 7), (15, 16), (7, 8), (9, 10), (23, 25), (24, 26)];
+const OLD_SDK_EXTRA: [(usize, usize); 8] =
+    [(14, 15), (17, 18), (6, 7), (15, 16), (7, 8), (9, 10), (23, 25), (24, 26)];
 
 /// Older-XDK embedded index 13 (+0x448): `Map(resource, subresource, map type, flags, void** data)`. The
 /// console returns the data pointer itself; the desktop fills a `D3D11_MAPPED_SUBRESOURCE`
@@ -2706,6 +2708,41 @@ fn readback_stats(tag: &str) {
 }
 
 /// Older-XDK embedded index 43: `RSSetScissorRects(count, rects)` (desktop 45); the first calls log the rectangles.
+/// A one-line description of a D3D object for the trace: its kind and, for a 2D texture, its size and format.
+fn trace_describe(obj: *mut c_void) -> String {
+    let kind = d3d_object_name(obj as u64);
+    if kind == "Tex2D" {
+        let vt = unsafe { *(obj as *const *const usize) };
+        let get_desc: unsafe extern "system" fn(*mut c_void, *mut u32) = unsafe { std::mem::transmute(*vt.add(10)) };
+        let mut d = [0u32; 11];
+        unsafe { get_desc(obj, d.as_mut_ptr()) };
+        return format!("{obj:p} Tex2D {}x{} mips {} array {} format {} usage {} bind {:#x}", d[0], d[1], d[2], d[3], d[4], d[7], d[8]);
+    }
+    format!("{obj:p} {kind}")
+}
+
+/// Older-XDK embedded index 46 (+0x550): `UpdateSubresource(resource, subresource, box, data, row pitch, depth pitch)`
+/// (desktop 48), forwarded; with the draw trace on it logs what it is given.
+unsafe extern "system" fn ctx_update_old(this: *mut c_void, dst: *mut c_void, sub: u32, region: *const u32, data: *const c_void, row: u32, depth: u32) {
+    if trace_wanted() {
+        let b = if region.is_null() { "whole".to_string() } else { format!("{:?}", unsafe { std::slice::from_raw_parts(region, 6) }) };
+        glog!("[gpu]   trace: UpdateSubresource {} sub {sub} box {b} row pitch {row} depth pitch {depth} data {}", trace_describe(dst), safe_dump(data as u64, 16));
+    }
+    let real = unsafe { real_context(this) };
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *const u32, *const c_void, u32, u32) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(48))) };
+    unsafe { f(real, unwrap_object(dst), sub, region, data, row, depth) };
+}
+
+/// Older-XDK embedded index 44 (+0x540): one object argument, called hundreds of times in the credits screen. Its meaning is
+/// not known: the object is not a shader resource view (`qi_kind` finds nothing), so `GenerateMips` is ruled out, and
+/// 44 + 2 would be `CopySubresourceRegion` (seven arguments). It only logs (with the draw trace on) and does nothing.
+unsafe extern "system" fn ctx_idx44_old(_this: *mut c_void, obj: *mut c_void) {
+    static FIRST: AtomicU32 = AtomicU32::new(0);
+    if trace_wanted() || FIRST.fetch_add(1, Ordering::Relaxed) < 3 {
+        glog!("[gpu]   trace: index 44 (+0x540) with {:p} kind {}", obj, qi_kind(obj));
+    }
+}
+
 unsafe extern "system" fn ctx_scissor_old(this: *mut c_void, count: u32, rects: *const i32) {
     static LOGS: AtomicU32 = AtomicU32::new(0);
     if LOGS.fetch_add(1, Ordering::Relaxed) < 6 && !rects.is_null() && count >= 1 {
