@@ -392,7 +392,7 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                                 }
                                 put(&mut out, "msg", *((rsp + 0x28) as *const u64), 190);
                             }
-                            rlog!("[log #{hit}]{}", out.as_str());
+                            rlog!("[log #{hit}] @{:#x}{}", addr.wrapping_sub(IMG_BASE.load(Ordering::Relaxed)), out.as_str());
                         }
                         *(addr as *mut u8) = WATCH_ORIG[i].load(Ordering::Relaxed) as u8;
                         WATCH_PENDING[i].store(true, Ordering::Relaxed);
