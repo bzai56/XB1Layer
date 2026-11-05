@@ -396,6 +396,23 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                                 }
                                 put(&mut out, "msg", *((rsp + 0x28) as *const u64), 190);
                             }
+                            if std::env::var_os("XB1_WATCH_STACK").is_some() {
+                                // Title return addresses found in the first 96 stack words.
+                                use std::fmt::Write;
+                                let _ = write!(out, " stack:");
+                                let (b, sz) = (IMG_BASE.load(Ordering::Relaxed), IMG_SIZE.load(Ordering::Relaxed));
+                                let mut shown = 0;
+                                for i in 0..96usize {
+                                    let mut q = 0u64;
+                                    let mut got = 0usize;
+                                    if ReadProcessMemory(GetCurrentProcess(), (rsp + i * 8) as *const c_void, &mut q as *mut u64 as *mut c_void, 8, &mut got) == 0 { break; }
+                                    let q = q as usize;
+                                    if q >= b && q < b + sz && shown < 8 {
+                                        let _ = write!(out, " {:#x}", q - b);
+                                        shown += 1;
+                                    }
+                                }
+                            }
                             rlog!("[log #{hit}] @{:#x}{}", addr.wrapping_sub(IMG_BASE.load(Ordering::Relaxed)), out.as_str());
                         }
                         *(addr as *mut u8) = WATCH_ORIG[i].load(Ordering::Relaxed) as u8;
@@ -892,6 +909,10 @@ extern "system" fn pool_io_trampoline(instance: *mut c_void, context: *mut c_voi
 /// `CreateThreadpoolIo(file, callback, context, environment)`.
 extern "system" fn xb_create_threadpool_io(file: *mut c_void, callback: usize, context: usize, env: *mut c_void) -> *mut c_void {
     // Leaked on purpose: the callback runs for every completion until the object is closed.
+    static LOGGED: AtomicUsize = AtomicUsize::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 3 {
+        rlog!("[io] CreateThreadpoolIo callback title+{:#x}", callback.wrapping_sub(IMG_BASE.load(Ordering::Relaxed)));
+    }
     let wrapped = Box::into_raw(Box::new(PoolIo { callback, context }));
     unsafe { CreateThreadpoolIo(file, pool_io_trampoline as usize, wrapped as *mut c_void, env) }
 }
@@ -1482,6 +1503,124 @@ unsafe fn patch_profile_copy(base: *mut u8, size: usize) {
     jump.extend_from_slice(&(thunk as u64).to_le_bytes());
     ptr::copy_nonoverlapping(jump.as_ptr(), base.add(SITE), 14);
     println!("compat: profile copy skips a profile record without options (title+{SITE:#x})");
+}
+
+/// Experiment (`XB1_PREMOUNT=1`, Forza Horizon 3 only): the title registers the directories of the zips listed in
+/// `media\zipmanifest.xml` but only mounts the ones it enumerates, so its render scenarios are never found. Right before
+/// it loads them (title+0x1899469, a call to title+0x1b04d40) the layer opens each manifest directory through the
+/// content manager's "open directory" method (vtable slot 0x1d8), which is what the title does for its UI zips and which
+/// opens and mounts the zip. Byte-guarded: nothing happens unless the code at the site is the expected one.
+unsafe fn patch_premount_zips(base: *mut u8, size: usize) {
+    const SITE: usize = 0x1899462;
+    const LOADER: usize = 0x1b04d40;
+    const NEXT: usize = 0x1885730;
+    if SITE + 17 > size {
+        return;
+    }
+    let b = std::slice::from_raw_parts(base.add(SITE), 17);
+    let rel = |at: usize, off: usize| -> usize { (SITE as i64 + at as i64 + 5 + i32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]]) as i64) as usize };
+    if b[0..3] != [0x48, 0x8B, 0x0D] || b[7] != 0xE8 || b[12] != 0xE8 || rel(7, 8) != LOADER || rel(12, 13) != NEXT {
+        return;
+    }
+    let global = (SITE as i64 + 7 + i32::from_le_bytes([b[3], b[4], b[5], b[6]]) as i64) as usize;
+    let thunk = VirtualAlloc(ptr::null_mut(), 128, MEM_COMMIT_RESERVE, PAGE_RWX) as *mut u8;
+    let mut code: Vec<u8> = Vec::new();
+    let mut call_abs = |code: &mut Vec<u8>, addr: u64| {
+        code.extend_from_slice(&[0x48, 0xB8]);
+        code.extend_from_slice(&addr.to_le_bytes());
+        code.extend_from_slice(&[0xFF, 0xD0]);
+    };
+    call_abs(&mut code, premount_zips as usize as u64);
+    code.extend_from_slice(&[0x48, 0xB8]); // mov rax, global
+    code.extend_from_slice(&((base as u64) + global as u64).to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x8B, 0x08]); // mov rcx, [rax]
+    call_abs(&mut code, (base as u64) + LOADER as u64);
+    call_abs(&mut code, (base as u64) + NEXT as u64);
+    code.extend_from_slice(&[0xFF, 0x25, 0, 0, 0, 0]);
+    code.extend_from_slice(&((base as u64) + SITE as u64 + 17).to_le_bytes());
+    ptr::copy_nonoverlapping(code.as_ptr(), thunk, code.len());
+    let mut jump: Vec<u8> = vec![0xFF, 0x25, 0, 0, 0, 0];
+    jump.extend_from_slice(&(thunk as u64).to_le_bytes());
+    ptr::copy_nonoverlapping(jump.as_ptr(), base.add(SITE), 14);
+    println!("compat: premount hook installed before the render scenario load (title+{SITE:#x})");
+}
+
+/// Opens every manifest zip's directory through the title's content manager (see `patch_premount_zips`).
+extern "system" fn premount_zips() {
+    unsafe {
+        let base = IMG_BASE.load(Ordering::Relaxed);
+        let Ok(text) = std::fs::read_to_string("./media/zipmanifest.xml") else {
+            rlog!("[premount] media/zipmanifest.xml unreadable");
+            return;
+        };
+        let mgr = *((base + 0x4e7c920) as *const usize);
+        if mgr == 0 {
+            rlog!("[premount] the content manager does not exist yet");
+            return;
+        }
+        let open_dir: extern "system" fn(usize, *mut u8, *mut u8, usize, u64, u64, u64, u64) -> *mut u8 =
+            std::mem::transmute(*((*(mgr as *const usize) + 0x1d8) as *const usize));
+        let make_string: extern "system" fn(*mut u8, *const u8, usize) -> *mut u8 = std::mem::transmute(base + 0x2451a0);
+        let skip: Vec<String> = std::env::var("XB1_PREMOUNT_SKIP").unwrap_or_else(|_| "game:\\media\\ui\\;game:\\media\\drivers\\;game:\\media\\stripped\\".into()).split(';').map(str::to_owned).collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut opened = 0usize;
+        // XB1_PREMOUNT_EXTRA="dir;dir": more directories to open (experiment), after the manifest ones.
+        let extra: Vec<String> = std::env::var("XB1_PREMOUNT_EXTRA").unwrap_or_default().split(';').filter(|d| !d.is_empty()).map(str::to_owned).collect();
+        for part in text.split("path=\"").skip(1) {
+            let Some(end) = part.find('"') else { continue };
+            let path = part[..end].to_ascii_lowercase();
+            let Some(stem) = path.strip_suffix(".zip") else { continue };
+            let stem = match stem.rfind("_pri_") { Some(i) if stem[i + 5..].bytes().all(|c| c.is_ascii_digit()) => &stem[..i], _ => stem };
+            let dir = format!("{stem}\\");
+            if !dir.starts_with("game:\\media\\") || skip.iter().any(|k| !k.is_empty() && dir.starts_with(k.as_str())) || !seen.insert(dir.clone()) {
+                continue;
+            }
+            let mut name = [0u8; 32];
+            *(name.as_mut_ptr().add(0x18) as *mut u64) = 0xf;
+            make_string(name.as_mut_ptr(), dir.as_ptr(), dir.len());
+            let mut out = [0u8; 0x100];
+            open_dir(mgr, out.as_mut_ptr(), name.as_mut_ptr(), 0, 0, 0, 0, 1);
+            opened += 1;
+            if opened <= 5 || opened % 100 == 0 || dir.contains("renderscenarios") {
+                let obj = *(out.as_ptr().add(0x28) as *const usize);
+                rlog!("[premount] {dir} -> object {obj:#x}");
+                rlog!("[premount] opened {opened}: {dir}");
+            }
+        }
+        for dir in &extra {
+            let mut name = [0u8; 32];
+            *(name.as_mut_ptr().add(0x18) as *mut u64) = 0xf;
+            make_string(name.as_mut_ptr(), dir.as_ptr(), dir.len());
+            let mut out = [0u8; 0x100];
+            open_dir(mgr, out.as_mut_ptr(), name.as_mut_ptr(), 0, 0, 0, 0, 1);
+            rlog!("[premount] extra {dir} -> object {:#x}", *(out.as_ptr().add(0x28) as *const usize));
+        }
+        rlog!("[premount] opened {opened} manifest directories");
+        // The zips' directories are read with overlapped I/O that the title's worker threads complete.
+        let wait = std::env::var("XB1_PREMOUNT_WAIT_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(3000);
+        std::thread::sleep(std::time::Duration::from_millis(wait));
+        // Debug: the title's registry of known files (title+0x4fa4208 .. 0x4fa4210), looked up by exact name.
+        let (begin, end) = (*((base + 0x4fa4208) as *const usize), *((base + 0x4fa4210) as *const usize));
+        let count = end.wrapping_sub(begin) / 8;
+        rlog!("[premount] file registry holds {count} entries");
+        if count < 1_000_000 {
+            let mut shown = 0;
+            for i in 0..count {
+                let e = *((begin + i * 8) as *const usize);
+                if e == 0 { continue; }
+                let size = *((e + 0xc0 + 0x10) as *const usize);
+                let cap = *((e + 0xc0 + 0x18) as *const usize);
+                let p = if cap >= 16 { *((e + 0xc0) as *const usize) } else { e + 0xc0 };
+                if size > 0 && size < 260 {
+                    let name = String::from_utf8_lossy(std::slice::from_raw_parts(p as *const u8, size)).to_string();
+                    if (name.to_ascii_lowercase().contains("renderscenarios") && shown < 5) || i < 3 {
+                        rlog!("[premount]   entry {i}: {name}");
+                        shown += 1;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// `memcpy(dst, src, n)` that leaves `dst` alone when `src` is all zeros (see `patch_profile_copy`).
@@ -2719,6 +2858,9 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool, dump_iat: bool) -> Res
         if std::env::var_os("XB1_NO_COMPAT").is_none() {
             unsafe { patch_filesys_storage(base, size_of_image) };
             unsafe { patch_profile_copy(base, size_of_image) };
+        }
+        if std::env::var_os("XB1_PREMOUNT").is_some() {
+            unsafe { patch_premount_zips(base, size_of_image) };
         }
         // XB1_PATCH="0x142cf6d=b201;0x...=..." (or --patch=...): write bytes into the mapped title
         // before it runs. For experiments and per-title compatibility fixes.
