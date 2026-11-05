@@ -147,13 +147,13 @@ static SEEN_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// Fixed-size formatting buffer so crash reporting never touches the heap
 /// (the title may have crashed inside it, or corrupted it).
 struct RawBuf {
-    b: [u8; 1024],
+    b: [u8; 4096],
     n: usize,
 }
 
 impl RawBuf {
     fn new() -> Self {
-        Self { b: [0; 1024], n: 0 }
+        Self { b: [0; 4096], n: 0 }
     }
     fn as_str(&self) -> &str {
         std::str::from_utf8(&self.b[..self.n]).unwrap_or("?")
@@ -354,7 +354,7 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                         // Compact line per hit: the logged file, line, category and message.
                         let hit = WATCH_HITS.fetch_add(1, Ordering::Relaxed);
                         static MAXHITS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-                        if hit < *MAXHITS.get_or_init(|| std::env::var("XB1_WATCH_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(400)) {
+                        if hit < *MAXHITS.get_or_init(|| std::env::var("XB1_WATCH_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(400)) || std::env::var_os("XB1_WATCH_FILTER").is_some() {
                             let rsp = reg(0x98) as usize;
                             let mut out = RawBuf::new();
                             let put = |out: &mut RawBuf, label: &str, p: u64, max: usize| {
@@ -368,6 +368,48 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                                     }
                                 }
                             };
+                            if let Some(spec) = std::env::var("XB1_WATCH_Q").ok() {
+                                // XB1_WATCH_Q="rbx+0x28:4,rbx+0x1e8:24": hex bytes at register+offset for every hit.
+                                use std::fmt::Write;
+                                for item in spec.split(',') {
+                                    if !item.contains(':') {
+                                        // A bare register name: its value.
+                                        let slot = match item.trim() {
+                                            "rax" => 0x78, "rcx" => 0x80, "rdx" => 0x88, "rbx" => 0x90, "rsi" => 0xA8, "rdi" => 0xB0,
+                                            "r8" => 0xB8, "r9" => 0xC0, "r10" => 0xC8, "r11" => 0xD0, "r12" => 0xD8, "r13" => 0xE0,
+                                            "r14" => 0xE8, "r15" => 0xF0, _ => continue,
+                                        };
+                                        let _ = write!(out, " {}={:#x}", item.trim(), reg(slot));
+                                        continue;
+                                    }
+                                    let Some((target, len)) = item.split_once(':') else { continue };
+                                    let Some((rn, off)) = target.split_once('+') else { continue };
+                                    let slot = match rn.trim() {
+                                        "rax" => 0x78, "rcx" => 0x80, "rdx" => 0x88, "rbx" => 0x90, "rsi" => 0xA8, "rdi" => 0xB0,
+                                        "r8" => 0xB8, "r9" => 0xC0, "r10" => 0xC8, "r11" => 0xD0, "r12" => 0xD8, "r13" => 0xE0,
+                                        "r14" => 0xE8, "r15" => 0xF0, _ => continue,
+                                    };
+                                    let (off, off2) = match off.split_once('>') { Some((a, b)) => (a, Some(b)), None => (off, None) };
+                                    let off = usize::from_str_radix(off.trim().trim_start_matches("0x"), 16).unwrap_or(0);
+                                    let len = len.trim().parse::<usize>().unwrap_or(8).min(64);
+                                    let mut buf = [0u8; 64];
+                                    let mut got = 0usize;
+                                    let mut a = (reg(slot) as usize).wrapping_add(off);
+                                    if let Some(o2) = off2 {
+                                        let mut q = 0usize;
+                                        let mut g2 = 0usize;
+                                        ReadProcessMemory(GetCurrentProcess(), a as *const c_void, &mut q as *mut usize as *mut c_void, 8, &mut g2);
+                                        a = q.wrapping_add(usize::from_str_radix(o2.trim().trim_start_matches("0x"), 16).unwrap_or(0));
+                                    }
+                                    if ReadProcessMemory(GetCurrentProcess(), a as *const c_void, buf.as_mut_ptr() as *mut c_void, len, &mut got) != 0 {
+                                        let _ = write!(out, " [{item}]=");
+                                        for b in &buf[..got] { let _ = write!(out, "{b:02x}"); }
+                                    } else {
+                                        let _ = write!(out, " [{item}]=?");
+                                    }
+                                }
+                            }
+                            let have_q = std::env::var_os("XB1_WATCH_Q").is_some();
                             if let Some(spec) = std::env::var("XB1_WATCH_STR").ok() {
                                 // XB1_WATCH_STR="rdx,r8": for each register print the text found at it, or
                                 // through the pointer stored there (a std::string with a heap buffer).
@@ -389,7 +431,7 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                                         }
                                     }
                                 }
-                            } else {
+                            } else if !have_q {
                                 put(&mut out, "file", reg(0x88), 150);
                                 {
                                     use std::fmt::Write;
@@ -414,7 +456,10 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                                     }
                                 }
                             }
-                            rlog!("[log #{hit}] @{:#x}{}", addr.wrapping_sub(IMG_BASE.load(Ordering::Relaxed)), out.as_str());
+                            let keep = match std::env::var("XB1_WATCH_FILTER") { Ok(f) => out.as_str().to_ascii_lowercase().contains(&f.to_ascii_lowercase()), Err(_) => true };
+                            if keep {
+                                rlog!("[log #{hit}] @{:#x}{}", addr.wrapping_sub(IMG_BASE.load(Ordering::Relaxed)), out.as_str());
+                            }
                         }
                         *(addr as *mut u8) = WATCH_ORIG[i].load(Ordering::Relaxed) as u8;
                         WATCH_PENDING[i].store(true, Ordering::Relaxed);
@@ -483,8 +528,13 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                                 "rax" => 0x78, "rcx" => 0x80, "rdx" => 0x88, "rbx" => 0x90, "rsi" => 0xA8, "rdi" => 0xB0,
                                 "r8" => 0xB8, "r9" => 0xC0, "r12" => 0xD8, "r13" => 0xE0, "r14" => 0xE8, "r15" => 0xF0, _ => 0x80,
                             };
+                            // "reg+off>off2": the pointer stored at reg+off, plus off2.
+                            let (off, off2) = match off.split_once('>') { Some((a, b)) => (a, Some(b)), None => (off, None) };
                             let off = usize::from_str_radix(off.trim_start_matches("0x"), 16).unwrap_or(0);
-                            let target = (reg(slot) as usize).wrapping_add(off);
+                            let mut target = (reg(slot) as usize).wrapping_add(off);
+                            if let Some(o2) = off2 {
+                                target = *(target as *const usize) + usize::from_str_radix(o2.trim_start_matches("0x"), 16).unwrap_or(0);
+                            }
                             *(ctx.add(0x48) as *mut u64) = target as u64; // Dr0
                             *(ctx.add(0x70) as *mut u64) = 1 | (1 << 16) | (3 << 18); // L0, write, 8 bytes
                             arm_hwbp_all_threads(target);
