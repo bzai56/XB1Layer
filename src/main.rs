@@ -353,7 +353,8 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                     if WATCH_REPEAT.load(Ordering::Relaxed) {
                         // Compact line per hit: the logged file, line, category and message.
                         let hit = WATCH_HITS.fetch_add(1, Ordering::Relaxed);
-                        if hit < 400 {
+                        static MAXHITS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                        if hit < *MAXHITS.get_or_init(|| std::env::var("XB1_WATCH_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(400)) {
                             let rsp = reg(0x98) as usize;
                             let mut out = RawBuf::new();
                             let put = |out: &mut RawBuf, label: &str, p: u64, max: usize| {
