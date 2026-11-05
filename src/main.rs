@@ -382,6 +382,10 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                                     let mut got = 0usize;
                                     if v >= 0x10000 && ReadProcessMemory(GetCurrentProcess(), v as *const c_void, &mut q as *mut u64 as *mut c_void, 8, &mut got) != 0 {
                                         put(&mut out, "*", q, 120);
+                                        {
+                                            use std::fmt::Write;
+                                            let _ = write!(out, " {}->{:#x}", rn.trim(), q.wrapping_sub(IMG_BASE.load(Ordering::Relaxed) as u64));
+                                        }
                                     }
                                 }
                             } else {
