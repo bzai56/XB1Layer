@@ -821,6 +821,17 @@ unsafe extern "system" fn generic_qi(this: *mut c_void, iid: *const GUID, out: *
             return HRESULT(0);
         }
     }
+    // Newer SDK, title that asks the controller for `IGamepad` (`082E402C`, Forza Horizon 3): the gamepad is a separate
+    // interface whose slot 8 is `GetCurrentReading`, while slot 8 of the controller itself is `get_User` (an object).
+    // Handing out the controller for both made `get_User` receive a reading (a bogus pointer, a crash in the title).
+    if o.class == "Windows.Xbox.Input.Controller.Controllers (element 0)" && !crate::VCCORLIB110.load(Ordering::Relaxed)
+        && unsafe { *iid } == GUID::from_u128(0x082E402C_07DF_45E1_A5AB_A3127AF197B5)
+    {
+        let t = controller_element();
+        unsafe { generic_add_ref(t) };
+        unsafe { *out = t };
+        return HRESULT(0);
+    }
     if o.class.starts_with("DownloadableContentPackageManager.Packages") && unsafe { (*iid).data1 } == 0x356E4A78 {
         // The package list as `IIterable`: slot 6 is `First(IIterator** out)`.
         let it = create_generic("DownloadableContentPackageManager.Packages (iterable)", unsafe { &*iid });
@@ -829,6 +840,10 @@ unsafe extern "system" fn generic_qi(this: *mut c_void, iid: *const GUID, out: *
         return HRESULT(0);
     }
     wlog_rare!("[winrt] {}::QueryInterface({:?}) -> self", o.class, unsafe { *iid });
+    // Sonic Mania asks the controller element for `9776FF56` and then polls readings through slot 8 of the same object.
+    if o.class.starts_with("Windows.Xbox.Input.Controller.Controllers (element") && unsafe { *iid } == GUID::from_u128(0x9776FF56_9BFD_4581_AD45_B645BBA526D6) {
+        unsafe { (*(this as *mut GenericObj)).kind = 3 };
+    }
     o.refs.fetch_add(1, Ordering::AcqRel);
     unsafe { *out = this };
     HRESULT(0)
@@ -1348,7 +1363,7 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
     // Slot 8 on the gamepad interface is `GetCurrentReading(GamepadReading* out)`: a 36-byte struct
     // (timestamp u64, buttons u32, left and right trigger f32, left and right stick x/y f32), decoded
     // from the title's poll at title+0x254e30 (it zeroes the struct, calls slot 8, then reads it).
-    if o.class.starts_with("Windows.Xbox.Input.Controller.Controllers (element") && !o.class.contains('#') && N == 8 && is_writable(arg1) && !crate::VCCORLIB110.load(Ordering::Relaxed) {
+    if o.class.starts_with("Windows.Xbox.Input.Controller.Controllers (element") && !o.class.contains('#') && N == 8 && is_writable(arg1) && !crate::VCCORLIB110.load(Ordering::Relaxed) && o.kind == 3 {
         unsafe { fill_gamepad_reading(arg1 as *mut u8) };
         return HRESULT(0);
     }

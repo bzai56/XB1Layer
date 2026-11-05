@@ -1401,6 +1401,39 @@ fn map_content_drive(dir: &Path) {
     }
 }
 
+/// The console's `T:` is a scratch drive the title may write to (Forza Horizon 3 creates `T:\Turn10Temp.scratch\`
+/// and builds its temporary file system there; without it that file system does not exist and the title dereferences
+/// NULL). Maps `T:` to a per-user scratch folder (`%TEMP%±layer-T`) when the letter is free.
+static TEMP_DRIVE: Mutex<Option<Vec<u16>>> = Mutex::new(None);
+
+fn map_temp_drive() {
+    use std::os::windows::ffi::OsStrExt;
+    if std::env::var_os("XB1_NO_TEMP_DRIVE").is_some() {
+        return;
+    }
+    let name: Vec<u16> = vec![b'T' as u16, b':' as u16, 0];
+    let mut buf = [0u16; 512];
+    if unsafe { QueryDosDeviceW(name.as_ptr(), buf.as_mut_ptr(), 512) } != 0 {
+        return; // in use: leave it alone
+    }
+    let dir = std::env::temp_dir().join("xb1layer-T");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let target: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    if unsafe { DefineDosDeviceW(0, name.as_ptr(), target.as_ptr()) } != 0 {
+        println!("mapped T: to {}", dir.display());
+        *TEMP_DRIVE.lock().unwrap() = Some(target);
+    }
+}
+
+fn unmap_temp_drive() {
+    if TEMP_DRIVE.lock().unwrap().take().is_some() {
+        let name: Vec<u16> = vec![b'T' as u16, b':' as u16, 0];
+        unsafe { DefineDosDeviceW(0x2, name.as_ptr(), ptr::null()) };
+    }
+}
+
 /// Removes the `G:` mapping made by `map_content_drive`.
 fn unmap_content_drive() {
     if CONTENT_DRIVE.lock().unwrap().take().is_some() {
@@ -1750,6 +1783,7 @@ extern "system" fn hooked_nt_terminate_process(process: isize, status: u32) -> i
     if process == -1 || process == 0 {
         log_exit_request("NtTerminateProcess", status);
         unmap_content_drive();
+        unmap_temp_drive();
     }
     let f: extern "system" fn(isize, u32) -> i32 = unsafe { std::mem::transmute(NT_TERMINATE_TRAMPOLINE.load(Ordering::Relaxed)) };
     f(process, status)
@@ -2892,6 +2926,7 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool, dump_iat: bool) -> Res
             let _ = unsafe { LoadLibraryA(name.as_ptr()) };
         }
         map_content_drive(dir);
+        map_temp_drive();
         // Titles expect a much larger main-thread stack than Rust's default, and the
         // TLS setup in `bootstrap` patches the calling thread's TEB, so do both on a
         // dedicated thread.
@@ -2980,6 +3015,7 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool, dump_iat: bool) -> Res
         }
         let code = worker.join().map_err(|_| "title thread panicked".to_string())??;
         unmap_content_drive();
+        unmap_temp_drive();
         println!("entry returned {code}");
     }
     Ok(())
