@@ -756,6 +756,9 @@ fn spawn_debug_message_pump(device: ID3D11Device) {
 /// `ID3D11Device::CreateDeferredContext(UINT flags, ID3D11DeviceContext**)`
 unsafe extern "system" fn device_create_deferred_context(this: *mut c_void, flags: u32, out: *mut *mut c_void) -> HRESULT {
     glog!("[gpu] CreateDeferredContext(flags {flags:#x}, out {out:p}) on {this:p}");
+    // The desktop accepts only 0 here (E_INVALIDARG otherwise); the console's flags (Forza Horizon 3 passes 0xa0000) are
+    // hints for its own command buffers.
+    let flags = 0u32;
     let p = unsafe { &*(this as *const Proxy) };
     let f: unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> HRESULT =
         unsafe { std::mem::transmute(*((*(p.real as *const *const usize)).add(DEVICE_CREATE_DEFERRED_CONTEXT))) };
