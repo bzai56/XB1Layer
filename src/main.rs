@@ -367,12 +367,31 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                                     }
                                 }
                             };
-                            put(&mut out, "file", reg(0x88), 150);
-                            {
-                                use std::fmt::Write;
-                                let _ = write!(out, " line={} cat={}", reg(0xB8) as u32, reg(0xC0) as u32);
+                            if let Some(spec) = std::env::var("XB1_WATCH_STR").ok() {
+                                // XB1_WATCH_STR="rdx,r8": for each register print the text found at it, or
+                                // through the pointer stored there (a std::string with a heap buffer).
+                                for rn in spec.split(',') {
+                                    let slot = match rn.trim() {
+                                        "rax" => 0x78, "rcx" => 0x80, "rdx" => 0x88, "rbx" => 0x90, "rsi" => 0xA8, "rdi" => 0xB0,
+                                        "r8" => 0xB8, "r9" => 0xC0, "r10" => 0xC8, "r11" => 0xD0, "r12" => 0xD8, "r13" => 0xE0,
+                                        "r14" => 0xE8, "r15" => 0xF0, _ => continue,
+                                    };
+                                    let v = reg(slot);
+                                    put(&mut out, rn.trim(), v, 120);
+                                    let mut q = 0u64;
+                                    let mut got = 0usize;
+                                    if v >= 0x10000 && ReadProcessMemory(GetCurrentProcess(), v as *const c_void, &mut q as *mut u64 as *mut c_void, 8, &mut got) != 0 {
+                                        put(&mut out, "*", q, 120);
+                                    }
+                                }
+                            } else {
+                                put(&mut out, "file", reg(0x88), 150);
+                                {
+                                    use std::fmt::Write;
+                                    let _ = write!(out, " line={} cat={}", reg(0xB8) as u32, reg(0xC0) as u32);
+                                }
+                                put(&mut out, "msg", *((rsp + 0x28) as *const u64), 190);
                             }
-                            put(&mut out, "msg", *((rsp + 0x28) as *const u64), 190);
                             rlog!("[log #{hit}]{}", out.as_str());
                         }
                         *(addr as *mut u8) = WATCH_ORIG[i].load(Ordering::Relaxed) as u8;
