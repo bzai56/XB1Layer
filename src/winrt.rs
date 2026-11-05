@@ -1301,6 +1301,16 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         wlog!("[winrt] {} slot {N}: (string, out) -> a stand-in object", o.class);
         return HRESULT(0);
     }
+    // `PackageTransferManager` slot 7 is not an event subscription: the title (Forza Horizon 3, title+0x1c30c10) passes a
+    // chunk object and an `int*` and treats the value written there as 0 = the install chunk is available. It asks for
+    // every chunk a zip belongs to, and a zip's files are only looked up when its chunk is available. Everything is
+    // installed in an unpacked dump, so answer 0. `XB1_NO_CHUNKS=1` restores the old behavior.
+    if o.class.starts_with("Windows.Xbox.Management.Deployment.PackageTransferManager") && N == 7 && is_writable(arg2) && !in_layer_image(arg2)
+        && std::env::var_os("XB1_NO_CHUNKS").is_none() && looks_like_com_object(arg1)
+    {
+        unsafe { ptr::write_unaligned(arg2 as *mut u32, 0) };
+        return HRESULT(0);
+    }
     // A delegate in arg1 means `add_Event(handler, &token)`: leave the handler alone.
     if looks_like_com_object(arg1) {
         if o.class == "Windows.Xbox.Input.Gamepad" || o.class == "Windows.Xbox.Input.Controller" {
