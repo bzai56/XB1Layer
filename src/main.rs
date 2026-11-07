@@ -2939,6 +2939,9 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool, dump_iat: bool) -> Res
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_secs(secs));
                 rlog!("[watchdog] XB1_TIMEOUT_SECS={secs} reached: ending the process");
+                if std::env::var_os("XB1_WATCHDOG_DUMP").is_some() {
+                    dump_all_threads();
+                }
                 unmap_content_drive();
                 unmap_temp_drive();
                 process::exit(0);

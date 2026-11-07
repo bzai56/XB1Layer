@@ -2619,6 +2619,15 @@ pub extern "system" fn create_device_x(params: *const u8, out_device: *mut *mut 
     match result {
         Ok(()) => {
             glog!("[gpu] created a desktop D3D11 device (feature level {:#x}); returning proxies", got.0);
+            // A console title uses its immediate context from several threads (Forza Horizon 3 crashed inside d3d11.dll
+            // in different places from run to run); the desktop immediate context is not thread safe unless asked.
+            if let Some(d) = &device {
+                use windows::core::Interface;
+                if let Ok(mt) = d.cast::<ID3D11Multithread>() {
+                    let was = unsafe { mt.SetMultithreadProtected(true) };
+                    glog!("[gpu] multithread protection on (was {})", was.as_bool());
+                }
+            }
             if debug {
                 if let Some(d) = device.clone() {
                     spawn_debug_message_pump(d);
@@ -2909,7 +2918,10 @@ unsafe extern "system" fn ctx_om_set_render_targets_new(this: *mut c_void, n: u3
     let mut views = [ptr::null_mut::<c_void>(); 8];
     let count = (n as usize).min(8);
     static LOGS: AtomicU32 = AtomicU32::new(0);
-    let log = LOGS.fetch_add(1, Ordering::Relaxed) < 16;
+    // Log the first calls, and every call that binds something (up to 60), so a crash inside the real call can be matched.
+    static BOUND_LOGS: AtomicU32 = AtomicU32::new(0);
+    let any_bound = (!rtvs.is_null() && readable(rtvs as *const c_void, count * 8) && (0..count).any(|i| unsafe { !(*rtvs.add(i)).is_null() })) || !dsv.is_null();
+    let log = LOGS.fetch_add(1, Ordering::Relaxed) < 16 || (any_bound && BOUND_LOGS.fetch_add(1, Ordering::Relaxed) < 60);
     if !rtvs.is_null() && readable(rtvs as *const c_void, count * 8) {
         for (i, v) in views.iter_mut().enumerate().take(count) {
             let raw = unsafe { *rtvs.add(i) };
@@ -2925,6 +2937,9 @@ unsafe extern "system" fn ctx_om_set_render_targets_new(this: *mut c_void, n: u3
     let dsv_ok = real_dsv.is_null() || (readable(real_dsv as *const c_void, 8) && readable(unsafe { *(real_dsv as *const *const c_void) }, 8));
     if log {
         glog!("[gpu] OMSetRenderTargets({n}): dsv {dsv:p} -> {real_dsv:p} {}", if dsv_ok { "ok" } else { "UNREADABLE, dropped" });
+    }
+    if log {
+        glog!("[gpu] OMSetRenderTargets({n}): calling the desktop context {real:p}");
     }
     unsafe { f(real, n, if rtvs.is_null() { ptr::null() } else { views.as_ptr() }, if dsv_ok { real_dsv } else { ptr::null_mut() }) };
 }

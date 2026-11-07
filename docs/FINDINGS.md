@@ -909,3 +909,11 @@ The title uses the same embedded table as Sonic Mania (base `+0x3E0`, index `(of
 | `+0x6b8`, `+0x6d0`, `+0x748`, `+0x750`, `+0x768`, `+0x8a8`, `+0x8b0`, `+0xa08`, `+0xa10` | various | unknown (compute / UAV / query / timestamp calls?) | log only |
 
 None of the new forwards was run with real draws; the only test was Sonic Mania (3 presents, no exceptions). Whether Forza's views and shaders are real desktop objects, and whether a frame can be presented, is untested because forwarding draws to the real driver hung the display driver earlier.
+
+### Forza Horizon 3: first default-mode runs (2026-11-08)
+
+Default mode (embedded context calls forwarded), `XB1_TIMEOUT_SECS=25`, texture cap 3072 MB, several runs: **no GPU hang and no black screen** (about 1.2 GiB of video memory, 900+ textures). About half of the runs reach the 25 s watchdog; the others crash inside `d3d11.dll` (offsets `+0x774f4`, `+0x17d665`) from the call at title+`0x1360548` (`call [ctx+0x4e0]`, embedded index 32, `OMSetRenderTargets`), once at title+`0x1a1f890`. The last call logged before each crash is `OMSetRenderTargets(1, &rtv, NULL)` with a real render target view (vtable in `d3d11.dll`), already past the pointer checks. Device multithread protection (`ID3D11Multithread::SetMultithreadProtected(TRUE)`) is now enabled; it did not remove the crash.
+
+No frame is presented in any run: `DXGIXPresentArray` is never called in 25 s. A title thread loops on `ID3D11DeviceX` extension slot `0x228` (index 69, args `(0, &out, 0)`; title+`0x1939a80`: wait for an event, call, repeat until a flag is set), which looks like a GPU submission thread. Not understood yet: why the render-target call crashes (the deferred contexts the title records on from worker threads are one suspect), and what the title waits for before its first present (possibly the `DXGIXSetVLineNotification` it registered, which the layer does not signal).
+
+New: `XB1_WATCHDOG_DUMP=1` prints a stack summary of every thread when the watchdog fires.
