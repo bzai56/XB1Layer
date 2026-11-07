@@ -969,6 +969,12 @@ fn create_back_buffer(context_proxy: *mut c_void) -> usize {
     glog!("[gpu] display back buffer {DISPLAY_WIDTH}x{DISPLAY_HEIGHT}: {:#x} -> {:p}", hr.0 as u32, tex);
     if hr.0 >= 0 && !tex.is_null() {
         extend_resource(tex, true);
+        // The chain hands the same texture out for the life of the process, and the title releases what it gets: hold
+        // enough references that those releases can never destroy it.
+        let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { std::mem::transmute(*((*(tex as *const *const usize)).add(1))) };
+        for _ in 0..100_000 {
+            unsafe { add_ref(tex) };
+        }
         return tex as usize;
     }
     0
@@ -979,10 +985,25 @@ fn create_back_buffer(context_proxy: *mut c_void) -> usize {
 /// stand-in (unknown).
 unsafe extern "system" fn context_ext_212(this: *mut c_void, count: usize, a: *mut *mut c_void, b: *mut *mut c_void) -> HRESULT {
     glog!("[gpu] context +0x6a0: count {count} -> display chain and a stand-in");
+    // Forza Horizon 3 passes `(context, 2, Object* out[2], &stand_in)`: `count` is the number of display planes and
+    // `a` an array with one chain per plane (an older title passed 1 and a single pointer).
     if !a.is_null() && (a as usize) % 8 == 0 {
-        let back_buffer = create_back_buffer(this);
-        let chain = Box::new(DisplayChain { vtbl: chain_vtable(), refs: AtomicU32::new(1), back_buffer });
-        unsafe { *a = Box::into_raw(chain) as *mut c_void };
+        // The title asks every frame (thousands of calls in a minute); each call used to create new 1920x1080 textures,
+        // which exhausted video memory. One chain per plane is created once and handed out again.
+        static CHAINS: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+        for i in 0..count.clamp(1, 4) {
+            let mut chain = CHAINS[i].load(Ordering::Acquire);
+            if chain == 0 {
+                let back_buffer = create_back_buffer(this);
+                let new = Box::into_raw(Box::new(DisplayChain { vtbl: chain_vtable(), refs: AtomicU32::new(1), back_buffer })) as usize;
+                chain = match CHAINS[i].compare_exchange(0, new, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => new,
+                    Err(existing) => existing,
+                };
+            }
+            unsafe { (*(chain as *const DisplayChain)).refs.fetch_add(1, Ordering::AcqRel) };
+            unsafe { *a.add(i) = chain as *mut c_void };
+        }
     }
     if !b.is_null() && (b as usize) % 8 == 0 {
         unsafe { *b = new_stand_in() };

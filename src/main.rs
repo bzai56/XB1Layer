@@ -1032,6 +1032,13 @@ unsafe fn bootstrap(base: *mut u8, size: usize, tls: (u32, u32), exc: (u32, u32)
         unsafe { arm_hwbp_on(GetCurrentThread(), addr) };
         rlog!("hardware write breakpoint armed from the start on title+{rva:#x}");
     }
+    // XB1_HWBP_ADDR=0x60194470960: the same with an absolute address (heap addresses of the title's allocator repeat
+    // from run to run, so an object found in one run can be watched from the start of the next).
+    if let Some(addr) = std::env::var("XB1_HWBP_ADDR").ok().and_then(|v| usize::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
+        HWBP_ADDR.store(addr, Ordering::Relaxed);
+        unsafe { arm_hwbp_on(GetCurrentThread(), addr) };
+        rlog!("hardware write breakpoint armed from the start on {addr:#x}");
+    }
     if let Ok(spec) = std::env::var("XB1_HWBP") {
         let _ = HWBP_SPEC.set(spec);
     }
