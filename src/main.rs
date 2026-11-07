@@ -377,7 +377,7 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                                         let slot = match item.trim() {
                                             "rax" => 0x78, "rcx" => 0x80, "rdx" => 0x88, "rbx" => 0x90, "rsi" => 0xA8, "rdi" => 0xB0,
                                             "r8" => 0xB8, "r9" => 0xC0, "r10" => 0xC8, "r11" => 0xD0, "r12" => 0xD8, "r13" => 0xE0,
-                                            "r14" => 0xE8, "r15" => 0xF0, _ => continue,
+                                            "r14" => 0xE8, "r15" => 0xF0, "rsp" => 0x98, _ => continue,
                                         };
                                         let _ = write!(out, " {}={:#x}", item.trim(), reg(slot));
                                         continue;
@@ -387,7 +387,7 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                                     let slot = match rn.trim() {
                                         "rax" => 0x78, "rcx" => 0x80, "rdx" => 0x88, "rbx" => 0x90, "rsi" => 0xA8, "rdi" => 0xB0,
                                         "r8" => 0xB8, "r9" => 0xC0, "r10" => 0xC8, "r11" => 0xD0, "r12" => 0xD8, "r13" => 0xE0,
-                                        "r14" => 0xE8, "r15" => 0xF0, _ => continue,
+                                        "r14" => 0xE8, "r15" => 0xF0, "rsp" => 0x98, _ => continue,
                                     };
                                     let (off, off2) = match off.split_once('>') { Some((a, b)) => (a, Some(b)), None => (off, None) };
                                     let off = usize::from_str_radix(off.trim().trim_start_matches("0x"), 16).unwrap_or(0);
@@ -417,7 +417,7 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                                     let slot = match rn.trim() {
                                         "rax" => 0x78, "rcx" => 0x80, "rdx" => 0x88, "rbx" => 0x90, "rsi" => 0xA8, "rdi" => 0xB0,
                                         "r8" => 0xB8, "r9" => 0xC0, "r10" => 0xC8, "r11" => 0xD0, "r12" => 0xD8, "r13" => 0xE0,
-                                        "r14" => 0xE8, "r15" => 0xF0, _ => continue,
+                                        "r14" => 0xE8, "r15" => 0xF0, "rsp" => 0x98, _ => continue,
                                     };
                                     let v = reg(slot);
                                     put(&mut out, rn.trim(), v, 120);
@@ -549,7 +549,7 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                             let slot = match rname {
                                 "rax" => 0x78, "rcx" => 0x80, "rdx" => 0x88, "rbx" => 0x90, "rsi" => 0xA8, "rdi" => 0xB0,
                                 "r8" => 0xB8, "r9" => 0xC0, "r10" => 0xC8, "r11" => 0xD0, "r12" => 0xD8, "r13" => 0xE0,
-                                "r14" => 0xE8, "r15" => 0xF0, _ => continue,
+                                "r14" => 0xE8, "r15" => 0xF0, "rsp" => 0x98, _ => continue,
                             };
                             // "reg+off>off2=v": read the qword at reg+off first, then write at that value + off2.
                             let (off, off2) = match off.split_once('>') {

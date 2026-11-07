@@ -1716,7 +1716,7 @@ unsafe fn create_placement_texture(
     {
         static TOTAL: AtomicU64 = AtomicU64::new(0);
         static WARNED: AtomicU32 = AtomicU32::new(0);
-        let cap_mb: u64 = std::env::var("XB1_TEX_CAP_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(1536);
+        let cap_mb: u64 = std::env::var("XB1_TEX_CAP_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(3072);
         let (w, h) = (desktop[0].max(1) as u64, desktop[1].max(1) as u64);
         let layers = if desktop_create_slot == 5 { desktop[3].max(1) as u64 } else { desktop[2].max(1) as u64 };
         let mips = if desktop_create_slot == 5 { desktop[2] } else { desktop[3] };
