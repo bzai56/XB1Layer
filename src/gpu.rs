@@ -162,8 +162,12 @@ const EMBED_VERIFIED_SHIFTED: [usize; 5] = [34, 46, 49, 59, 63];
 /// one behind: 32 `OMSetRenderTargets(1,&rtv,dsv)`, 35 `OMSetDepthStencilState(state,1)`,
 /// 42 `RSSetState`, 43 `RSSetViewports(1,&vp)`; console 52 (offset +0x580) is
 /// `ClearDepthStencilView(dsv,3,..)` = desktop 53, so the shift is a constant one from 32 on.
-const EMBED_EXTRA: [(usize, usize); 11] =
-    [(8, 8), (19, 19), (10, 10), (12, 12), (16, 16), (18, 18), (32, 33), (35, 36), (42, 43), (43, 44), (52, 53)];
+///
+/// Added from Forza Horizon 3's per-frame calls (same table base): 7 `VSSetConstantBuffers(0, 1, &b)` (desktop 7), 13
+/// `Draw(vertex count, start)` (desktop 13: `a2` = 3 or 966, `a3` = 0) and 22 `GSSetConstantBuffers(0, 1, &b)` (desktop 22),
+/// all three with the argument shapes of their desktop namesakes and no console-only values.
+const EMBED_EXTRA: [(usize, usize); 14] =
+    [(8, 8), (19, 19), (10, 10), (12, 12), (16, 16), (18, 18), (32, 33), (35, 36), (42, 43), (43, 44), (52, 53), (7, 7), (13, 13), (22, 22)];
 
 /// `(embedded index, entry)` pairs that forward to the real context. Built once.
 fn forwarded_entries() -> &'static Vec<(usize, usize)> {

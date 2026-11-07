@@ -885,3 +885,27 @@ Repeated runs of Forza Horizon 3 (about 1,700 placed textures created per run, t
 - The title's resource manager logs `Failed to load FromFile(game:\media\...swatchbin)` (title+`0x1ea4e76`, `0x1ea6aec`) for every texture whose creation fails; the loader then dereferences the NULL result. The failures were caused by the layer's own safety cap (`XB1_TEX_CAP_MB`, 256 in those runs, 1536 default) making placed-texture creation fail with `E_OUTOFMEMORY`. With `XB1_LOG_ALL=1 XB1_TEX_CAP_MB=2048` the title ran for the full 45 s of the watchdog with no exception: about 950 textures created, the game thread looping, about 1.3 GiB of video memory used, no frame presented yet. The default cap is now 3072 MiB.
 - Where it is now: the title's loop calls the embedded context functions (`+0x418`, `0x420`, `0x430`, `0x448`, `0x460`, `0x490`, `0x4a0`, `0x4e0`, `0x4f0`, `0x4f8`, `0x538`, `0x5f0`, `0x610`, `0x748`, `0x750`, ...) but nothing is forwarded in log-only mode and no `Present` reaches the layer. Next: map those context functions (the same table as Sonic Mania's, so most are known), then the present path (`DXGIXPresentArray`).
 - The second crash (title+`0x17277e9`) did not appear in the runs with the larger cap, so it was probably a consequence of failed loads too.
+
+### Forza Horizon 3: the embedded context functions, as far as the logged arguments show (2026-11-08)
+
+The title uses the same embedded table as Sonic Mania (base `+0x3E0`, index `(offset - 0x3E0) / 8`). Arguments of the first calls in a 45 s log-only run (`XB1_LOG_ALL=1`):
+
+| offset (index) | arguments seen | reading | status |
+|---|---|---|---|
+| `+0x418` (7) | `(0, 1, &buffer)` | `VSSetConstantBuffers` | forwarded to desktop 7 (new) |
+| `+0x420` (8) | `(object, 0, 0x76b40..)` | pixel-shader resources / shader (as Sonic) | existing handler |
+| `+0x430` (10) | `(0, 1, &sampler)` | `PSSetSamplers` | existing |
+| `+0x440` (12) | `(0x1e00000000, 0, 0)` | `DrawIndexed`, count packed in the high dword (as the older SDK) | existing handler, packed form not checked |
+| `+0x448` (13) | `(3 or 966, 0, ...)` | `Draw(vertex count, start)` | forwarded to desktop 13 (new) |
+| `+0x460` (16), `+0x470` (18), `+0x478` (19) | `(0, 1, &object)`, `(0, 1, &object)`, `(0, &object, 0)` | `PSSetConstantBuffers`, `IASetVertexBuffers`, index buffer (argument order differs from Sonic's) | existing; 19 unverified |
+| `+0x490` (22) | `(0, 1, &buffer)` | `GSSetConstantBuffers` | forwarded to desktop 22 (new) |
+| `+0x498` (23), `+0x5b8` (59), `+0x5d8` (63) | `(0, &object, 0x100)` once each | shader reset (GS, HS, DS) with NULL | log only |
+| `+0x4a0` (24), `+0x5f0` (66) | `(object, 0, 0x71d80 / 0x70140)` | per-stage `SetShader` (VS and ?) with a class-instance argument | log only, unverified |
+| `+0x4e0` (32) | `(1 or 2, &views, dsv)` | `OMSetRenderTargets` | handler with pointer checks |
+| `+0x4f0` (34), `+0x4f8` (35) | `(state, 0, 0xffffffff)`, `(state, 0, ...)` | `OMSetBlendState`, depth-stencil state | existing |
+| `+0x530` (42), `+0x538` (43), `+0x520` (40) | `(0, ..., 0xffffffff)`, `(1, &x, 0)`, `(1, 1, 1)` | rasterizer state, viewports, ? | partly existing |
+| `+0x550` (46), `+0x568` (49), `+0x580` (52) | two resources and a context; `(view, &zeros, 0)`; `(dsv, 3, ...)` | `CopyResource`, `ClearRenderTargetView`, `ClearDepthStencilView` | existing |
+| `+0x6a0` | `(2, &out[2], &stand_in)` | display planes | handled (see above) |
+| `+0x6b8`, `+0x6d0`, `+0x748`, `+0x750`, `+0x768`, `+0x8a8`, `+0x8b0`, `+0xa08`, `+0xa10` | various | unknown (compute / UAV / query / timestamp calls?) | log only |
+
+None of the new forwards was run with real draws; the only test was Sonic Mania (3 presents, no exceptions). Whether Forza's views and shaders are real desktop objects, and whether a frame can be presented, is untested because forwarding draws to the real driver hung the display driver earlier.
