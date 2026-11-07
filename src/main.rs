@@ -2927,6 +2927,16 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool, dump_iat: bool) -> Res
         }
         map_content_drive(dir);
         map_temp_drive();
+        // XB1_TIMEOUT_SECS=n: end the process after n seconds (a watchdog for tests that might hang the GPU driver).
+        if let Some(secs) = std::env::var("XB1_TIMEOUT_SECS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(secs));
+                rlog!("[watchdog] XB1_TIMEOUT_SECS={secs} reached: ending the process");
+                unmap_content_drive();
+                unmap_temp_drive();
+                process::exit(0);
+            });
+        }
         // Titles expect a much larger main-thread stack than Rust's default, and the
         // TLS setup in `bootstrap` patches the calling thread's TEB, so do both on a
         // dedicated thread.

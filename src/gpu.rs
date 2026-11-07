@@ -251,6 +251,10 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
                 v.push((index_of(EMBED_TABLE + 19 * 8), ctx_bind_object as usize));
                 continue;
             }
+            if console_slot == 32 {
+                v.push((index_of(EMBED_TABLE + 32 * 8), ctx_om_set_render_targets_new as usize));
+                continue;
+            }
             let thunk = forward_context_thunk(unsafe { thunks.add((128 + console_slot) * 32) }, desktop_slot);
             v.push((index_of(EMBED_TABLE + console_slot * 8), thunk));
         }
@@ -1685,6 +1689,25 @@ unsafe fn create_placement_texture(
         glog!("[gpu] device slot {which}: dropping console-only MiscFlags bits {:#x}", desktop[misc_index] & !misc_keep);
         desktop[misc_index] &= misc_keep;
     }
+    // Safety cap: a title that creates thousands of placed textures can exhaust video memory and hang the display
+    // driver (a black screen). The estimate is 4 bytes a texel; `XB1_TEX_CAP_MB` (default 1536) bounds the total and
+    // creation then fails with E_OUTOFMEMORY. `XB1_TEX_CAP_MB=0` removes the cap.
+    {
+        static TOTAL: AtomicU64 = AtomicU64::new(0);
+        static WARNED: AtomicU32 = AtomicU32::new(0);
+        let cap_mb: u64 = std::env::var("XB1_TEX_CAP_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(1536);
+        let (w, h) = (desktop[0].max(1) as u64, desktop[1].max(1) as u64);
+        let layers = if desktop_create_slot == 5 { desktop[3].max(1) as u64 } else { desktop[2].max(1) as u64 };
+        let mips = if desktop_create_slot == 5 { desktop[2] } else { desktop[3] };
+        let bytes = w * h * layers * 4 * if mips > 1 { 4 } else { 3 } / 3;
+        let total = TOTAL.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        if cap_mb != 0 && total > cap_mb << 20 {
+            if WARNED.fetch_add(1, Ordering::Relaxed) == 0 {
+                glog!("[gpu] texture memory estimate {} MiB is over the cap of {cap_mb} MiB (XB1_TEX_CAP_MB): further textures fail with E_OUTOFMEMORY", total >> 20);
+            }
+            return HRESULT(0x8007000Eu32 as i32);
+        }
+    }
     let mut texture: *mut c_void = ptr::null_mut();
     let hr = unsafe { real_create_texture(p.real, desktop_create_slot, desktop.as_ptr() as *const u8, &mut texture) };
     if hr.0 >= 0 && !texture.is_null() {
@@ -2840,6 +2863,45 @@ unsafe extern "system" fn ctx_om_set_render_targets_old(this: *mut c_void, n: u3
             unsafe { set_srv(real, 0, 16, saved.as_ptr()) };
         }
     }
+}
+
+/// True when `p` points at memory the layer can read `n` bytes from (guards forwarding of a garbage pointer).
+fn readable(p: *const c_void, n: usize) -> bool {
+    if (p as usize) < 0x10000 {
+        return false;
+    }
+    let mut got = 0usize;
+    let mut b = [0u8; 64];
+    unsafe { crate::ReadProcessMemory(crate::GetCurrentProcess(), p, b.as_mut_ptr() as *mut c_void, n.min(64), &mut got) != 0 && got >= n.min(64) }
+}
+
+/// `OMSetRenderTargets(n, rtvs, dsv)` of the newer SDK's embedded table (console index 32; Forza Horizon 3 calls it with
+/// two render targets, the second NULL). Same job as the desktop call; every view is checked before it is forwarded.
+unsafe extern "system" fn ctx_om_set_render_targets_new(this: *mut c_void, n: u32, rtvs: *const *mut c_void, dsv: *mut c_void) {
+    let real = unsafe { real_context(this) };
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void, *mut c_void) =
+        unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(33))) };
+    let mut views = [ptr::null_mut::<c_void>(); 8];
+    let count = (n as usize).min(8);
+    static LOGS: AtomicU32 = AtomicU32::new(0);
+    let log = LOGS.fetch_add(1, Ordering::Relaxed) < 16;
+    if !rtvs.is_null() && readable(rtvs as *const c_void, count * 8) {
+        for (i, v) in views.iter_mut().enumerate().take(count) {
+            let raw = unsafe { *rtvs.add(i) };
+            let real_view = unwrap_object(raw);
+            let ok = real_view.is_null() || (readable(real_view as *const c_void, 8) && readable(unsafe { *(real_view as *const *const c_void) }, 8));
+            if log {
+                glog!("[gpu] OMSetRenderTargets({n}): rtv[{i}] {raw:p} -> {real_view:p} {}", if ok { "ok" } else { "UNREADABLE, dropped" });
+            }
+            *v = if ok { real_view } else { ptr::null_mut() };
+        }
+    }
+    let real_dsv = unwrap_object(dsv);
+    let dsv_ok = real_dsv.is_null() || (readable(real_dsv as *const c_void, 8) && readable(unsafe { *(real_dsv as *const *const c_void) }, 8));
+    if log {
+        glog!("[gpu] OMSetRenderTargets({n}): dsv {dsv:p} -> {real_dsv:p} {}", if dsv_ok { "ok" } else { "UNREADABLE, dropped" });
+    }
+    unsafe { f(real, n, if rtvs.is_null() { ptr::null() } else { views.as_ptr() }, if dsv_ok { real_dsv } else { ptr::null_mut() }) };
 }
 
 fn kind_of(wrapper: *mut c_void) -> u8 {
