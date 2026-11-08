@@ -1770,7 +1770,7 @@ fn dump_bound_ps(n: u32, real: *mut c_void) {
     }
     LAST_PS.store(ps, Ordering::Relaxed);
     // The first pixel-shader resource (t0): its texture size and format (PSGetShaderResources is desktop slot 73).
-    if n < 8 {
+    if n < 40 {
         unsafe {
             let get: unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) = std::mem::transmute(*((*(real as *const *const usize)).add(73)));
             let mut srv: *mut c_void = ptr::null_mut();
@@ -1788,6 +1788,9 @@ fn dump_bound_ps(n: u32, real: *mut c_void) {
                     let mut d = [0u32; 11];
                     gd(res, d.as_mut_ptr());
                     glog!("[gpu] draw {n}: t0 srv {srv:p} texture {res:p} {}x{} mips {} array {} fmt {} bind {:#x} misc {:#x}", d[0], d[1], d[2], d[3], d[4], d[8], d[10]);
+                    T0_RES.store(res as usize, Ordering::Relaxed);
+                    T0_REAL.store(real as usize, Ordering::Relaxed);
+                    T0_DESC.store(((d[0] as u64) << 32) | (d[1] as u64) << 8 | d[4] as u64 & 0xff, Ordering::Relaxed);
                     let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*rvt.add(2));
                     rel(res);
                 }
@@ -1801,6 +1804,62 @@ fn dump_bound_ps(n: u32, real: *mut c_void) {
         glog!("[gpu] pixel shader {ps:#x} ({} bytes) written for draw {n}", b.len());
     } else {
         glog!("[gpu] draw {n}: bound pixel shader {ps:#x} has no recorded bytecode");
+    }
+}
+
+static T0_RES: AtomicUsize = AtomicUsize::new(0);
+static T0_REAL: AtomicUsize = AtomicUsize::new(0);
+static T0_DESC: AtomicU64 = AtomicU64::new(0);
+
+/// Copies a 2D texture into a staging texture and logs a few pixels (raw 32-bit values; as R10G10B10A2 for format 23/24).
+unsafe fn readback_texture(real: *mut c_void, res: *mut c_void, d: [u32; 11]) {
+    unsafe {
+        let ctx_vt = *(real as *const *const usize);
+        let get_device: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = std::mem::transmute(*ctx_vt.add(3));
+        let mut dev: *mut c_void = ptr::null_mut();
+        glog!("[gpu] readback: start");
+        get_device(real, &mut dev);
+        glog!("[gpu] readback: device {dev:p}");
+        if dev.is_null() {
+            return;
+        }
+        // D3D11_TEXTURE2D_DESC: width, height, mips, array, format, {count, quality}, usage, bind, cpu, misc
+        let desc: [u32; 11] = [d[0], d[1], 1, 1, d[4], 1, 0, 3 /* STAGING */, 0, 0x20000 /* CPU_ACCESS_READ */, 0];
+        let create: unsafe extern "system" fn(*mut c_void, *const u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(*((*(dev as *const *const usize)).add(5)));
+        let mut st: *mut c_void = ptr::null_mut();
+        let hr = create(dev, desc.as_ptr(), ptr::null(), &mut st);
+        if hr.0 < 0 || st.is_null() {
+            glog!("[gpu] readback: staging texture failed {:#x}", hr.0 as u32);
+            return;
+        }
+        let copy: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(*ctx_vt.add(47));
+        glog!("[gpu] readback: staging {st:p}, copying");
+        copy(real, st, res);
+        glog!("[gpu] readback: copied");
+        // Map(resource, subresource, MAP_READ = 1, flags, D3D11_MAPPED_SUBRESOURCE {data, row pitch, depth pitch})
+        let map: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut [usize; 3]) -> HRESULT = std::mem::transmute(*ctx_vt.add(14));
+        let mut m = [0usize; 3];
+        glog!("[gpu] readback: mapping, slot fn {:#x}", *ctx_vt.add(14));
+        let hr = map(real, st, 0, 1, 0, &mut m);
+        glog!("[gpu] readback: mapped {:#x} data {:#x} pitch {}", hr.0 as u32, m[0], m[1]);
+        if hr.0 >= 0 {
+            let pitch = m[1] & 0xffff_ffff;
+            let mut line = String::new();
+            for (x, y) in [(100usize, 100usize), (560, 630), (960, 540), (1400, 700), (1800, 300), (300, 300), (1750, 650)] {
+                if (x as u32) < d[0] && (y as u32) < d[1] {
+                    let v = *((m[0] + y * pitch + x * 4) as *const u32);
+                    // R10G10B10A2: r = bits 0..9, g = 10..19, b = 20..29, a = 30..31
+                    line.push_str(&format!(" ({x},{y}) {v:#010x} r{} g{} b{} a{};", v & 0x3ff, (v >> 10) & 0x3ff, (v >> 20) & 0x3ff, v >> 30));
+                }
+            }
+            glog!("[gpu] readback of the t0 texture (format {}):{}", d[4], line);
+            let unmap: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*ctx_vt.add(15));
+            unmap(real, st, 0);
+        } else {
+            glog!("[gpu] readback: Map failed {:#x}", hr.0 as u32);
+        }
+        let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*((*(st as *const *const usize)).add(2)));
+        rel(st);
     }
 }
 
@@ -2548,6 +2607,32 @@ pub unsafe extern "system" fn present_array(a1: u64, a2: u64, a3: u64, a4: u64, 
     let n = COUNT.fetch_add(1, Ordering::Relaxed);
     PRESENT_ARRAY_CALLS.fetch_add(1, Ordering::Relaxed);
     FRAMES.fetch_add(1, Ordering::Relaxed);
+    if std::env::var_os("XB1_DUMP_PS").is_some() && (n == 150 || n == 900 || n == 1500) && T0_RES.load(Ordering::Relaxed) != 0 {
+        let (res, real) = (T0_RES.load(Ordering::Relaxed), T0_REAL.load(Ordering::Relaxed));
+        let packed = T0_DESC.load(Ordering::Relaxed);
+        let mut d = [0u32; 11];
+        d[0] = (packed >> 32) as u32;
+        d[1] = ((packed >> 8) & 0xfffff) as u32;
+        d[4] = (packed & 0xff) as u32;
+        glog!("[gpu] present {n}:");
+        unsafe { readback_texture(real as *mut c_void, res as *mut c_void, d) };
+        // The swap chain's current buffer (what is shown): GetBuffer(0, IID_ID3D11Texture2D) is slot 9.
+        let sc = crate::display::SWAP_CHAIN.load(Ordering::Acquire);
+        if sc != 0 {
+            unsafe {
+                let vt = *(sc as *const *const usize);
+                let get_buffer: unsafe extern "system" fn(*mut c_void, u32, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(9));
+                let iid = GUID::from_u128(0x6f15aaf2_d208_4e89_9ab4_489535d34f9c);
+                let mut buf: *mut c_void = ptr::null_mut();
+                if get_buffer(sc as *mut c_void, 0, &iid, &mut buf).0 >= 0 && !buf.is_null() {
+                    glog!("[gpu] swap chain buffer 0:");
+                    readback_texture(real as *mut c_void, buf, [1920, 1080, 1, 1, 24, 0, 0, 0, 0, 0, 0]);
+                    let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*((*(buf as *const *const usize)).add(2)));
+                    rel(buf);
+                }
+            }
+        }
+    }
     if n < 6 {
         glog!("[gpu] DXGIXPresentArray #{n}: a1={a1:#x} a2={a2:#x} a3={a3:#x} a4={a4:#x} a5={} a6={}", safe_dump(a5, 48), safe_dump(a6, 64));
         if a4 > 0 && a4 <= 4 && a5 > 0x10000 {
