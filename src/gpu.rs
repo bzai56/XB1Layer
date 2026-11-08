@@ -3359,6 +3359,22 @@ fn readable(p: *const c_void, n: usize) -> bool {
     unsafe { crate::ReadProcessMemory(crate::GetCurrentProcess(), p, b.as_mut_ptr() as *mut c_void, n.min(64), &mut got) != 0 && got >= n.min(64) }
 }
 
+/// Whether an object looks like a real D3D11 object: its vtable pointer lies in a loaded module's image (the layer's own
+/// objects have vtables on the heap; the extended console vtables are restored before this is asked).
+fn has_image_vtable(obj: *const c_void) -> bool {
+    #[repr(C)]
+    struct Mbi { base: usize, alloc_base: usize, alloc_prot: u32, _pad: u32, size: usize, state: u32, prot: u32, ty: u32, _pad2: u32 }
+    unsafe extern "system" {
+        fn VirtualQuery(addr: *const c_void, info: *mut Mbi, len: usize) -> usize;
+    }
+    if !readable(obj, 8) {
+        return false;
+    }
+    let vt = unsafe { *(obj as *const usize) };
+    let mut m = Mbi { base: 0, alloc_base: 0, alloc_prot: 0, _pad: 0, size: 0, state: 0, prot: 0, ty: 0, _pad2: 0 };
+    unsafe { VirtualQuery(vt as *const c_void, &mut m, std::mem::size_of::<Mbi>()) != 0 && m.ty == 0x100_0000 }
+}
+
 /// `OMSetRenderTargets(n, rtvs, dsv)` of the newer SDK's embedded table (console index 32; Forza Horizon 3 calls it with
 /// two render targets, the second NULL). Same job as the desktop call; every view is checked before it is forwarded.
 unsafe extern "system" fn ctx_om_set_render_targets_new(this: *mut c_void, n: u32, rtvs: *const *mut c_void, dsv: *mut c_void) {
@@ -3379,6 +3395,12 @@ unsafe extern "system" fn ctx_om_set_render_targets_new(this: *mut c_void, n: u3
             restore_object_vtable(raw);
             if readable(raw as *const c_void, 8) && unsafe { *(raw as *const usize) } == chain_vtable() as usize {
                 raw = chain_render_target_view(raw, real);
+            } else if !raw.is_null() && !has_image_vtable(raw as *const c_void) {
+                static OLOGS: AtomicU32 = AtomicU32::new(0);
+                if OLOGS.fetch_add(1, Ordering::Relaxed) < 4 {
+                    glog!("[gpu] OMSetRenderTargets: rtv[{i}] {raw:p} is not a D3D object (its vtable is not in a module image): dropped");
+                }
+                raw = ptr::null_mut();
             }
             let real_view = unwrap_object(raw);
             let ok = real_view.is_null() || (readable(real_view as *const c_void, 8) && readable(unsafe { *(real_view as *const *const c_void) }, 8));
@@ -3398,12 +3420,16 @@ unsafe extern "system" fn ctx_om_set_render_targets_new(this: *mut c_void, n: u3
                 line.push_str(&format!(" | rtv[{i}]={raw:p} [{:#x} {:#x}] -> {:p} {} {} standin={}", a.0, a.1, views[i], d3d_object_name(raw as u64), crate::winrt::identify_vtable(a.0 as usize).unwrap_or(""), a.0 as usize == stand_in_vtable() as usize));
             }
         }
+        if !dsv.is_null() && readable(dsv as *const c_void, 16) {
+            let (a, b) = unsafe { (*(dsv as *const u64), *(dsv as *const u64).add(1)) };
+            line.push_str(&format!(" | dsv [{a:#x} {b:#x}] {} chain={}", d3d_object_name(dsv as u64), a as usize == chain_vtable() as usize));
+        }
         glog!("{line}");
     }
     restore_object_vtable(dsv);
     // The same mix-up as for the render targets: a display chain object where a depth view was expected (the real call faults
     // on it): bind no depth target.
-    let dsv = if !dsv.is_null() && readable(dsv as *const c_void, 8) && unsafe { *(dsv as *const usize) } == chain_vtable() as usize {
+    let dsv = if !dsv.is_null() && readable(dsv as *const c_void, 8) && !has_image_vtable(dsv as *const c_void) {
         static DLOGS: AtomicU32 = AtomicU32::new(0);
         if DLOGS.fetch_add(1, Ordering::Relaxed) < 3 {
             glog!("[gpu] a display chain {dsv:p} was bound as a depth view: no depth target");
