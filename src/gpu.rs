@@ -1026,6 +1026,37 @@ unsafe extern "system" fn chain_get_back_buffer(this: *mut c_void, out: *mut *mu
     HRESULT(0)
 }
 
+/// A real render target view for a display chain object the title bound as a render target (its `QueryInterface` answers
+/// every interface with the chain itself, so the title ends up holding the chain where it expected a view): one view of the
+/// chain's back buffer, created on first use.
+fn chain_render_target_view(chain: *mut c_void, real_ctx: *mut c_void) -> *mut c_void {
+    static CACHE: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+    if let Some((_, v)) = CACHE.lock().unwrap().iter().find(|(c, _)| *c == chain as usize) {
+        return *v as *mut c_void;
+    }
+    let back = unsafe { (*(chain as *const DisplayChain)).back_buffer } as *mut c_void;
+    if back.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe {
+        let get_device: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = std::mem::transmute(*((*(real_ctx as *const *const usize)).add(3)));
+        let mut dev: *mut c_void = ptr::null_mut();
+        get_device(real_ctx, &mut dev);
+        if dev.is_null() {
+            return ptr::null_mut();
+        }
+        let create: unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(*((*(dev as *const *const usize)).add(9)));
+        let mut view: *mut c_void = ptr::null_mut();
+        let hr = create(dev, unwrap_object(back), ptr::null(), &mut view);
+        glog!("[gpu] a display chain {chain:p} was bound as a render target: view of its back buffer {back:p} -> {:#x} {view:p}", hr.0 as u32);
+        if hr.0 >= 0 && !view.is_null() {
+            CACHE.lock().unwrap().push((chain as usize, view as usize));
+            return view;
+        }
+    }
+    ptr::null_mut()
+}
+
 fn chain_vtable() -> *const usize {
     static VTBL: OnceLock<Vec<usize>> = OnceLock::new();
     VTBL.get_or_init(|| {
@@ -3343,7 +3374,12 @@ unsafe extern "system" fn ctx_om_set_render_targets_new(this: *mut c_void, n: u3
     let log = LOGS.fetch_add(1, Ordering::Relaxed) < 16 || (any_bound && BOUND_LOGS.fetch_add(1, Ordering::Relaxed) < 60);
     if !rtvs.is_null() && readable(rtvs as *const c_void, count * 8) {
         for (i, v) in views.iter_mut().enumerate().take(count) {
-            let raw = unsafe { *rtvs.add(i) };
+            let mut raw = unsafe { *rtvs.add(i) };
+            // Views the layer gave an extended (console-shaped) vtable must have the real one when the desktop context uses them.
+            restore_object_vtable(raw);
+            if readable(raw as *const c_void, 8) && unsafe { *(raw as *const usize) } == chain_vtable() as usize {
+                raw = chain_render_target_view(raw, real);
+            }
             let real_view = unwrap_object(raw);
             let ok = real_view.is_null() || (readable(real_view as *const c_void, 8) && readable(unsafe { *(real_view as *const *const c_void) }, 8));
             if log {
@@ -3352,6 +3388,30 @@ unsafe extern "system" fn ctx_om_set_render_targets_new(this: *mut c_void, n: u3
             *v = if ok { real_view } else { ptr::null_mut() };
         }
     }
+    if std::env::var_os("XB1_RTV_TRACE").is_some() {
+        // Every call, so the last lines before a crash inside the real call show what was passed.
+        let mut line = format!("[gpu] OMRT n={n} rtvs={rtvs:p} dsv={dsv:p}");
+        if !rtvs.is_null() && readable(rtvs as *const c_void, count * 8) {
+            for i in 0..count {
+                let raw = unsafe { *rtvs.add(i) };
+                let a = if readable(raw as *const c_void, 16) { unsafe { (*(raw as *const u64), *(raw as *const u64).add(1)) } } else { (0, 0) };
+                line.push_str(&format!(" | rtv[{i}]={raw:p} [{:#x} {:#x}] -> {:p} {} {} standin={}", a.0, a.1, views[i], d3d_object_name(raw as u64), crate::winrt::identify_vtable(a.0 as usize).unwrap_or(""), a.0 as usize == stand_in_vtable() as usize));
+            }
+        }
+        glog!("{line}");
+    }
+    restore_object_vtable(dsv);
+    // The same mix-up as for the render targets: a display chain object where a depth view was expected (the real call faults
+    // on it): bind no depth target.
+    let dsv = if !dsv.is_null() && readable(dsv as *const c_void, 8) && unsafe { *(dsv as *const usize) } == chain_vtable() as usize {
+        static DLOGS: AtomicU32 = AtomicU32::new(0);
+        if DLOGS.fetch_add(1, Ordering::Relaxed) < 3 {
+            glog!("[gpu] a display chain {dsv:p} was bound as a depth view: no depth target");
+        }
+        ptr::null_mut()
+    } else {
+        dsv
+    };
     let real_dsv = unwrap_object(dsv);
     let dsv_ok = real_dsv.is_null() || (readable(real_dsv as *const c_void, 8) && readable(unsafe { *(real_dsv as *const *const c_void) }, 8));
     if log {
