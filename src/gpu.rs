@@ -2351,6 +2351,24 @@ pub unsafe extern "system" fn present_array(a1: u64, a2: u64, a3: u64, a4: u64, 
 /// `DXGIXSetVLineNotification(...)`: logged, reports success.
 pub unsafe extern "system" fn set_vline_notification(a1: u64, a2: u64, a3: u64, a4: u64) -> i32 {
     glog!("[gpu] DXGIXSetVLineNotification({a1:#x}, {a2:#x}, {a3:#x}, {a4:#x})");
+    // The third argument is an event handle (Forza Horizon 3 passes a `CreateEventW` result): the console signals it at
+    // a display line every frame, and the title's app thread waits for it before it runs a frame. Pulse it at the
+    // frame rate (`XB1_FPS`, default 60); `XB1_NO_VLINE=1` leaves it alone.
+    if a3 != 0 && std::env::var_os("XB1_NO_VLINE").is_none() {
+        unsafe extern "system" {
+            fn SetEvent(h: *mut c_void) -> i32;
+        }
+        let handle = a3 as usize;
+        let fps: u64 = std::env::var("XB1_FPS").ok().and_then(|v| v.parse().ok()).filter(|v| *v > 0).unwrap_or(60);
+        std::thread::spawn(move || {
+            let period = std::time::Duration::from_micros(1_000_000 / fps);
+            loop {
+                std::thread::sleep(period);
+                unsafe { SetEvent(handle as *mut c_void) };
+            }
+        });
+        glog!("[gpu] pulsing event {a3:#x} at {fps} Hz for the vline notification");
+    }
     0
 }
 

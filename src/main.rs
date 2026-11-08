@@ -50,6 +50,13 @@ unsafe extern "system" {
     fn SuspendThread(thread: *mut c_void) -> u32;
     fn ResumeThread(thread: *mut c_void) -> u32;
     fn SetThreadContext(thread: *mut c_void, ctx: *const c_void) -> i32;
+    fn WaitForSingleObject(h: *mut c_void, ms: u32) -> u32;
+    fn CreateEventW(attrs: *mut c_void, manual: i32, initial: i32, name: *const u16) -> *mut c_void;
+    fn CreateEventA(attrs: *mut c_void, manual: i32, initial: i32, name: *const i8) -> *mut c_void;
+    fn SetEvent(h: *mut c_void) -> i32;
+    fn CreateSemaphoreExW(attrs: *mut c_void, initial: i32, max: i32, name: *const u16, flags: u32, access: u32) -> *mut c_void;
+    fn ReleaseSemaphore(h: *mut c_void, count: i32, previous: *mut i32) -> i32;
+    fn WaitForMultipleObjects(count: u32, handles: *const *mut c_void, all: i32, ms: u32) -> u32;
     fn CloseHandle(h: *mut c_void) -> i32;
     fn GetCurrentProcessId() -> u32;
     fn DefineDosDeviceW(flags: u32, name: *const u16, target: *const u16) -> i32;
@@ -229,7 +236,7 @@ fn dump_all_threads() {
         let mut ok = Thread32First(snap, entry.as_mut_ptr());
         while ok != 0 {
             if entry[3] == pid && entry[2] != me {
-                rlog!("=== thread {}", entry[2]);
+                rlog!("=== thread {}{}", entry[2], if entry[2] == TITLE_TID.load(Ordering::Relaxed) { " (title main thread)" } else { "" });
                 dump_thread(entry[2]);
             }
             ok = Thread32Next(snap, entry.as_mut_ptr());
@@ -279,7 +286,7 @@ fn dump_thread(tid: u32) {
                 describe(v, &mut l);
                 rlog!("  stack[{i}] -> {}", l.as_str());
                 shown += 1;
-                if shown == 16 {
+                if shown == 40 {
                     break;
                 }
             }
@@ -377,7 +384,7 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                                         let slot = match item.trim() {
                                             "rax" => 0x78, "rcx" => 0x80, "rdx" => 0x88, "rbx" => 0x90, "rsi" => 0xA8, "rdi" => 0xB0,
                                             "r8" => 0xB8, "r9" => 0xC0, "r10" => 0xC8, "r11" => 0xD0, "r12" => 0xD8, "r13" => 0xE0,
-                                            "r14" => 0xE8, "r15" => 0xF0, "rsp" => 0x98, _ => continue,
+                                            "r14" => 0xE8, "r15" => 0xF0, "rsp" => 0x98, "rbp" => 0xA0, _ => continue,
                                         };
                                         let _ = write!(out, " {}={:#x}", item.trim(), reg(slot));
                                         continue;
@@ -387,7 +394,7 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                                     let slot = match rn.trim() {
                                         "rax" => 0x78, "rcx" => 0x80, "rdx" => 0x88, "rbx" => 0x90, "rsi" => 0xA8, "rdi" => 0xB0,
                                         "r8" => 0xB8, "r9" => 0xC0, "r10" => 0xC8, "r11" => 0xD0, "r12" => 0xD8, "r13" => 0xE0,
-                                        "r14" => 0xE8, "r15" => 0xF0, "rsp" => 0x98, _ => continue,
+                                        "r14" => 0xE8, "r15" => 0xF0, "rsp" => 0x98, "rbp" => 0xA0, _ => continue,
                                     };
                                     let (off, off2) = match off.split_once('>') { Some((a, b)) => (a, Some(b)), None => (off, None) };
                                     let off = usize::from_str_radix(off.trim().trim_start_matches("0x"), 16).unwrap_or(0);
@@ -417,7 +424,7 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                                     let slot = match rn.trim() {
                                         "rax" => 0x78, "rcx" => 0x80, "rdx" => 0x88, "rbx" => 0x90, "rsi" => 0xA8, "rdi" => 0xB0,
                                         "r8" => 0xB8, "r9" => 0xC0, "r10" => 0xC8, "r11" => 0xD0, "r12" => 0xD8, "r13" => 0xE0,
-                                        "r14" => 0xE8, "r15" => 0xF0, "rsp" => 0x98, _ => continue,
+                                        "r14" => 0xE8, "r15" => 0xF0, "rsp" => 0x98, "rbp" => 0xA0, _ => continue,
                                     };
                                     let v = reg(slot);
                                     put(&mut out, rn.trim(), v, 120);
@@ -549,7 +556,7 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                             let slot = match rname {
                                 "rax" => 0x78, "rcx" => 0x80, "rdx" => 0x88, "rbx" => 0x90, "rsi" => 0xA8, "rdi" => 0xB0,
                                 "r8" => 0xB8, "r9" => 0xC0, "r10" => 0xC8, "r11" => 0xD0, "r12" => 0xD8, "r13" => 0xE0,
-                                "r14" => 0xE8, "r15" => 0xF0, "rsp" => 0x98, _ => continue,
+                                "r14" => 0xE8, "r15" => 0xF0, "rsp" => 0x98, "rbp" => 0xA0, _ => continue,
                             };
                             // "reg+off>off2=v": read the qword at reg+off first, then write at that value + off2.
                             let (off, off2) = match off.split_once('>') {
@@ -966,6 +973,67 @@ extern "system" fn xb_create_threadpool_io(file: *mut c_void, callback: usize, c
     }
     let wrapped = Box::into_raw(Box::new(PoolIo { callback, context }));
     unsafe { CreateThreadpoolIo(file, pool_io_trampoline as usize, wrapped as *mut c_void, env) }
+}
+
+/// `XB1_EVENT_TRACE=1`: log every event the title creates and sets (handle and calling title address), to find which
+/// code is expected to signal an event a thread waits on.
+fn event_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XB1_EVENT_TRACE").is_some())
+}
+
+fn caller_rva() -> usize {
+    unsafe extern "system" { fn RtlCaptureStackBackTrace(skip: u32, count: u32, frames: *mut *mut c_void, hash: *mut u32) -> u16; }
+    let mut f = [ptr::null_mut::<c_void>(); 3];
+    unsafe { RtlCaptureStackBackTrace(1, 3, f.as_mut_ptr(), ptr::null_mut()) };
+    let base = IMG_BASE.load(Ordering::Relaxed);
+    f.iter().map(|p| *p as usize).find(|a| *a >= base && *a < base + IMG_SIZE.load(Ordering::Relaxed)).map_or(0, |a| a - base)
+}
+
+extern "system" fn xb_create_event_w(attrs: *mut c_void, manual: i32, initial: i32, name: *const u16) -> *mut c_void {
+    let h = unsafe { CreateEventW(attrs, manual, initial, name) };
+    rlog!("[event] create {h:p} manual={manual} initial={initial} from title+{:#x}", caller_rva());
+    h
+}
+
+extern "system" fn xb_create_event_a(attrs: *mut c_void, manual: i32, initial: i32, name: *const i8) -> *mut c_void {
+    let h = unsafe { CreateEventA(attrs, manual, initial, name) };
+    rlog!("[event] create {h:p} manual={manual} initial={initial} from title+{:#x}", caller_rva());
+    h
+}
+
+extern "system" fn xb_set_event(h: *mut c_void) -> i32 {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 3_000_000 {
+        rlog!("[event] set {h:p} from title+{:#x}", caller_rva());
+    }
+    unsafe { SetEvent(h) }
+}
+
+extern "system" fn xb_create_semaphore(attrs: *mut c_void, initial: i32, max: i32, name: *const u16, flags: u32, access: u32) -> *mut c_void {
+    let h = unsafe { CreateSemaphoreExW(attrs, initial, max, name, flags, access) };
+    rlog!("[event] create semaphore {h:p} initial={initial} max={max} from title+{:#x}", caller_rva());
+    h
+}
+
+extern "system" fn xb_release_semaphore(h: *mut c_void, count: i32, previous: *mut i32) -> i32 {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 3_000_000 {
+        rlog!("[event] release semaphore {h:p} by {count} from title+{:#x}", caller_rva());
+    }
+    unsafe { ReleaseSemaphore(h, count, previous) }
+}
+
+/// Handles of the last infinite wait-for-all the title made (the watchdog reports their state).
+static WAIT_ALL_HANDLES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+extern "system" fn xb_wait_multiple(count: u32, handles: *const *mut c_void, all: i32, ms: u32) -> u32 {
+    if all != 0 && ms == u32::MAX && count > 0 && count <= 16 && !handles.is_null() {
+        let v: Vec<usize> = (0..count as usize).map(|i| unsafe { *handles.add(i) } as usize).collect();
+        rlog!("[event] wait for all of {:#x?} (infinite) from title+{:#x}", v, caller_rva());
+        *WAIT_ALL_HANDLES.lock().unwrap() = v;
+    }
+    unsafe { WaitForMultipleObjects(count, handles, all, ms) }
 }
 
 struct ThreadStart {
@@ -2184,6 +2252,12 @@ fn override_for(dll: &str, func: &str) -> Option<usize> {
         "TitleMemoryStatus" => Some(xb_title_memory_status as usize),
         "CreateThread" => Some(xb_create_thread as usize),
         "CreateThreadpoolIo" => Some(xb_create_threadpool_io as usize),
+        "CreateEventW" if event_trace() => Some(xb_create_event_w as usize),
+        "CreateEventA" if event_trace() => Some(xb_create_event_a as usize),
+        "SetEvent" if event_trace() => Some(xb_set_event as usize),
+        "CreateSemaphoreExW" if event_trace() => Some(xb_create_semaphore as usize),
+        "ReleaseSemaphore" if event_trace() => Some(xb_release_semaphore as usize),
+        "WaitForMultipleObjects" if event_trace() => Some(xb_wait_multiple as usize),
         "LoadLibraryExW" if RING.load(Ordering::Relaxed) != 0 || std::env::var_os("XB1_FILES").is_some() => Some(xb_load_library_ex_w as usize),
         "CreateFile2" if RING.load(Ordering::Relaxed) != 0 || std::env::var_os("XB1_FILES").is_some() => Some(xb_create_file2 as usize),
         "FindFirstFileExA" if RING.load(Ordering::Relaxed) != 0 || std::env::var_os("XB1_FILES").is_some() => Some(xb_find_first_file_ex_a as usize),
@@ -2941,6 +3015,19 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool, dump_iat: bool) -> Res
                 rlog!("[watchdog] XB1_TIMEOUT_SECS={secs} reached: ending the process");
                 if std::env::var_os("XB1_WATCHDOG_DUMP").is_some() {
                     dump_all_threads();
+                }
+                for h in WAIT_ALL_HANDLES.lock().unwrap().iter() {
+                    let r = unsafe { WaitForSingleObject(*h as *mut c_void, 0) };
+                    rlog!("[watchdog] wait-all handle {h:#x}: {}", match r { 0 => "signaled", 0x102 => "not signaled", _ => "invalid or abandoned" });
+                }
+                // XB1_WATCH_HANDLES="0x2f4,0x2f8": whether each handle is signaled at this moment.
+                if let Ok(list) = std::env::var("XB1_WATCH_HANDLES") {
+                    for item in list.split(',') {
+                        if let Ok(h) = usize::from_str_radix(item.trim().trim_start_matches("0x"), 16) {
+                            let r = unsafe { WaitForSingleObject(h as *mut c_void, 0) };
+                            rlog!("[watchdog] handle {h:#x}: {}", match r { 0 => "signaled", 0x102 => "not signaled", _ => "invalid or abandoned" });
+                        }
+                    }
                 }
                 unmap_content_drive();
                 unmap_temp_drive();
