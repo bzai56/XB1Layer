@@ -58,6 +58,7 @@ unsafe extern "system" {
     fn ReleaseSemaphore(h: *mut c_void, count: i32, previous: *mut i32) -> i32;
     fn WaitForMultipleObjects(count: u32, handles: *const *mut c_void, all: i32, ms: u32) -> u32;
     fn WaitForSingleObjectEx(h: *mut c_void, ms: u32, alertable: i32) -> u32;
+    fn SetProcessAffinityMask(process: *mut c_void, mask: usize) -> i32;
     fn CloseHandle(h: *mut c_void) -> i32;
     fn GetCurrentProcessId() -> u32;
     fn DefineDosDeviceW(flags: u32, name: *const u16, target: *const u16) -> i32;
@@ -134,6 +135,8 @@ static WATCH_PENDING: [std::sync::atomic::AtomicBool; 256] = [const { std::sync:
 /// `--watch-repeat`: watchpoints stay armed and report every hit (up to a cap) instead of once.
 static WATCH_REPEAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static WATCH_HITS: AtomicUsize = AtomicUsize::new(0);
+/// `rcx` at the last repeat-mode watch hit (for `XB1_WATCHDOG_PEEK=@+off:len`).
+static LAST_HIT_RCX: AtomicUsize = AtomicUsize::new(0);
 
 unsafe fn plant_watch_sites(base: *mut u8, rvas: &[usize]) {
     for (i, rva) in rvas.iter().take(WATCH_ADDR.len()).enumerate() {
@@ -464,6 +467,7 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                                     }
                                 }
                             }
+                            LAST_HIT_RCX.store(reg(0x80) as usize, Ordering::Relaxed);
                             let keep = match std::env::var("XB1_WATCH_FILTER") { Ok(f) => out.as_str().to_ascii_lowercase().contains(&f.to_ascii_lowercase()), Err(_) => true };
                             if keep {
                                 rlog!("[log #{hit}] @{:#x}{}", addr.wrapping_sub(IMG_BASE.load(Ordering::Relaxed)), out.as_str());
@@ -3058,6 +3062,12 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool, dump_iat: bool) -> Res
         }
         map_content_drive(dir);
         map_temp_drive();
+        // XB1_AFFINITY=0x3: restrict the process to those CPUs (experiment: does a title's start-up race depend on how many
+        // threads really run at once?).
+        if let Some(mask) = std::env::var("XB1_AFFINITY").ok().and_then(|v| usize::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
+            let ok = unsafe { SetProcessAffinityMask(GetCurrentProcess(), mask) };
+            println!("process affinity mask {mask:#x}: {}", if ok != 0 { "set" } else { "failed" });
+        }
         // XB1_TIMEOUT_SECS=n: end the process after n seconds (a watchdog for tests that might hang the GPU driver).
         if let Some(secs) = std::env::var("XB1_TIMEOUT_SECS").ok().and_then(|v| v.parse::<u64>().ok()) {
             std::thread::spawn(move || {
@@ -3072,6 +3082,34 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool, dump_iat: bool) -> Res
                 }
                 for (tid, h, caller) in PENDING_WAITS.lock().unwrap().iter() {
                     rlog!("[watchdog] thread {tid} waits forever on {h:#x} from {caller}");
+                }
+                // XB1_WATCHDOG_PEEK="0xADDR:len;0xADDR:len": memory at absolute addresses when the watchdog fires.
+                if let Ok(list) = std::env::var("XB1_WATCHDOG_PEEK") {
+                    for item in list.split(';') {
+                        let Some((a, n)) = item.split_once(':') else { continue };
+                        let a = a.trim();
+                        // "*0xRVA+0xOFF": the pointer stored at title+RVA, plus OFF.
+                        let deref = a.strip_prefix('*').and_then(|r| {
+                            let (rva, off) = r.split_once('+')?;
+                            let rva = usize::from_str_radix(rva.trim_start_matches("0x"), 16).ok()?;
+                            let off = usize::from_str_radix(off.trim_start_matches("0x"), 16).ok()?;
+                            let mut q = 0usize;
+                            let mut g = 0usize;
+                            if unsafe { ReadProcessMemory(GetCurrentProcess(), (IMG_BASE.load(Ordering::Relaxed) + rva) as *const c_void, &mut q as *mut usize as *mut c_void, 8, &mut g) } == 0 { return None; }
+                            Some(q + off)
+                        });
+                        let addr = if deref.is_some() { deref } else if let Some(off) = a.strip_prefix("@+") { usize::from_str_radix(off.trim_start_matches("0x"), 16).ok().map(|o| LAST_HIT_RCX.load(Ordering::Relaxed) + o) } else { usize::from_str_radix(a.trim_start_matches("0x"), 16).ok() };
+                        let (Some(a), Ok(n)) = (addr, n.trim().parse::<usize>()) else { continue };
+                        let mut buf = [0u8; 256];
+                        let mut got = 0usize;
+                        let n = n.min(256);
+                        if unsafe { ReadProcessMemory(GetCurrentProcess(), a as *const c_void, buf.as_mut_ptr() as *mut c_void, n, &mut got) } != 0 {
+                            let hex: String = buf[..got].iter().map(|b| format!("{b:02x}")).collect();
+                            rlog!("[watchdog] peek {a:#x}: {hex}");
+                        } else {
+                            rlog!("[watchdog] peek {a:#x}: unreadable");
+                        }
+                    }
                 }
                 // XB1_WATCH_HANDLES="0x2f4,0x2f8": whether each handle is signaled at this moment.
                 if let Ok(list) = std::env::var("XB1_WATCH_HANDLES") {
