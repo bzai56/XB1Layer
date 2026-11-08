@@ -1439,6 +1439,17 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         wlog_rare!("[winrt] controller sub-object slot {N} -> integer 0");
         return HRESULT(0);
     }
+    // Experiment XB1_NARROW_CLASS=<prefix>: stack out-parameters of matching classes get a 32-bit 0 instead of a stand-in pointer
+    // (to find getters that write a pointer into a narrower variable).
+    if on_stack && is_writable(arg1) {
+        static P: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        if let Some(pre) = P.get_or_init(|| std::env::var("XB1_NARROW_CLASS").ok()) {
+            if o.class.starts_with(pre.as_str()) {
+                unsafe { *(arg1 as *mut u32) = 0 };
+                return HRESULT(0);
+            }
+        }
+    }
     // A pointer that is not 8-aligned cannot be an `Object**`: it is a value getter (`uint*`, `bool*`), so zero is
     // written (a pointer write there panicked on the misalignment).
     if is_writable(arg1) && (arg1 as usize) % 8 != 0 && !in_layer_image(arg1) {

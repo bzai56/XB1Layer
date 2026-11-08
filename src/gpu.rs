@@ -2547,7 +2547,19 @@ pub unsafe extern "system" fn set_vline_notification(a1: u64, a2: u64, a3: u64, 
         unsafe extern "system" {
             fn SetEvent(h: *mut c_void) -> i32;
         }
-        let handle = a3 as usize;
+        // Signal our own duplicate: the title may close its handle and the number be reused for another object, and the
+        // pulse thread then signalled unrelated events (start-up crashes with garbage in callee-saved registers).
+        unsafe extern "system" {
+            fn DuplicateHandle(sp: *mut c_void, sh: *mut c_void, tp: *mut c_void, th: *mut *mut c_void, access: u32, inherit: i32, opts: u32) -> i32;
+            fn GetCurrentProcess() -> *mut c_void;
+        }
+        let mut dup: *mut c_void = std::ptr::null_mut();
+        let ok = unsafe { DuplicateHandle(GetCurrentProcess(), a3 as *mut c_void, GetCurrentProcess(), &mut dup, 0, 0, 2) };
+        if ok == 0 {
+            glog!("[gpu] vline: could not duplicate the event handle {a3:#x}; not pulsing");
+            return 0;
+        }
+        let handle = dup as usize;
         let fps: u64 = std::env::var("XB1_FPS").ok().and_then(|v| v.parse().ok()).filter(|v| *v > 0).unwrap_or(60);
         std::thread::spawn(move || {
             let period = std::time::Duration::from_micros(1_000_000 / fps);
