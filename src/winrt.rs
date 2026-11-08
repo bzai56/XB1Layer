@@ -1431,6 +1431,14 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         wlog!("[winrt] {} slot {N}: out-parameter {arg1:p} is not on the stack, left alone", o.class);
         return HRESULT(0);
     }
+    // Forza Horizon 3 (title+0x1a1f7fc..0x1a1f830): slots 10 and 11 of the controller's sub-object write a 32-bit value into a
+    // stack integer (`int*` at rsp+0x110 / 0x118, 8-aligned). A stand-in pointer written there made the title use the low half of a
+    // heap address as a count, which corrupted memory and gave the random start-up crashes (rbx / r15 holding small garbage).
+    if o.class.starts_with("Windows.Xbox.Input.Controller.Controllers (element") && o.class.ends_with("#slot12") && (N == 10 || N == 11) && on_stack && is_writable(arg1) && std::env::var_os("XB1_OLD_CONTROLLER_INTS").is_none() {
+        unsafe { ptr::write_unaligned(arg1 as *mut u64, 0) };
+        wlog_rare!("[winrt] controller sub-object slot {N} -> integer 0");
+        return HRESULT(0);
+    }
     // A pointer that is not 8-aligned cannot be an `Object**`: it is a value getter (`uint*`, `bool*`), so zero is
     // written (a pointer write there panicked on the misalignment).
     if is_writable(arg1) && (arg1 as usize) % 8 != 0 && !in_layer_image(arg1) {

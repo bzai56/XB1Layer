@@ -259,6 +259,11 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
                 v.push((index_of(EMBED_TABLE + 32 * 8), ctx_om_set_render_targets_new as usize));
                 continue;
             }
+            if console_slot == 13 && std::env::var_os("XB1_NEW_DRAW_PLAIN").is_none() {
+                // Newer SDK `Draw`: the primitive topology is part of the title's inlined state (see `old_topology`).
+                v.push((index_of(EMBED_TABLE + 13 * 8), ctx_draw_old as usize));
+                continue;
+            }
             let thunk = forward_context_thunk(unsafe { thunks.add((128 + console_slot) * 32) }, desktop_slot);
             v.push((index_of(EMBED_TABLE + console_slot * 8), thunk));
         }
@@ -269,7 +274,7 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
             let console_slot = if *desktop_slot > EMBED_FORWARD_MAX { desktop_slot - 1 } else { *desktop_slot };
             let target = index_of(EMBED_TABLE + console_slot * 8);
             let thunk = synced_forward_thunk(unsafe { synced.add(n * 128) }, *desktop_slot);
-            if *desktop_slot == 12 {
+            if *desktop_slot == 12 || (*desktop_slot == 13 && std::env::var_os("XB1_NEW_DRAW_PLAIN").is_none()) {
                 continue;
             }
             if let Some(entry) = v.iter_mut().find(|(i, _)| *i == target) {
@@ -2437,6 +2442,7 @@ pub unsafe extern "system" fn present_array(a1: u64, a2: u64, a3: u64, a4: u64, 
     static COUNT: AtomicU32 = AtomicU32::new(0);
     let n = COUNT.fetch_add(1, Ordering::Relaxed);
     PRESENT_ARRAY_CALLS.fetch_add(1, Ordering::Relaxed);
+    FRAMES.fetch_add(1, Ordering::Relaxed);
     if n < 6 {
         glog!("[gpu] DXGIXPresentArray #{n}: a1={a1:#x} a2={a2:#x} a3={a3:#x} a4={a4:#x} a5={} a6={}", safe_dump(a5, 48), safe_dump(a6, 64));
         if a4 > 0 && a4 <= 4 && a5 > 0x10000 {
@@ -3275,6 +3281,16 @@ unsafe extern "system" fn ctx_draw_old(this: *mut c_void, count: u32, start: u32
         glog!("[gpu] Draw({count}, {start})");
     }
     draw_trace("plain", count, start, this);
+    {
+        // The first plain draws of each size: the state dwords the topology might be in (`XB1_NEW_DRAW_PLAIN` is the old path).
+        static SEEN: AtomicU32 = AtomicU32::new(0);
+        let k = match count { 3 => 1, 4 => 2, 6 => 4, _ => 8 };
+        if SEEN.fetch_or(k, Ordering::Relaxed) & k == 0 && !this.is_null() {
+            let mut f = [0u32; 24];
+            unsafe { ptr::copy_nonoverlapping((this as *const u8).add(0x160), f.as_mut_ptr() as *mut u8, 96) };
+            glog!("[gpu] Draw({count}) context +0x160: {:x?}", f);
+        }
+    }
     LAST_DRAW[0].store(0, Ordering::Relaxed);
     LAST_DRAW[1].store(count, Ordering::Relaxed);
     LAST_DRAW[2].store(start, Ordering::Relaxed);
