@@ -59,6 +59,8 @@ unsafe extern "system" {
     fn WaitForMultipleObjects(count: u32, handles: *const *mut c_void, all: i32, ms: u32) -> u32;
     fn WaitForSingleObjectEx(h: *mut c_void, ms: u32, alertable: i32) -> u32;
     fn SetProcessAffinityMask(process: *mut c_void, mask: usize) -> i32;
+    fn RtlLookupFunctionEntry(pc: u64, image_base: *mut u64, history: *mut c_void) -> *mut c_void;
+    fn RtlVirtualUnwind(kind: u32, image_base: u64, pc: u64, entry: *mut c_void, ctx: *mut c_void, handler_data: *mut *mut c_void, establisher: *mut u64, ctx_ptrs: *mut c_void) -> *mut c_void;
     fn CloseHandle(h: *mut c_void) -> i32;
     fn GetCurrentProcessId() -> u32;
     fn DefineDosDeviceW(flags: u32, name: *const u16, target: *const u16) -> i32;
@@ -241,11 +243,73 @@ fn dump_all_threads() {
         while ok != 0 {
             if entry[3] == pid && entry[2] != me {
                 rlog!("=== thread {}{}", entry[2], if entry[2] == TITLE_TID.load(Ordering::Relaxed) { " (title main thread)" } else { "" });
-                dump_thread(entry[2]);
+                if std::env::var_os("XB1_WATCHDOG_WALK").is_some() {
+                    walk_thread(entry[2]);
+                } else {
+                    dump_thread(entry[2]);
+                }
             }
             ok = Thread32Next(snap, entry.as_mut_ptr());
         }
         CloseHandle(snap);
+    }
+}
+
+/// A real stack walk of another thread (unwind tables, not a scan of the raw stack): `XB1_WATCHDOG_WALK=1`.
+fn walk_thread(tid: u32) {
+    unsafe {
+        let h = OpenThread(0x1F_FFFF, 0, tid);
+        if h.is_null() {
+            rlog!("  cannot open thread");
+            return;
+        }
+        SuspendThread(h);
+        let mut c = Context([0; 1232]);
+        *(c.0.as_mut_ptr().add(0x30) as *mut u32) = 0x10_000B; // CONTEXT_FULL
+        let ok = GetThreadContext(h, c.0.as_mut_ptr() as *mut c_void);
+        if ok == 0 {
+            ResumeThread(h);
+            rlog!("  GetThreadContext failed");
+            return;
+        }
+        let (base, size) = (IMG_BASE.load(Ordering::Relaxed), IMG_SIZE.load(Ordering::Relaxed));
+        let mut line = RawBuf::new();
+        use std::fmt::Write;
+        for depth in 0..24 {
+            let rip = *(c.0.as_ptr().add(0xF8) as *const u64);
+            if rip == 0 {
+                break;
+            }
+            let mut image: u64 = 0;
+            let entry = RtlLookupFunctionEntry(rip, &mut image, ptr::null_mut());
+            if (rip as usize) >= base && (rip as usize) < base + size {
+                let _ = write!(line, " title+{:#x}", rip as usize - base);
+            } else {
+                let mut d = RawBuf::new();
+                describe(rip as usize, &mut d);
+                let _ = write!(line, " {}", d.as_str());
+            }
+            if entry.is_null() {
+                // a leaf: the return address is at the stack pointer
+                let rsp = *(c.0.as_ptr().add(0x98) as *const u64);
+                let mut ret = 0u64;
+                let mut g = 0usize;
+                if ReadProcessMemory(GetCurrentProcess(), rsp as *const c_void, &mut ret as *mut u64 as *mut c_void, 8, &mut g) == 0 {
+                    break;
+                }
+                *(c.0.as_mut_ptr().add(0xF8) as *mut u64) = ret;
+                *(c.0.as_mut_ptr().add(0x98) as *mut u64) = rsp + 8;
+            } else {
+                let mut hd: *mut c_void = ptr::null_mut();
+                let mut est: u64 = 0;
+                RtlVirtualUnwind(0, image, rip, entry, c.0.as_mut_ptr() as *mut c_void, &mut hd, &mut est, ptr::null_mut());
+            }
+            if depth == 23 {
+                break;
+            }
+        }
+        ResumeThread(h);
+        rlog!("  walk:{}", line.as_str());
     }
 }
 

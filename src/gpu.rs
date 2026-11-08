@@ -870,6 +870,90 @@ fn new_stand_in() -> *mut c_void {
     Box::into_raw(Box::new(StandIn { vtbl: stand_in_vtable(), refs: AtomicU32::new(1) })) as *mut c_void
 }
 
+// ---------------------------------------------------------------------------------------
+// Display event queue (embedded context function +0x6a0, second output)
+// ---------------------------------------------------------------------------------------
+
+/// The object `+0x6a0` returns through its last argument is not a COM object: the title treats vtable slot 2 as
+/// `Wait(1, 0, timeout, out, 0) -> HRESULT` and slot 3 as `bool TryGet(Event*)` (title+`0x27bd584`, a thread that counts
+/// display events). The generic stand-in's slot 2 was `Release`, which the polling loop called until the object was freed
+/// (a use-after-free: random crashes), and its slot 3 never had an event. The event is 40 bytes: a `u32` type at `+0`
+/// (2 = a display line passed, 0x10 = a frame completed), a `u32` flag at `+4`, a timestamp at `+8`, a counter at `+0x10`.
+#[repr(C)]
+struct EventQueue {
+    vtbl: *const usize,
+    refs: AtomicU32,
+}
+
+static EVENT_QUEUE_PENDING: AtomicU32 = AtomicU32::new(0);
+static EVENT_QUEUE_COUNTER: AtomicU64 = AtomicU64::new(0);
+static EVENT_QUEUE_STARTED: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "system" fn event_queue_qi(this: *mut c_void, _iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    unsafe { *out = this };
+    HRESULT(0)
+}
+unsafe extern "system" fn event_queue_add_ref(_this: *mut c_void) -> u32 {
+    2
+}
+/// Slot 2: wait until an event is pending (at most about a second), report success.
+unsafe extern "system" fn event_queue_wait(_this: *mut c_void, _count: usize, _flags: usize, timeout_ms: u32, _out: *mut c_void, _x: usize) -> HRESULT {
+    let limit = if timeout_ms == u32::MAX { 1000 } else { (timeout_ms as u64).min(1000) };
+    let start = std::time::Instant::now();
+    while EVENT_QUEUE_PENDING.load(Ordering::Acquire) == 0 && start.elapsed().as_millis() < limit as u128 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    HRESULT(0)
+}
+/// Slot 3: pop one event into the caller's buffer.
+unsafe extern "system" fn event_queue_try_get(_this: *mut c_void, ev: *mut u8) -> u32 {
+    if ev.is_null() || EVENT_QUEUE_PENDING.load(Ordering::Acquire) == 0 {
+        return 0;
+    }
+    if EVENT_QUEUE_PENDING.fetch_sub(1, Ordering::AcqRel) == 0 {
+        EVENT_QUEUE_PENDING.store(0, Ordering::Release);
+        return 0;
+    }
+    let n = EVENT_QUEUE_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+    unsafe {
+        ptr::write_bytes(ev, 0, 40);
+        *(ev as *mut u32) = 2; // a display line passed
+        *(ev.add(8) as *mut u64) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64);
+        *(ev.add(0x10) as *mut u64) = n;
+    }
+    1
+}
+
+fn event_queue() -> *mut c_void {
+    static OBJ: OnceLock<usize> = OnceLock::new();
+    let obj = *OBJ.get_or_init(|| {
+        static VTBL: OnceLock<Vec<usize>> = OnceLock::new();
+        let vt = VTBL.get_or_init(|| {
+            let mut v = vec![0usize; 64];
+            v[0] = event_queue_qi as usize;
+            v[1] = event_queue_add_ref as usize;
+            v[2] = event_queue_wait as usize;
+            v[3] = event_queue_try_get as usize;
+            for slot in v.iter_mut().skip(4) {
+                *slot = ret_zero as usize;
+            }
+            v
+        });
+        Box::into_raw(Box::new(EventQueue { vtbl: vt.as_ptr(), refs: AtomicU32::new(1) })) as usize
+    });
+    if !EVENT_QUEUE_STARTED.swap(true, Ordering::AcqRel) {
+        // The console reports a display line every frame: one event per frame (`XB1_FPS`, default 60), without piling up.
+        let fps: u64 = std::env::var("XB1_FPS").ok().and_then(|v| v.parse().ok()).filter(|v| *v > 0).unwrap_or(60);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_micros(1_000_000 / fps));
+            if EVENT_QUEUE_PENDING.load(Ordering::Acquire) < 8 {
+                EVENT_QUEUE_PENDING.fetch_add(1, Ordering::AcqRel);
+            }
+        });
+    }
+    obj as *mut c_void
+}
+
 fn hex_dump(p: *const u8, n: usize) -> String {
     let mut s = String::new();
     for i in 0..n {
@@ -1010,7 +1094,9 @@ unsafe extern "system" fn context_ext_212(this: *mut c_void, count: usize, a: *m
         }
     }
     if !b.is_null() && (b as usize) % 8 == 0 {
-        unsafe { *b = new_stand_in() };
+        // The display event queue (see `EventQueue`); `XB1_OLD_STAND_IN=1` brings back the argument-logging stand-in.
+        let si = if std::env::var_os("XB1_OLD_STAND_IN").is_some() { new_stand_in() } else { event_queue() };
+        unsafe { *b = si };
     }
     HRESULT(0)
 }
@@ -1672,9 +1758,10 @@ unsafe extern "system" fn device_ext_67(_this: *mut c_void, desc: *const u32, ou
 /// stand-in COM object is returned and its use is logged.
 unsafe extern "system" fn device_ext_59(_this: *mut c_void, desc: *const u32, out: *mut *mut c_void) -> HRESULT {
     let (kind, size) = unsafe { (*desc, *desc.add(1)) };
-    glog!("[gpu] device slot 59: kind {kind}, size {size:#x} -> stand-in object");
+    let si = new_stand_in();
+    glog!("[gpu] device slot 59: kind {kind}, size {size:#x} -> stand-in object {si:p}");
     if !out.is_null() {
-        unsafe { *out = new_stand_in() };
+        unsafe { *out = si };
     }
     HRESULT(0)
 }
