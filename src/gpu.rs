@@ -1904,28 +1904,35 @@ unsafe extern "system" fn ctx_ps_srv(this: *mut c_void, views: *const *mut c_voi
     let real = unsafe { real_context(this) };
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, *const *mut c_void) =
         unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(8))) };
-    // The argument is an array of 16-byte entries `{view, 0}`, one per bound texture (the Bink video shader reads three planes,
-    // which were never bound: only the first view was). Consecutive non-NULL entries are bound to slots 0, 1, ...
+    // The argument is an array of consecutive 8-byte slots (the slot number is the index; NULL means unbound) that ends at the
+    // first value that is not a view: the Bink video shader reads three planes (`[Y, Cr, Cb, 0, ...]`), which were never bound
+    // (first the count was fixed at 1, then the array was read with a wrong stride, which bound only two planes).
     if std::env::var_os("XB1_PS_SRV_ONE").is_none() {
         let mut list = [ptr::null_mut::<c_void>(); 8];
-        let mut count = 0usize;
-        while count < 8 && readable(unsafe { (views as *const usize).add(count * 2) } as *const c_void, 8) {
-            let p = unsafe { *(views as *const usize).add(count * 2) };
-            if p == 0 || p % 8 != 0 || !readable(p as *const c_void, 8) {
+        let mut count = 0usize; // slots up to and including the last bound view
+        let mut i = 0usize;
+        while i < 8 && readable(unsafe { (views as *const usize).add(i) } as *const c_void, 8) {
+            let p = unsafe { *(views as *const usize).add(i) };
+            if p == 0 {
+                i += 1;
+                continue;
+            }
+            if p % 8 != 0 || !readable(p as *const c_void, 8) {
                 break;
             }
             restore_object_vtable(p as *mut c_void);
-            // Stale entries of the shared array must not be bound: only real shader resource views.
-            if count > 0 && (!has_image_vtable(p as *const c_void) || qi_kind(p as *mut c_void) != "SRV") {
+            // Stale or foreign values after the real entries must not be bound: only real shader resource views.
+            if i > 0 && (!has_image_vtable(p as *const c_void) || qi_kind(p as *mut c_void) != "SRV") {
                 break;
             }
-            list[count] = p as *mut c_void;
-            count += 1;
+            list[i] = p as *mut c_void;
+            i += 1;
+            count = i;
         }
         if count > 1 {
             static MLOG: AtomicU32 = AtomicU32::new(0);
             if MLOG.fetch_add(1, Ordering::Relaxed) < 6 {
-                glog!("[gpu] console 8 binds {count} views: {:?}", &list[..count]);
+                glog!("[gpu] console 8 binds {count} slots: {:?}", &list[..count]);
             }
         }
         unsafe { f(real, 0, count.max(1) as u32, list.as_ptr()) };
@@ -2123,6 +2130,12 @@ unsafe fn readback_texture(real: *mut c_void, res: *mut c_void, d: [u32; 11]) {
             let pitch = m[1] & 0xffff_ffff;
             let mut line = String::new();
             for (x, y) in [(100usize, 100usize), (560, 630), (960, 540), (1400, 700), (1800, 300), (300, 300), (1750, 650)] {
+                if d[4] == 61 && (x as u32) < d[0] && (y as u32) < d[1] {
+                    // R8: one byte per pixel
+                    let b = *((m[0] + y * pitch + x) as *const u8);
+                    line.push_str(&format!(" ({x},{y}) r8={b};"));
+                    continue;
+                }
                 if (x as u32) < d[0] && (y as u32) < d[1] {
                     let v = *((m[0] + y * pitch + x * 4) as *const u32);
                     // R10G10B10A2: r = bits 0..9, g = 10..19, b = 20..29, a = 30..31
@@ -2181,6 +2194,11 @@ unsafe extern "system" fn device_create_extended<const SLOT: usize>(this: *mut c
                 if SLOT == 15 && a1 > 0x10000 && a2 > 16 && a2 < (1 << 22) {
                     // Pixel shader bytecode by object (for `XB1_DUMP_PS`).
                     let bytes = unsafe { std::slice::from_raw_parts(a1 as *const u8, a2) }.to_vec();
+                    if let Ok(dir) = std::env::var("XB1_DUMP_ALL_PS") {
+                        // every pixel shader the title creates, by size and first bytes (for disassembly)
+                        let h = bytes.iter().fold(5381u32, |h, b| h.wrapping_mul(33) ^ *b as u32);
+                        let _ = std::fs::write(format!("{dir}/all_{h:08x}.bin"), &bytes);
+                    }
                     PS_BYTECODE.lock().unwrap().get_or_insert_with(Default::default).insert(unsafe { *out } as usize, bytes);
                 }
             }
