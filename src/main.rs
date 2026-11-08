@@ -124,6 +124,15 @@ unsafe fn patch_fastfail_sites(base: *mut u8, size: usize) -> usize {
 
 /// Parses `--watch-sites=0x1B10F53,0x1B12D1D` (title RVAs) from the command line.
 fn args_watch_sites() -> Option<Vec<usize>> {
+    // Forza Horizon 3 (full game): nothing in the layer sets the game object's "render enabled" request (`[r15+0x4cc]` in the
+    // main tick, title+0x172e4d0); until its trigger is found, the layer writes it at the tick's first pass. `XB1_FH3_BOOT=0`
+    // turns this off. See docs/FINDINGS.md.
+    if env::args().any(|a| a.to_ascii_lowercase().contains("forza_durango_release_final")) && env::var("XB1_FH3_BOOT").as_deref() != Ok("0") && !env::args().any(|a| a.starts_with("--watch-sites=")) {
+        if env::var_os("XB1_POKE").is_none() {
+            unsafe { env::set_var("XB1_POKE", "r15+0x4cc=1") };
+        }
+        return Some(vec![0x172e521]);
+    }
     let arg = env::args().find_map(|a| a.strip_prefix("--watch-sites=").map(str::to_owned))?;
     Some(arg.split(',').filter_map(|s| usize::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).collect())
 }
