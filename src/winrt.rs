@@ -1450,6 +1450,16 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
             }
         }
     }
+    // Experiment XB1_NARROW_SLOTS=8,10: those slots of the controller element get a 32-bit 0 on stack out-parameters instead of an
+    // object pointer (a start-up crash follows these two calls; the out-variable may be narrower than 8 bytes).
+    if on_stack && is_writable(arg1) && o.class.starts_with("Windows.Xbox.Input.Controller.Controllers (element") && !o.class.contains('#') {
+        static SL: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+        let v = SL.get_or_init(|| std::env::var("XB1_NARROW_SLOTS").ok().map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default());
+        if v.contains(&N) {
+            unsafe { *(arg1 as *mut u32) = 0 };
+            return HRESULT(0);
+        }
+    }
     // A pointer that is not 8-aligned cannot be an `Object**`: it is a value getter (`uint*`, `bool*`), so zero is
     // written (a pointer write there panicked on the misalignment).
     if is_writable(arg1) && (arg1 as usize) % 8 != 0 && !in_layer_image(arg1) {

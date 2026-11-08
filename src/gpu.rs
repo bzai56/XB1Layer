@@ -235,12 +235,24 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
                 v.push((index_of(EMBED_TABLE + 49 * 8), ctx_clear_rtv as usize));
                 continue;
             }
+            if console_slot == 46 {
+                v.push((index_of(EMBED_TABLE + 46 * 8), ctx_copy_resource as usize));
+                continue;
+            }
+            if console_slot == 34 {
+                v.push((index_of(EMBED_TABLE + 34 * 8), ctx_set_blend as usize));
+                continue;
+            }
             let thunk = forward_context_thunk(unsafe { thunks.add((64 + console_slot - EMBED_SHIFTED_FROM) * 32) }, console_slot + 1);
             v.push((index_of(EMBED_TABLE + console_slot * 8), thunk));
         }
         for (console_slot, desktop_slot) in EMBED_EXTRA.iter().copied().filter(|_| !log_all) {
             if console_slot == 8 {
                 v.push((index_of(EMBED_TABLE + 8 * 8), ctx_ps_srv as usize));
+                continue;
+            }
+            if console_slot == 47 {
+                v.push((index_of(EMBED_TABLE + 47 * 8), ctx_update_resource as usize));
                 continue;
             }
             if console_slot == 43 {
@@ -270,6 +282,12 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
             }
             let thunk = forward_context_thunk(unsafe { thunks.add((128 + console_slot) * 32) }, desktop_slot);
             v.push((index_of(EMBED_TABLE + console_slot * 8), thunk));
+        }
+        if !log_all && std::env::var_os("XB1_NO_FINISH_CL").is_none() {
+            // Console index 113 (+0x768) = desktop 114 `FinishCommandList(restore, ID3D11CommandList** out)`.
+            v.push((index_of(EMBED_TABLE + 113 * 8), ctx_finish_command_list as usize));
+            // Console index 57 (+0x5a8) = desktop 58 `ExecuteCommandList(commandList, restore)`.
+            v.push((index_of(EMBED_TABLE + 57 * 8), ctx_execute_command_list as usize));
         }
         // Draws and dispatches first mirror the placement buffers (see sync_before_draw).
         let synced = unsafe { VirtualAlloc(ptr::null_mut(), 4096, 0x3000, 0x40) } as *mut u8;
@@ -1675,11 +1693,29 @@ fn draw_trace(kind: &str, count: u32, start: u32, ctx: *mut c_void) {
     }
 }
 
+/// Counts the draw and, for `XB1_DRAW_PROBE=<present number>` / `XB1_DRAW_PROBE_FROM=<draw>`, probes the render target.
+fn frame_probe(this: *mut c_void) {
+    {
+        // XB1_DRAW_PROBE=<present number>: from that present on, probe the first 90 draws.
+        static PROBE: OnceLock<u32> = OnceLock::new();
+        static PROBED: AtomicU32 = AtomicU32::new(0);
+        let at = *PROBE.get_or_init(|| std::env::var("XB1_DRAW_PROBE").ok().and_then(|v| v.parse().ok()).unwrap_or(u32::MAX));
+        let dif = DRAWS_IN_FRAME.fetch_add(1, Ordering::Relaxed);
+        let from: u32 = std::env::var("XB1_DRAW_PROBE_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        if FRAMES.load(Ordering::Relaxed) == at && dif >= from && PROBED.load(Ordering::Relaxed) < 70 {
+            let k = PROBED.fetch_add(1, Ordering::Relaxed);
+            unsafe { probe_render_target(real_context(this), dif) };
+            let _ = k;
+        }
+    }
+}
+
 unsafe extern "system" fn ctx_draw_indexed(this: *mut c_void, packed: u64) {
     // The console packs both numbers into one register: index count in the high half, first index
     // in the low half (`0x600000000` = 6 indices from 0, `0x60000001e` = 6 indices from 30).
     let (count, start) = ((packed >> 32) as u32, packed as u32);
     draw_trace("indexed", count, start, this);
+    frame_probe(this);
     LAST_DRAW[0].store(1, Ordering::Relaxed);
     LAST_DRAW[1].store(count, Ordering::Relaxed);
     LAST_DRAW[2].store(start, Ordering::Relaxed);
@@ -1700,6 +1736,109 @@ unsafe extern "system" fn ctx_draw_indexed(this: *mut c_void, packed: u64) {
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, i32) =
         unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(12))) };
     unsafe { f(real, count, start, 0) };
+}
+
+/// Histogram of the render target 0 write mask of the blend states the title binds (index = mask).
+static BLEND_BINDS: [AtomicU32; 16] = [const { AtomicU32::new(0) }; 16];
+
+/// Console index 34 = desktop 35 `OMSetBlendState(state, factor, mask)`: counts the write mask of each bound state, then forwards.
+unsafe extern "system" fn ctx_set_blend(this: *mut c_void, state: *mut c_void, factor: *const f32, mask: u32) {
+    let real = unsafe { real_context(this) };
+    if !state.is_null() && readable(state as *const c_void, 8) {
+        let mut d = [0u32; 80];
+        unsafe {
+            restore_object_vtable(state);
+            let vt = *(state as *const *const usize);
+            let gd: unsafe extern "system" fn(*mut c_void, *mut u32) = std::mem::transmute(*vt.add(7));
+            gd(state, d.as_mut_ptr());
+        }
+        BLEND_BINDS[(d[9] & 0xf) as usize].fetch_add(1, Ordering::Relaxed);
+    }
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const f32, u32) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(35))) };
+    unsafe { f(real, state, factor, mask) };
+}
+
+/// Console index 57 = desktop 58 `ExecuteCommandList(commandList, restoreContextState)`: seen with exactly the pointers
+/// `FinishCommandList` returned as its first argument.
+unsafe extern "system" fn ctx_execute_command_list(this: *mut c_void, cl: *mut c_void, restore: usize) {
+    static N: AtomicU32 = AtomicU32::new(0);
+    let real = unsafe { real_context(this) };
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 6 || n % 2000 == 0 {
+        glog!("[gpu] ExecuteCommandList #{n} on {real:p}: command list {cl:p}, restore {restore:#x}");
+    }
+    if cl.is_null() {
+        return;
+    }
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, i32) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(58))) };
+    unsafe { f(real, cl, (restore & 1) as i32) };
+}
+
+/// Console index 113 = desktop 114 `FinishCommandList(restore, ppCommandList)`: the title records most of its drawing on deferred
+/// contexts (DrawBundleRecordContext threads); the call was an unmapped stub, so no command list ever existed.
+unsafe extern "system" fn ctx_finish_command_list(this: *mut c_void, restore: usize, out: *mut *mut c_void, _a4: usize) -> HRESULT {
+    static N: AtomicU32 = AtomicU32::new(0);
+    let real = unsafe { real_context(this) };
+    let f: unsafe extern "system" fn(*mut c_void, i32, *mut *mut c_void) -> HRESULT = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(114))) };
+    let hr = unsafe { f(real, (restore & 1) as i32, out) };
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 6 || n % 2000 == 0 {
+        let cl = if out.is_null() { ptr::null_mut() } else { unsafe { *out } };
+        glog!("[gpu] FinishCommandList #{n} on {real:p}: restore {restore:#x} -> {:#x} command list {cl:p}", hr.0 as u32);
+    }
+    hr
+}
+
+static UPD_COUNT: AtomicU32 = AtomicU32::new(0);
+static COPY_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Console index 47 = desktop 48 `UpdateSubresource(dst, subresource, box, data, row pitch, depth pitch)`: counted, the
+/// calls on the final-pass texture (`T0_RES`) logged, then forwarded.
+unsafe extern "system" fn ctx_update_resource(this: *mut c_void, dst: *mut c_void, sub: u32, bx: *const c_void, data: *const c_void, row: u32, depth: u32) {
+    let real = unsafe { real_context(this) };
+    let n = UPD_COUNT.fetch_add(1, Ordering::Relaxed);
+    {
+        static ULOG: AtomicU32 = AtomicU32::new(0);
+        if ULOG.fetch_add(1, Ordering::Relaxed) < 40 {
+            let mut d = [0u32; 11];
+            if readable(dst as *const c_void, 8) {
+                unsafe {
+                    let vt = *(dst as *const *const usize);
+                    let gd: unsafe extern "system" fn(*mut c_void, *mut u32) = std::mem::transmute(*vt.add(10));
+                    gd(dst, d.as_mut_ptr());
+                }
+            }
+            glog!("[gpu] UpdateSubresource #{n}: dst {dst:p} {}x{} mips {} fmt {} bind {:#x}, sub {sub}, box {bx:p}, pitch {row}/{depth}", d[0], d[1], d[2], d[4], d[8]);
+        }
+    }
+    if dst as usize == T0_RES.load(Ordering::Relaxed) && n % 50 == 0 {
+        glog!("[gpu] UpdateSubresource on the final-pass texture: sub {sub} box {bx:p} data {data:p} pitch {row}/{depth}");
+    }
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *const c_void, *const c_void, u32, u32) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(48))) };
+    unsafe { f(real, dst, sub, bx, data, row, depth) };
+}
+
+/// Console index 46 = desktop 47 `CopyResource(dst, src)`: the copies into the final-pass texture are logged, then forwarded.
+unsafe extern "system" fn ctx_copy_resource(this: *mut c_void, dst: *mut c_void, src: *mut c_void) {
+    let real = unsafe { real_context(this) };
+    let n = COPY_COUNT.fetch_add(1, Ordering::Relaxed);
+    if (dst as usize == T0_RES.load(Ordering::Relaxed) || n < 6) && n < 400 {
+        let desc = |o: *mut c_void| -> [u32; 11] {
+            let mut d = [0u32; 11];
+            if readable(o as *const c_void, 8) {
+                unsafe {
+                    let vt = *(o as *const *const usize);
+                    let gd: unsafe extern "system" fn(*mut c_void, *mut u32) = std::mem::transmute(*vt.add(10));
+                    gd(o, d.as_mut_ptr());
+                }
+            }
+            d
+        };
+        let (a, b) = (desc(dst), desc(src));
+        glog!("[gpu] CopyResource #{n}: dst {dst:p} {}x{} fmt {} <- src {src:p} {}x{} fmt {} (dst is the final-pass texture: {})", a[0], a[1], a[4], b[0], b[1], b[4], dst as usize == T0_RES.load(Ordering::Relaxed));
+    }
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(47))) };
+    unsafe { f(real, dst, src) };
 }
 
 /// Console index 49 = desktop 50 `ClearRenderTargetView(rtv, color[4])`: logged (the first calls), then forwarded.
@@ -1838,6 +1977,78 @@ fn dump_bound_ps(n: u32, real: *mut c_void) {
     }
 }
 
+/// `XB1_DRAW_PROBE=<frame>`: before each draw of that frame (the first 90), logs the current render target 0 (resource, size,
+/// format) and one pixel of it (960, 540), to find which draw writes the green-only values.
+unsafe fn probe_render_target(real: *mut c_void, draw: u32) {
+    unsafe {
+        // The pixel shader's resources t0..t3: texture, size, format (PSGetShaderResources is desktop slot 73).
+        let vt0 = *(real as *const *const usize);
+        let get_srv: unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) = std::mem::transmute(*vt0.add(73));
+        for slot in 0..4u32 {
+            let mut srv: *mut c_void = ptr::null_mut();
+            get_srv(real, slot, 1, &mut srv);
+            if srv.is_null() {
+                continue;
+            }
+            let svt = *(srv as *const *const usize);
+            let get_res: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = std::mem::transmute(*svt.add(7));
+            let mut res: *mut c_void = ptr::null_mut();
+            get_res(srv, &mut res);
+            if !res.is_null() {
+                let tvt = *(res as *const *const usize);
+                let gd: unsafe extern "system" fn(*mut c_void, *mut u32) = std::mem::transmute(*tvt.add(10));
+                let mut d = [0u32; 11];
+                gd(res, d.as_mut_ptr());
+                glog!("[gpu] probe draw {draw}: t{slot} {res:p} {}x{} fmt {} bind {:#x}", d[0], d[1], d[4], d[8]);
+                if d[0] > 16 && d[1] > 16 && d[0] <= 4096 {
+                    readback_texture(real, res, d);
+                }
+                let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*tvt.add(2));
+                rel(res);
+            }
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*svt.add(2));
+            rel(srv);
+        }
+        let vt = *(real as *const *const usize);
+        // OMGetRenderTargets(n, RTV**, DSV**) is desktop slot 89.
+        let get: unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void, *mut *mut c_void) = std::mem::transmute(*vt.add(89));
+        let mut rtv: *mut c_void = ptr::null_mut();
+        let mut dsv: *mut c_void = ptr::null_mut();
+        get(real, 1, &mut rtv, &mut dsv);
+        if rtv.is_null() {
+            glog!("[gpu] probe draw {draw}: no render target");
+            return;
+        }
+        let rvt = *(rtv as *const *const usize);
+        let get_res: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = std::mem::transmute(*rvt.add(7));
+        let mut res: *mut c_void = ptr::null_mut();
+        get_res(rtv, &mut res);
+        if !res.is_null() {
+            let tvt = *(res as *const *const usize);
+            let gd: unsafe extern "system" fn(*mut c_void, *mut u32) = std::mem::transmute(*tvt.add(10));
+            let mut d = [0u32; 11];
+            gd(res, d.as_mut_ptr());
+            if d[0] == 1920 && d[1] == 1080 {
+                // a one-pixel look through the existing readback helper's staging copy (whole texture; only draws of one frame)
+                glog!("[gpu] probe draw {draw}: rt0 {res:p} {}x{} fmt {} t0={}", d[0], d[1], d[4], res as usize == T0_RES.load(Ordering::Relaxed));
+                readback_texture(real, res, d);
+            } else {
+                glog!("[gpu] probe draw {draw}: rt0 {res:p} {}x{} fmt {}", d[0], d[1], d[4]);
+            }
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*tvt.add(2));
+            rel(res);
+        }
+        let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*rvt.add(2));
+        rel(rtv);
+        if !dsv.is_null() {
+            let dvt = *(dsv as *const *const usize);
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*dvt.add(2));
+            rel(dsv);
+        }
+    }
+}
+
+static DRAWS_IN_FRAME: AtomicU32 = AtomicU32::new(0);
 static T0_RES: AtomicUsize = AtomicUsize::new(0);
 static T0_REAL: AtomicUsize = AtomicUsize::new(0);
 static T0_DESC: AtomicU64 = AtomicU64::new(0);
@@ -1919,13 +2130,17 @@ unsafe extern "system" fn device_create_extended<const SLOT: usize>(this: *mut c
                     // The blend state as the desktop sees it (GetDesc is slot 7: AlphaToCoverage, Independent, then 8 x
                     // {enable, src, dest, op, src alpha, dest alpha, op alpha, write mask}).
                     static BLOGS: AtomicU32 = AtomicU32::new(0);
-                    if BLOGS.fetch_add(1, Ordering::Relaxed) < 10 {
+                    let nb = BLOGS.fetch_add(1, Ordering::Relaxed);
+                    if nb < 400 {
                         let obj = unsafe { *out };
                         let mut d = [0u32; 80];
                         let vt = unsafe { *(obj as *const *const usize) };
                         let gd: unsafe extern "system" fn(*mut c_void, *mut u32) = unsafe { std::mem::transmute(*vt.add(7)) };
                         unsafe { gd(obj, d.as_mut_ptr()) };
-                        glog!("[gpu] blend state: desktop desc rt0 {:x?}; raw title desc {}", &d[2..10], safe_dump(a1 as u64, 48));
+                        let masks: Vec<u32> = (0..8).map(|k| d[9 + 8 * k] & 0xf).collect();
+                        if nb < 4 || masks.iter().any(|m| *m != 0xf) {
+                            glog!("[gpu] blend state #{nb}: write masks {:x?} (independent {}), rt0 {:x?}", masks, d[1], &d[2..10]);
+                        }
                     }
                 }
                 if SLOT == 15 && a1 > 0x10000 && a2 > 16 && a2 < (1 << 22) {
@@ -2638,6 +2853,12 @@ pub unsafe extern "system" fn present_array(a1: u64, a2: u64, a3: u64, a4: u64, 
     let n = COUNT.fetch_add(1, Ordering::Relaxed);
     PRESENT_ARRAY_CALLS.fetch_add(1, Ordering::Relaxed);
     FRAMES.fetch_add(1, Ordering::Relaxed);
+    {
+        let d = DRAWS_IN_FRAME.swap(0, Ordering::Relaxed);
+        if n % 300 == 0 {
+            glog!("[gpu] draws in the last frame: {d}");
+        }
+    }
     if std::env::var_os("XB1_DUMP_PS").is_some() && (n == 150 || n == 900 || n == 1500) && T0_RES.load(Ordering::Relaxed) != 0 {
         let (res, real) = (T0_RES.load(Ordering::Relaxed), T0_REAL.load(Ordering::Relaxed));
         let packed = T0_DESC.load(Ordering::Relaxed);
@@ -2697,7 +2918,7 @@ pub unsafe extern "system" fn present_array(a1: u64, a2: u64, a3: u64, a4: u64, 
             let mut t = T.lock().unwrap();
             let rate = t.map(|t0| 300.0 / t0.elapsed().as_secs_f64()).unwrap_or(0.0);
             *t = Some(std::time::Instant::now());
-            glog!("[gpu] DXGIXPresentArray: {n} calls so far ({rate:.1} presents per second over the last 300)");
+            glog!("[gpu] DXGIXPresentArray: {n} calls so far ({rate:.1} presents per second over the last 300); blend binds by rt0 write mask {:?}; UpdateSubresource calls {}, CopyResource calls {}", BLEND_BINDS.iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<_>>(), UPD_COUNT.load(Ordering::Relaxed), COPY_COUNT.load(Ordering::Relaxed));
         }
     }
     0
@@ -3573,6 +3794,7 @@ unsafe extern "system" fn ctx_draw_old(this: *mut c_void, count: u32, start: u32
         glog!("[gpu] Draw({count}, {start})");
     }
     draw_trace("plain", count, start, this);
+    frame_probe(this);
     {
         static DUMPS: AtomicU32 = AtomicU32::new(0);
         let d = DUMPS.fetch_add(1, Ordering::Relaxed);
