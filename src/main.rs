@@ -272,6 +272,14 @@ fn walk_thread(tid: u32) {
             rlog!("  GetThreadContext failed");
             return;
         }
+        walk_context(&mut c);
+        ResumeThread(h);
+    }
+}
+
+/// Unwinds a thread context record (`c`) with the unwind tables and logs the frames.
+unsafe fn walk_context(c: &mut Context) {
+    {
         let (base, size) = (IMG_BASE.load(Ordering::Relaxed), IMG_SIZE.load(Ordering::Relaxed));
         let mut line = RawBuf::new();
         use std::fmt::Write;
@@ -308,7 +316,6 @@ fn walk_thread(tid: u32) {
                 break;
             }
         }
-        ResumeThread(h);
         rlog!("  walk:{}", line.as_str());
     }
 }
@@ -811,6 +818,13 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
             let target = *(rec.add(40) as *const usize);
             let kind = match kind { 0 => "read", 1 => "write", _ => "execute" };
             rlog!("  access violation: {kind} of {target:#x}");
+            {
+                // Unwind the faulting thread from the exception context (a copy; the original is left alone).
+                let mut copy = Context([0; 1232]);
+                ptr::copy_nonoverlapping(ctx as *const u8, copy.0.as_mut_ptr(), 1232);
+                rlog!("  fault rip {:#x}", reg(0xF8));
+                walk_context(&mut copy);
+            }
             if kind == "execute" || std::env::var_os("XB1_DUMP_STACK").is_some() {
                 let rsp = reg(0x98) as usize;
                 let mut words = [0usize; 24];
@@ -1051,10 +1065,30 @@ fn event_trace() -> bool {
     *ON.get_or_init(|| std::env::var_os("XB1_EVENT_TRACE").is_some())
 }
 
-fn caller_rva() -> usize {
+/// Title return addresses (RVAs) found by the stack unwinder above the caller (up to 8 frames, the stack walk skips frames
+/// without unwind data, so deeper frames can be missing).
+pub(crate) fn title_frames() -> [usize; 8] {
     unsafe extern "system" { fn RtlCaptureStackBackTrace(skip: u32, count: u32, frames: *mut *mut c_void, hash: *mut u32) -> u16; }
-    let mut f = [ptr::null_mut::<c_void>(); 3];
-    unsafe { RtlCaptureStackBackTrace(1, 3, f.as_mut_ptr(), ptr::null_mut()) };
+    let mut f = [ptr::null_mut::<c_void>(); 32];
+    let n = unsafe { RtlCaptureStackBackTrace(1, 32, f.as_mut_ptr(), ptr::null_mut()) } as usize;
+    let base = IMG_BASE.load(Ordering::Relaxed);
+    let size = IMG_SIZE.load(Ordering::Relaxed);
+    let mut out = [0usize; 8];
+    let mut k = 0;
+    for p in f.iter().take(n) {
+        let a = *p as usize;
+        if a >= base && a < base + size && k < 8 {
+            out[k] = a - base;
+            k += 1;
+        }
+    }
+    out
+}
+
+pub(crate) fn caller_rva() -> usize {
+    unsafe extern "system" { fn RtlCaptureStackBackTrace(skip: u32, count: u32, frames: *mut *mut c_void, hash: *mut u32) -> u16; }
+    let mut f = [ptr::null_mut::<c_void>(); 8];
+    unsafe { RtlCaptureStackBackTrace(1, 8, f.as_mut_ptr(), ptr::null_mut()) };
     let base = IMG_BASE.load(Ordering::Relaxed);
     f.iter().map(|p| *p as usize).find(|a| *a >= base && *a < base + IMG_SIZE.load(Ordering::Relaxed)).map_or(0, |a| a - base)
 }
@@ -1129,7 +1163,7 @@ extern "system" fn xb_wait_single_ex(h: *mut c_void, ms: u32, alertable: i32) ->
 }
 
 /// The first few title return addresses on the stack, as text.
-fn caller_chain() -> String {
+pub(crate) fn caller_chain() -> String {
     // Raw stack scan (the title's tiny wait wrapper has no unwind data, so the unwinder stops at it).
     let marker = 0usize;
     let top = &marker as *const usize as usize;
@@ -2318,6 +2352,9 @@ fn override_for(dll: &str, func: &str) -> Option<usize> {
     }
     if dll.eq_ignore_ascii_case("d3d11_x.dll") && func == "DXGIXPresentArray" {
         return Some(gpu::present_array as usize);
+    }
+    if dll.eq_ignore_ascii_case("d3d11_x.dll") && func == "DXGIXGetFrameStatistics" {
+        return Some(gpu::get_frame_statistics as usize);
     }
     if dll.eq_ignore_ascii_case("d3d11_x.dll") && func == "DXGIXSetVLineNotification" {
         return Some(gpu::set_vline_notification as usize);

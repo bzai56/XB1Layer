@@ -167,6 +167,9 @@ unsafe fn patch_present1(swap_chain: *mut c_void) {
     }
 }
 
+/// The real swap chain created through `CreateSwapChainForCoreWindow` (0 until then), for the display-plane present path.
+pub static SWAP_CHAIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// `IDXGIFactory2::CreateSwapChainForCoreWindow(device, window, desc, restrict, out)`, redirected.
 unsafe extern "system" fn create_for_core_window(this: *mut c_void, device: *mut c_void, _window: *mut c_void, desc: *const u32, restrict: *mut c_void, out: *mut *mut c_void) -> i32 {
     // DXGI_SWAP_CHAIN_DESC1: width, height, format, stereo, sample {count, quality}, usage, buffers, scaling, swap effect, alpha, flags.
@@ -207,6 +210,7 @@ unsafe extern "system" fn create_for_core_window(this: *mut c_void, device: *mut
         let vt = if sc.is_null() { 0 } else { unsafe { *(sc as *const usize) } };
         eprintln!("[display] swap chain object {sc:p}, vtable {vt:#x}");
         unsafe { patch_present1(sc) };
+        SWAP_CHAIN.store(sc as usize, std::sync::atomic::Ordering::Release);
         if crate::VCCORLIB110.load(std::sync::atomic::Ordering::Relaxed) {
             unsafe { *out = crate::gpu::wrap_dxgi(sc, 2) };
         }

@@ -1068,6 +1068,19 @@ fn create_back_buffer(context_proxy: *mut c_void) -> usize {
     0
 }
 
+/// Chains handed out so far (`context_ext_212`), one per plane.
+static DISPLAY_CHAINS: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+
+/// The back buffers of the display chains created so far.
+fn display_chain_buffers() -> Vec<usize> {
+    DISPLAY_CHAINS
+        .iter()
+        .map(|c| c.load(Ordering::Acquire))
+        .filter(|c| *c != 0)
+        .map(|c| unsafe { (*(c as *const DisplayChain)).back_buffer })
+        .collect()
+}
+
 /// Embedded context function `+0x6a0` (`call [ctx+0x6a0]` at title+0x1e3a06c):
 /// `(context, 1, Object** chain, Object** other)`. `chain` is the display chain; `other` is a
 /// stand-in (unknown).
@@ -1078,7 +1091,7 @@ unsafe extern "system" fn context_ext_212(this: *mut c_void, count: usize, a: *m
     if !a.is_null() && (a as usize) % 8 == 0 {
         // The title asks every frame (thousands of calls in a minute); each call used to create new 1920x1080 textures,
         // which exhausted video memory. One chain per plane is created once and handed out again.
-        static CHAINS: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+        let CHAINS = &DISPLAY_CHAINS;
         for i in 0..count.clamp(1, 4) {
             let mut chain = CHAINS[i].load(Ordering::Acquire);
             if chain == 0 {
@@ -2218,7 +2231,7 @@ unsafe fn create_view(this: *mut c_void, slot: usize, name: &str, resource: *mut
         // The debug layer crashes on this; the runtime would return E_INVALIDARG.
         let n = FALLBACKS.fetch_add(1, Ordering::Relaxed);
         if n < 8 {
-            glog!("[gpu] {name}: NULL resource (display back buffer?) -> E_INVALIDARG");
+            glog!("[gpu] {name}: NULL resource (display back buffer?) -> E_INVALIDARG <- {}", crate::caller_chain());
         }
         return HRESULT(0x80070057u32 as i32);
     }
@@ -2423,13 +2436,96 @@ fn safe_dump(p: u64, n: usize) -> String {
 pub unsafe extern "system" fn present_array(a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> i32 {
     static COUNT: AtomicU32 = AtomicU32::new(0);
     let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    PRESENT_ARRAY_CALLS.fetch_add(1, Ordering::Relaxed);
     if n < 6 {
         glog!("[gpu] DXGIXPresentArray #{n}: a1={a1:#x} a2={a2:#x} a3={a3:#x} a4={a4:#x} a5={} a6={}", safe_dump(a5, 48), safe_dump(a6, 64));
         if a4 > 0 && a4 <= 4 && a5 > 0x10000 {
             for i in 0..a4 as usize {
                 let plane = unsafe { *((a5 as *const u64).add(i)) };
                 glog!("[gpu]   plane {i}: {}", safe_dump(plane, 64));
+                glog!("[gpu]   plane {i} is the title's swap chain: {}", plane as usize == crate::display::SWAP_CHAIN.load(Ordering::Acquire));
             }
+        }
+    }
+    // The "planes" the newer SDK passes are the title's swap chains (the pointer is the real swap chain the layer created in
+    // `CreateSwapChainForCoreWindow`; its vtable is dxgi.dll's): presenting them shows the frame in the layer's window.
+    // `XB1_NO_PRESENT=1` keeps the old behaviour (log only).
+    if a4 > 0 && a4 <= 4 && a5 > 0x10000 && std::env::var_os("XB1_NO_PRESENT").is_none() {
+        let own = crate::display::SWAP_CHAIN.load(Ordering::Acquire);
+        for i in 0..a4 as usize {
+            let plane = unsafe { *((a5 as *const usize).add(i)) };
+            if plane != 0 && plane == own {
+                // IDXGISwapChain::Present is slot 8; one vertical sync (the title's 2 means "every second refresh").
+                let vt = unsafe { *(plane as *const *const usize) };
+                let present: unsafe extern "system" fn(*mut c_void, u32, u32) -> i32 = unsafe { std::mem::transmute(*vt.add(8)) };
+                let hr = unsafe { present(plane as *mut c_void, 1, 0) };
+                if n < 3 || hr < 0 && n < 50 {
+                    glog!("[gpu] DXGIXPresentArray #{n}: Present on the swap chain -> {:#x}", hr as u32);
+                }
+                crate::display::limit_frame_rate();
+            }
+        }
+        if n > 0 && n % 300 == 0 {
+            glog!("[gpu] DXGIXPresentArray: {n} calls so far");
+        }
+    }
+    0
+}
+
+/// Number of `DXGIXPresentArray` calls so far (also what `DXGIXGetFrameStatistics` reports as the present count).
+static PRESENT_ARRAY_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// `DXGIXGetFrameStatistics(count, DXGIX_FRAME_STATISTICS* out)`: the title (Forza Horizon 3's dynamic resolution) asks for
+/// the last three frames and walks them. The 0x78-byte layout is only partly known from how the title reads it: qwords at
+/// +0x20 / +0x38 are two times of one frame (their difference is divided by a frequency), +0x28 / +0x30 / +0x40 other times
+/// or counts, +0x50 is non-zero for a frame that was presented (the title looks for the first non-zero one; with none it
+/// reads past the array) and +0x68 is a pointer to a structure with the frame's size (two dwords at +8 and +0xc).
+/// The values are plausible ones: frames spaced by one refresh period, the present count, 1920x1080.
+pub unsafe extern "system" fn get_frame_statistics(count: u32, out: *mut u8) -> i32 {
+    unsafe extern "system" {
+        fn QueryPerformanceCounter(v: *mut i64) -> i32;
+        fn QueryPerformanceFrequency(v: *mut i64) -> i32;
+    }
+    static SIZE_BLOCK: OnceLock<usize> = OnceLock::new();
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    let n = CALLS.fetch_add(1, Ordering::Relaxed);
+    if n < 3 {
+        glog!("[gpu] DXGIXGetFrameStatistics({count}, {out:p})");
+    }
+    if out.is_null() || count == 0 || count > 16 {
+        return 0;
+    }
+    let block = *SIZE_BLOCK.get_or_init(|| {
+        let b: &'static mut [u32; 8] = Box::leak(Box::new([0, 0, 1920, 1080, 0, 0, 0, 0]));
+        b.as_ptr() as usize
+    });
+    let (mut now, mut freq) = (0i64, 0i64);
+    unsafe {
+        QueryPerformanceCounter(&mut now);
+        QueryPerformanceFrequency(&mut freq);
+    }
+    let fps: i64 = std::env::var("XB1_FPS").ok().and_then(|v| v.parse().ok()).filter(|v| *v > 0).unwrap_or(60);
+    let period = freq / fps;
+    let presented = PRESENT_ARRAY_CALLS.load(Ordering::Relaxed).max(count as u64);
+    for k in 0..count as usize {
+        let age = (count as usize - 1 - k) as i64;
+        let t = (now - age * period).max(1) as u64;
+        let e = unsafe { out.add(k * 0x78) };
+        unsafe {
+            std::ptr::write_bytes(e, 0, 0x78);
+            let q = |off: usize, v: u64| std::ptr::write_unaligned(e.add(off) as *mut u64, v);
+            q(0x00, t);
+            q(0x08, t + period as u64 / 8);
+            q(0x10, 1);
+            q(0x20, t);
+            q(0x28, t + period as u64 / 4);
+            q(0x30, t + period as u64 / 2);
+            q(0x38, t + period as u64);
+            q(0x40, t + period as u64 / 2);
+            q(0x48, 1);
+            q(0x50, presented - age as u64);
+            q(0x58, presented - age as u64);
+            q(0x68, block as u64);
         }
     }
     0
@@ -2724,6 +2820,12 @@ pub extern "system" fn create_device_x(params: *const u8, out_device: *mut *mut 
     match result {
         Ok(()) => {
             glog!("[gpu] created a desktop D3D11 device (feature level {:#x}); returning proxies", got.0);
+            // Titles of the newer SDK (Forza Horizon 3) create a swap chain with CreateSwapChainForCoreWindow through
+            // the device's DXGI factory: the real DXGI rejects the shell's CoreWindow, so redirect it to a native window.
+            // (Before this the title got a NULL swap chain and a NULL back buffer.)
+            if std::env::var_os("XB1_NO_DISPLAY_REDIRECT").is_none() {
+                crate::display::install();
+            }
             // A console title uses its immediate context from several threads (Forza Horizon 3 crashed inside d3d11.dll
             // in different places from run to run); the desktop immediate context is not thread safe unless asked.
             if let Some(d) = &device {
