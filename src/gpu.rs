@@ -1941,6 +1941,59 @@ unsafe extern "system" fn ctx_ps_srv(this: *mut c_void, views: *const *mut c_voi
                 glog!("[gpu] console 8 binds {count} slots: {:?}", &list[..count]);
             }
         }
+        if ATLAS_RES.load(Ordering::Relaxed) == 0 && std::env::var_os("XB1_DUMP_IMG").is_some() {
+            // Find the 1024x1024 RGBA8 texture the UI draws sample (for the dump).
+            for k in 0..count {
+                let v = list[k];
+                if v.is_null() || !has_image_vtable(v as *const c_void) {
+                    continue;
+                }
+                unsafe {
+                    let svt = *(v as *const *const usize);
+                    let get_res: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = std::mem::transmute(*svt.add(7));
+                    let mut res: *mut c_void = ptr::null_mut();
+                    get_res(v, &mut res);
+                    if !res.is_null() {
+                        let tvt = *(res as *const *const usize);
+                        let gd: unsafe extern "system" fn(*mut c_void, *mut u32) = std::mem::transmute(*tvt.add(10));
+                        let mut d = [0u32; 11];
+                        gd(res, d.as_mut_ptr());
+                        if d[0] == 1024 && d[1] == 1024 && d[4] == 28 {
+                            ATLAS_RES.store(res as usize, Ordering::Relaxed);
+                        }
+                        let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*tvt.add(2));
+                        rel(res);
+                    }
+                }
+            }
+        }
+        // Placed textures: upload what the title wrote into their memory (once, and again when it changes).
+        for k in 0..count {
+            let v = list[k];
+            if v.is_null() || !has_image_vtable(v as *const c_void) {
+                continue;
+            }
+            static VIEW_RES: std::sync::Mutex<Option<std::collections::HashMap<usize, usize>>> = std::sync::Mutex::new(None);
+            let cached = VIEW_RES.lock().unwrap().as_ref().and_then(|m| m.get(&(v as usize)).copied());
+            let res = match cached {
+                Some(r) => r,
+                None => unsafe {
+                    let svt = *(v as *const *const usize);
+                    let get_res: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = std::mem::transmute(*svt.add(7));
+                    let mut r: *mut c_void = ptr::null_mut();
+                    get_res(v, &mut r);
+                    if !r.is_null() {
+                        let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*((*(r as *const *const usize)).add(2)));
+                        rel(r);
+                    }
+                    VIEW_RES.lock().unwrap().get_or_insert_with(Default::default).insert(v as usize, r as usize);
+                    r as usize
+                },
+            };
+            if res != 0 {
+                mirror_placed_texture(res);
+            }
+        }
         unsafe { f(real, 0, count.max(1) as u32, list.as_ptr()) };
         return;
     }
@@ -2329,6 +2382,11 @@ unsafe fn create_placement_texture(
     let hr = unsafe { real_create_texture(p.real, desktop_create_slot, desktop.as_ptr() as *const u8, &mut texture) };
     if hr.0 >= 0 && !texture.is_null() {
         glog!("[gpu] device slot {which}: created a desktop texture {texture:p}");
+        {
+            let pt = PlacedTexture { resource: texture as usize, memory: memory as usize, desc: desktop, tile_mode, pitch };
+            PLACED_TEX_MAP.lock().unwrap().get_or_insert_with(Default::default).insert(texture as usize, (pt.clone(), 0u64, 0u32));
+            PLACED_TEXTURES.lock().unwrap().push(pt);
+        }
         extend_resource(texture, desktop_create_slot == 5);
         if !out.is_null() {
             unsafe { *out = texture };
@@ -2360,6 +2418,166 @@ unsafe extern "system" fn device_ext_65(this: *mut c_void, desc: *const u8, tile
 // directly because the console GPU reads it there. The desktop resource is separate, so before
 // every draw or dispatch the contents of each placed buffer are compared with the last copy
 // uploaded and, if they changed, uploaded again.
+
+/// Placed textures (slots 64 and 65): the texture, its placement memory and the creation parameters. The title writes the
+/// texel data (console tiled layout) into the memory; nothing uploads it yet.
+#[derive(Clone)]
+struct PlacedTexture {
+    resource: usize,
+    memory: usize,
+    desc: [u32; 11],
+    tile_mode: u32,
+    pitch: u32,
+}
+static PLACED_TEXTURES: std::sync::Mutex<Vec<PlacedTexture>> = std::sync::Mutex::new(Vec::new());
+/// Placed textures by resource, with the hash of the memory last uploaded and the present number of the last check.
+static PLACED_TEX_MAP: std::sync::Mutex<Option<std::collections::HashMap<usize, (PlacedTexture, u64, u32)>>> = std::sync::Mutex::new(None);
+
+/// Element layout of a texture format: (block width, block height, bytes per element), or None if not handled.
+fn element_layout(fmt: u32) -> Option<(usize, usize, usize)> {
+    Some(match fmt {
+        28 | 29 | 87 | 91 => (1, 1, 4),
+        61 => (1, 1, 1),
+        71 | 72 | 80 | 81 => (4, 4, 8),
+        74 | 75 | 77 | 78 | 83 | 84 | 95 | 96 | 98 | 99 => (4, 4, 16),
+        _ => return None,
+    })
+}
+
+/// Uploads the texel data the title wrote into a placed texture's memory (tile mode 0xd: 1D-tiled thin, found by analysis of
+/// dumps: 8x8-element micro tiles in Morton order, tiles row-major, the base level's pitch aligned to 64 elements, the levels
+/// stored one after another with each padded to whole tiles). The memory is re-checked every 120 presents, so textures that are
+/// filled or streamed in later show up. `XB1_NO_TEX_MIRROR=1` turns this off.
+fn mirror_placed_texture(resource: usize) {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    if *OFF.get_or_init(|| env_flag("XB1_NO_TEX_MIRROR")) {
+        return;
+    }
+    let frame = FRAMES.load(Ordering::Relaxed);
+    let (pt, last_hash) = {
+        let mut guard = PLACED_TEX_MAP.lock().unwrap();
+        let Some(map) = guard.as_mut() else { return };
+        let Some(e) = map.get_mut(&resource) else { return };
+        if e.2 != 0 && frame.wrapping_sub(e.2) < 120 {
+            return;
+        }
+        e.2 = frame.max(1);
+        (e.0.clone(), e.1)
+    };
+    if pt.tile_mode != 0xd || pt.desc[3] != 1 || pt.memory == 0 {
+        return;
+    }
+    let (w, h, mips, fmt) = (pt.desc[0] as usize, pt.desc[1] as usize, (pt.desc[2] as usize).max(1), pt.desc[4]);
+    let Some((bw, bh, bpe)) = element_layout(fmt) else { return };
+    // level layout
+    let mut levels: Vec<(usize, usize, usize, usize, usize)> = Vec::new(); // (elements wide, elements high, tiles x, tiles y, offset)
+    let mut off = 0usize;
+    for l in 0..mips {
+        let (lw, lh) = ((w >> l).max(1), (h >> l).max(1));
+        let (ew, eh) = ((lw + bw - 1) / bw, (lh + bh - 1) / bh);
+        let pitch_el = if l == 0 { (ew + 63) / 64 * 64 } else { (ew + 7) / 8 * 8 };
+        let (tx, ty) = (pitch_el / 8, (eh + 7) / 8);
+        levels.push((ew, eh, tx, ty, off));
+        off += tx * ty * 64 * bpe;
+    }
+    if off == 0 || off > 64 << 20 {
+        return;
+    }
+    let mut buf = vec![0u8; off];
+    let mut got = 0usize;
+    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), pt.memory as *const c_void, buf.as_mut_ptr() as *mut c_void, off, &mut got) } != 0;
+    if !ok || got != off {
+        return;
+    }
+    // hash: every 8th qword plus the length
+    let mut hsh = 1469598103934665603u64 ^ off as u64;
+    let mut any = false;
+    for c in buf.chunks_exact(64) {
+        let v = u64::from_le_bytes(c[0..8].try_into().unwrap());
+        any |= v != 0;
+        hsh = (hsh ^ v).wrapping_mul(1099511628211);
+    }
+    if !any || hsh == last_hash {
+        return;
+    }
+    let proxy = CONTEXT_PROXY.load(Ordering::Acquire);
+    if proxy == 0 {
+        return;
+    }
+    let real = unsafe { (*(proxy as *const Proxy)).real };
+    let update: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *const c_void, *const c_void, u32, u32) =
+        unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(48))) };
+    for (l, &(ew, eh, tx_n, _ty_n, loff)) in levels.iter().enumerate() {
+        let mut lin = vec![0u8; ew * eh * bpe];
+        let tiles_y = (eh + 7) / 8;
+        for ty in 0..tiles_y {
+            for tx in 0..tx_n {
+                let base = loff + (ty * tx_n + tx) * 64 * bpe;
+                for e in 0..64usize {
+                    let x = (e & 1) | (((e >> 2) & 1) << 1) | (((e >> 4) & 1) << 2);
+                    let y = ((e >> 1) & 1) | (((e >> 3) & 1) << 1) | (((e >> 5) & 1) << 2);
+                    let (gx, gy) = (tx * 8 + x, ty * 8 + y);
+                    if gx < ew && gy < eh {
+                        let src = base + e * bpe;
+                        let dst = (gy * ew + gx) * bpe;
+                        lin[dst..dst + bpe].copy_from_slice(&buf[src..src + bpe]);
+                    }
+                }
+            }
+        }
+        unsafe { update(real, resource as *mut c_void, l as u32, ptr::null(), lin.as_ptr() as *const c_void, (ew * bpe) as u32, 0) };
+    }
+    {
+        let mut guard = PLACED_TEX_MAP.lock().unwrap();
+        if let Some(m) = guard.as_mut() {
+            if let Some(e) = m.get_mut(&resource) {
+                e.1 = hsh;
+            }
+        }
+    }
+    static NLOG: AtomicU32 = AtomicU32::new(0);
+    let n = NLOG.fetch_add(1, Ordering::Relaxed);
+    if n < 8 || n % 500 == 0 {
+        glog!("[gpu] placed texture {resource:#x} {w}x{h} fmt {fmt} mips {mips}: uploaded {off} bytes from {:#x} (#{n})", pt.memory);
+    }
+}
+
+/// `XB1_DUMP_TEX=<dir>`: writes the raw placement memory of a few textures with their description (for working out the tiled
+/// layout offline): `tex_<n>_<w>x<h>_fmt<f>_mips<m>_tile<t>.bin`.
+fn dump_placed_textures() {
+    let Ok(dir) = std::env::var("XB1_DUMP_TEX") else { return };
+    let list = PLACED_TEXTURES.lock().unwrap().clone();
+    let mut done = 0;
+    for (n, t) in list.iter().enumerate() {
+        let (w, h, mips, fmt) = (t.desc[0] as usize, t.desc[1] as usize, t.desc[2] as usize, t.desc[4]);
+        // bytes per element: 4 for RGBA8 / BGRA8, 1 for R8, 16 for BC2/3/5/6/7 (blocks of 4x4), 8 for BC1/BC4
+        let (bw, bh, bpe) = match fmt {
+            28 | 29 | 87 | 91 => (1, 1, 4),
+            61 => (1, 1, 1),
+            71 | 72 | 80 | 81 => (4, 4, 8),
+            74 | 75 | 77 | 78 | 83 | 84 | 95 | 96 | 98 | 99 => (4, 4, 16),
+            _ => continue,
+        };
+        if w < 64 || w > 1024 || t.memory == 0 || done >= 40 || (matches!(fmt, 98 | 99) && done > 8) {
+            continue;
+        }
+        let base = ((w + bw - 1) / bw) * ((h + bh - 1) / bh) * bpe;
+        let size = if mips > 1 { base * 4 / 3 + 65536 } else { base } + 4096;
+        let mut buf = vec![0u8; size];
+        let mut got = 0usize;
+        let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), t.memory as *const c_void, buf.as_mut_ptr() as *mut c_void, size, &mut got) } != 0;
+        if !ok && got == 0 {
+            continue;
+        }
+        buf.truncate(got);
+        if buf.iter().all(|b| *b == 0) {
+            continue;
+        }
+        let _ = std::fs::write(format!("{dir}/tex_{n}_{w}x{h}_fmt{fmt}_mips{mips}_tile{:x}.bin", t.tile_mode), &buf);
+        done += 1;
+    }
+    glog!("[gpu] dumped {done} placed textures of {}", list.len());
+}
 
 struct PlacedBuffer {
     resource: usize,
@@ -2952,6 +3170,9 @@ pub unsafe extern "system" fn present_array(a1: u64, a2: u64, a3: u64, a4: u64, 
         if n % 300 == 0 {
             glog!("[gpu] draws in the last frame: {d}");
         }
+    }
+    if n == 1500 {
+        dump_placed_textures();
     }
     if std::env::var_os("XB1_DUMP_PS").is_some() && (n == 150 || n == 900 || n == 1500 || (n > 0 && n % 6000 == 0)) && T0_RES.load(Ordering::Relaxed) != 0 {
         let (res, real) = (T0_RES.load(Ordering::Relaxed), T0_REAL.load(Ordering::Relaxed));
