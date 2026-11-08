@@ -1872,7 +1872,15 @@ unsafe extern "system" fn ctx_viewports(this: *mut c_void, count: u32, vp: *cons
 }
 
 /// Console index 8: `(pointer to a variable holding a view, ..)` -> `PSSetShaderResources(0, 1, views)`.
-unsafe extern "system" fn ctx_ps_srv(this: *mut c_void, views: *const *mut c_void) {
+unsafe extern "system" fn ctx_ps_srv(this: *mut c_void, views: *const *mut c_void, a3: usize, a4: usize) {
+    {
+        static ALOG: AtomicU32 = AtomicU32::new(0);
+        let n = ALOG.fetch_add(1, Ordering::Relaxed);
+        if (n < 20 || n % 5000 == 0) && !views.is_null() && readable(views as *const c_void, 32) {
+            let q = unsafe { std::slice::from_raw_parts(views as *const usize, 4) };
+            glog!("[gpu] console 8 call #{n}: views {views:p} [{:#x} {:#x} {:#x} {:#x}] a3 {a3:#x} a4 {a4:#x}", q[0], q[1], q[2], q[3]);
+        }
+    }
     if views.is_null() || (views as usize) % 8 != 0 {
         return;
     }
@@ -1893,10 +1901,37 @@ unsafe extern "system" fn ctx_ps_srv(this: *mut c_void, views: *const *mut c_voi
             glog!("[gpu]   its texture desc {:x?}", d);
         }
     }
-    restore_object_vtable(unsafe { *views });
     let real = unsafe { real_context(this) };
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, *const *mut c_void) =
         unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(8))) };
+    // The argument is an array of 16-byte entries `{view, 0}`, one per bound texture (the Bink video shader reads three planes,
+    // which were never bound: only the first view was). Consecutive non-NULL entries are bound to slots 0, 1, ...
+    if std::env::var_os("XB1_PS_SRV_ONE").is_none() {
+        let mut list = [ptr::null_mut::<c_void>(); 8];
+        let mut count = 0usize;
+        while count < 8 && readable(unsafe { (views as *const usize).add(count * 2) } as *const c_void, 8) {
+            let p = unsafe { *(views as *const usize).add(count * 2) };
+            if p == 0 || p % 8 != 0 || !readable(p as *const c_void, 8) {
+                break;
+            }
+            restore_object_vtable(p as *mut c_void);
+            // Stale entries of the shared array must not be bound: only real shader resource views.
+            if count > 0 && (!has_image_vtable(p as *const c_void) || qi_kind(p as *mut c_void) != "SRV") {
+                break;
+            }
+            list[count] = p as *mut c_void;
+            count += 1;
+        }
+        if count > 1 {
+            static MLOG: AtomicU32 = AtomicU32::new(0);
+            if MLOG.fetch_add(1, Ordering::Relaxed) < 6 {
+                glog!("[gpu] console 8 binds {count} views: {:?}", &list[..count]);
+            }
+        }
+        unsafe { f(real, 0, count.max(1) as u32, list.as_ptr()) };
+        return;
+    }
+    restore_object_vtable(unsafe { *views });
     unsafe { f(real, 0, 1, views) };
 }
 
