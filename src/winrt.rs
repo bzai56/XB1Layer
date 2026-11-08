@@ -178,7 +178,9 @@ fn controller_view() -> *mut c_void {
 /// Raises the registered `Gamepad` / `Controller` events once (a controller was added): `Invoke(sender, args)` with the
 /// controller element as the sender and as the answer of any getter on the arguments. `XB1_NO_INPUT_EVENTS=1` turns it off.
 pub fn raise_input_events() {
-    if std::env::var_os("XB1_NO_INPUT_EVENTS").is_some() || !crate::VCCORLIB110.load(Ordering::Relaxed) {
+    // The older SDK always; a newer one (Forza Horizon 3 registers controller added / removed / pairing handlers)
+    // only with `XB1_INPUT_EVENTS=1` until it is confirmed that this does not disturb Sonic Mania.
+    if std::env::var_os("XB1_NO_INPUT_EVENTS").is_some() || (!crate::VCCORLIB110.load(Ordering::Relaxed) && std::env::var_os("XB1_INPUT_EVENTS").is_none()) {
         return;
     }
     std::thread::spawn(|| {
@@ -391,9 +393,9 @@ impl Iface for CoreAppTag {
     const VTBL: &'static Self::Vtbl = &ICoreApplication_Vtbl {
         base__: inspectable::<CoreAppTag>(),
         Id: app_id,
-        Suspending: app_add_event,
+        Suspending: app_add_suspending,
         RemoveSuspending: app_remove_event,
-        Resuming: app_add_event,
+        Resuming: app_add_resuming,
         RemoveResuming: app_remove_event,
         Properties: app_properties,
         GetCurrentView: app_get_current_view,
@@ -408,10 +410,54 @@ unsafe extern "system" fn app_id(_this: *mut c_void, out: *mut *mut c_void) -> H
     HRESULT(0)
 }
 
-unsafe extern "system" fn app_add_event(_this: *mut c_void, _handler: *mut c_void, token: *mut i64) -> HRESULT {
-    wlog!("[winrt] CoreApplication::add_Suspending/Resuming");
+/// Delegates the title registered with `CoreApplication.Suspending` and `.Resuming` (kept so `Resuming` can be raised).
+static SUSPENDING_HANDLERS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static RESUMING_HANDLERS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+fn keep_handler(list: &Mutex<Vec<usize>>, handler: *mut c_void) {
+    if handler.is_null() {
+        return;
+    }
+    let vt = unsafe { *(handler as *const *const usize) };
+    let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { std::mem::transmute(*vt.add(1)) };
+    unsafe { add_ref(handler) };
+    list.lock().unwrap().push(handler as usize);
+}
+
+unsafe extern "system" fn app_add_suspending(_this: *mut c_void, handler: *mut c_void, token: *mut i64) -> HRESULT {
+    wlog!("[winrt] CoreApplication::add_Suspending");
+    keep_handler(&SUSPENDING_HANDLERS, handler);
     unsafe { *token = next_token() };
     HRESULT(0)
+}
+
+unsafe extern "system" fn app_add_resuming(_this: *mut c_void, handler: *mut c_void, token: *mut i64) -> HRESULT {
+    wlog!("[winrt] CoreApplication::add_Resuming");
+    keep_handler(&RESUMING_HANDLERS, handler);
+    unsafe { *token = next_token() };
+    HRESULT(0)
+}
+
+/// Raises the title's `Resuming` delegates once (`Invoke(sender, args)`, slot 3), a moment after the title is running:
+/// a console title is started suspended and resumed. Experiment: `XB1_RAISE_RESUMING=1`.
+pub fn raise_resuming() {
+    if std::env::var_os("XB1_RAISE_RESUMING").is_none() {
+        return;
+    }
+    std::thread::spawn(|| {
+        crate::ensure_tls_on_current_thread();
+        let delay: u64 = std::env::var("XB1_RAISE_RESUMING_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000);
+        std::thread::sleep(std::time::Duration::from_millis(delay));
+        let list: Vec<usize> = RESUMING_HANDLERS.lock().unwrap().clone();
+        wlog!("[winrt] raising CoreApplication::Resuming to {} handler(s)", list.len());
+        for h in list {
+            let vt = unsafe { *(h as *const *const usize) };
+            let invoke: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT = unsafe { std::mem::transmute(*vt.add(3)) };
+            let hr = unsafe { invoke(h as *mut c_void, ptr::null_mut(), ptr::null_mut()) };
+            wlog!("[winrt]   Resuming: Invoke -> {:#x}", hr.0 as u32);
+        }
+        crate::restore_loader_tls();
+    });
 }
 
 unsafe extern "system" fn app_remove_event(_this: *mut c_void, _token: i64) -> HRESULT {
@@ -493,6 +539,7 @@ fn run_view(source: &IFrameworkViewSource) -> Result<()> {
     if std::env::var_os("XB1_NO_USER_EVENTS").is_none() {
         raise_user_events();
         raise_input_events();
+        raise_resuming();
     }
     if std::env::var_os("XB1_WINDOW_EVENTS").is_some() {
         raise_window_events();
