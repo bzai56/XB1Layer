@@ -634,6 +634,18 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                         }
                     }
                     // XB1_POKE="r13+0x3224=1": experiment only, writes one byte at register+offset.
+                    if POKE_SPEC.get().map_or(false, |p| p.contains("r15+0x4cc")) && std::env::var_os("XB1_BOOT_WAIT").is_some() {
+                        // Opt-in experiment (XB1_BOOT_WAIT=1; it did not fix the crash): the render request set only once the graphics start-up has finished (the
+                        // swap chain exists and its views are created); set too early, the main tick draws while another thread is
+                        // still creating them (NULL render target view, crash at title+0x1cd6a0b).
+                        let mut waited = 0u32;
+                        while crate::display::SWAP_CHAIN.load(Ordering::Acquire) == 0 && waited < 20_000 {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                            waited += 5;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1500));
+                        rlog!("  boot flag: waited {waited} ms for the swap chain (+1.5 s)");
+                    }
                     if let Some(spec) = POKE_SPEC.get() {
                         for item in spec.split(';') {
                             let Some((target, val)) = item.split_once('=') else { continue };

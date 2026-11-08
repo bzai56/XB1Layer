@@ -2658,11 +2658,15 @@ pub unsafe extern "system" fn present_array(a1: u64, a2: u64, a3: u64, a4: u64, 
                 if n < 3 || hr < 0 && n < 50 {
                     glog!("[gpu] DXGIXPresentArray #{n}: Present on the swap chain -> {:#x}", hr as u32);
                 }
-                crate::display::limit_frame_rate();
+                // No extra frame limiter: the vertical sync of `Present(1, 0)` already paces (a second limiter on top halved the rate).
             }
         }
         if n > 0 && n % 300 == 0 {
-            glog!("[gpu] DXGIXPresentArray: {n} calls so far");
+            static T: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+            let mut t = T.lock().unwrap();
+            let rate = t.map(|t0| 300.0 / t0.elapsed().as_secs_f64()).unwrap_or(0.0);
+            *t = Some(std::time::Instant::now());
+            glog!("[gpu] DXGIXPresentArray: {n} calls so far ({rate:.1} presents per second over the last 300)");
         }
     }
     0
