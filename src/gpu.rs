@@ -2048,6 +2048,9 @@ unsafe fn probe_render_target(real: *mut c_void, draw: u32) {
                 let mut d = [0u32; 11];
                 gd(res, d.as_mut_ptr());
                 glog!("[gpu] probe draw {draw}: t{slot} {res:p} {}x{} fmt {} bind {:#x}", d[0], d[1], d[4], d[8]);
+                if d[0] == 1024 && d[1] == 1024 && d[4] == 28 {
+                    ATLAS_RES.store(res as usize, Ordering::Relaxed);
+                }
                 if d[0] > 16 && d[1] > 16 && d[0] <= 4096 {
                     readback_texture(real, res, d);
                 }
@@ -2096,6 +2099,7 @@ unsafe fn probe_render_target(real: *mut c_void, draw: u32) {
     }
 }
 
+static ATLAS_RES: AtomicUsize = AtomicUsize::new(0);
 static DRAWS_IN_FRAME: AtomicU32 = AtomicU32::new(0);
 static T0_RES: AtomicUsize = AtomicUsize::new(0);
 static T0_REAL: AtomicUsize = AtomicUsize::new(0);
@@ -2958,6 +2962,19 @@ pub unsafe extern "system" fn present_array(a1: u64, a2: u64, a3: u64, a4: u64, 
         d[4] = (packed & 0xff) as u32;
         glog!("[gpu] present {n}:");
         unsafe { readback_texture(real as *mut c_void, res as *mut c_void, d) };
+        {
+            let atlas = ATLAS_RES.load(Ordering::Relaxed);
+            if atlas != 0 {
+                glog!("[gpu] the 1024x1024 atlas texture {atlas:#x}:");
+                unsafe { readback_texture(real as *mut c_void, atlas as *mut c_void, [1024, 1024, 1, 1, 28, 0, 0, 0, 0, 0, 0]) };
+            }
+            // The first display plane's texture (the UI overlay).
+            let plane_tex = first_plane_back_buffer();
+            if plane_tex != 0 {
+                glog!("[gpu] display plane 0 texture:");
+                unsafe { readback_texture(real as *mut c_void, plane_tex as *mut c_void, [1920, 1080, 1, 1, if std::env::var_os("XB1_PLANE_COPY").is_some() { 24 } else { 28 }, 0, 0, 0, 0, 0, 0]) };
+            }
+        }
         // The swap chain's current buffer (what is shown): GetBuffer(0, IID_ID3D11Texture2D) is slot 9.
         let sc = crate::display::SWAP_CHAIN.load(Ordering::Acquire);
         if sc != 0 {
@@ -3021,6 +3038,25 @@ pub unsafe extern "system" fn present_array(a1: u64, a2: u64, a3: u64, a4: u64, 
                 }
             }
             if plane != 0 && plane == own {
+                // The UI overlay: the title draws its UI into the display plane's texture; blend it over the swap chain's buffer.
+                if std::env::var("XB1_UI_COMPOSITE").as_deref() == Ok("1") {
+                    let plane_tex = first_plane_back_buffer();
+                    let proxy = CONTEXT_PROXY.load(Ordering::Acquire);
+                    if plane_tex != 0 && proxy != 0 {
+                        unsafe {
+                            let real_ctx = (*(proxy as *const Proxy)).real;
+                            let vt0 = *(plane as *const *const usize);
+                            let get_buffer: unsafe extern "system" fn(*mut c_void, u32, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt0.add(9));
+                            let iid = GUID::from_u128(0x6f15aaf2_d208_4e89_9ab4_489535d34f9c);
+                            let mut buf: *mut c_void = ptr::null_mut();
+                            if get_buffer(plane as *mut c_void, 0, &iid, &mut buf).0 >= 0 && !buf.is_null() {
+                                crate::overlay::composite(real_ctx, buf, &[plane_tex as *mut c_void]);
+                                let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*((*(buf as *const *const usize)).add(2)));
+                                rel(buf);
+                            }
+                        }
+                    }
+                }
                 // IDXGISwapChain::Present is slot 8; one vertical sync (the title's 2 means "every second refresh").
                 let vt = unsafe { *(plane as *const *const usize) };
                 let present: unsafe extern "system" fn(*mut c_void, u32, u32) -> i32 = unsafe { std::mem::transmute(*vt.add(8)) };

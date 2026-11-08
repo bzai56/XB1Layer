@@ -10,6 +10,7 @@
 mod display;
 mod dualsense;
 mod gpu;
+mod overlay;
 mod profile;
 mod tlsdll;
 mod winrt;
@@ -686,8 +687,8 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                             std::thread::sleep(std::time::Duration::from_millis(5));
                             waited += 5;
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(1500));
-                        rlog!("  boot flag: waited {waited} ms for the swap chain (+1.5 s)");
+                        std::thread::sleep(std::time::Duration::from_millis(std::env::var("XB1_BOOT_EXTRA_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1500)));
+                        rlog!("  boot flag: waited {waited} ms for the swap chain (+extra)");
                     }
                     if let Some(spec) = POKE_SPEC.get() {
                         for item in spec.split(';') {
