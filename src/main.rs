@@ -57,6 +57,7 @@ unsafe extern "system" {
     fn CreateSemaphoreExW(attrs: *mut c_void, initial: i32, max: i32, name: *const u16, flags: u32, access: u32) -> *mut c_void;
     fn ReleaseSemaphore(h: *mut c_void, count: i32, previous: *mut i32) -> i32;
     fn WaitForMultipleObjects(count: u32, handles: *const *mut c_void, all: i32, ms: u32) -> u32;
+    fn WaitForSingleObjectEx(h: *mut c_void, ms: u32, alertable: i32) -> u32;
     fn CloseHandle(h: *mut c_void) -> i32;
     fn GetCurrentProcessId() -> u32;
     fn DefineDosDeviceW(flags: u32, name: *const u16, target: *const u16) -> i32;
@@ -127,9 +128,9 @@ fn args_watch_sites() -> Option<Vec<usize>> {
 /// One-shot watchpoints (`--watch-sites=0x1B10F53,...`, title RVAs): the first byte of the
 /// instruction is replaced with `int3`; on the first hit the crash logger reports the registers
 /// and the title's call chain, restores the byte and re-executes the instruction.
-static WATCH_ADDR: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
-static WATCH_ORIG: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
-static WATCH_PENDING: [std::sync::atomic::AtomicBool; 16] = [const { std::sync::atomic::AtomicBool::new(false) }; 16];
+static WATCH_ADDR: [AtomicUsize; 256] = [const { AtomicUsize::new(0) }; 256];
+static WATCH_ORIG: [AtomicUsize; 256] = [const { AtomicUsize::new(0) }; 256];
+static WATCH_PENDING: [std::sync::atomic::AtomicBool; 256] = [const { std::sync::atomic::AtomicBool::new(false) }; 256];
 /// `--watch-repeat`: watchpoints stay armed and report every hit (up to a cap) instead of once.
 static WATCH_REPEAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static WATCH_HITS: AtomicUsize = AtomicUsize::new(0);
@@ -1034,6 +1035,53 @@ extern "system" fn xb_wait_multiple(count: u32, handles: *const *mut c_void, all
         *WAIT_ALL_HANDLES.lock().unwrap() = v;
     }
     unsafe { WaitForMultipleObjects(count, handles, all, ms) }
+}
+
+/// Infinite single-object waits in progress: `(thread id, handle, title caller)`.
+static PENDING_WAITS: Mutex<Vec<(u32, usize, String)>> = Mutex::new(Vec::new());
+
+fn tracked_wait(h: *mut c_void, ms: u32, f: impl FnOnce() -> u32) -> u32 {
+    if ms != u32::MAX {
+        return f();
+    }
+    let tid = unsafe { GetCurrentThreadId() };
+    let caller = caller_chain();
+    PENDING_WAITS.lock().unwrap().push((tid, h as usize, caller));
+    let r = f();
+    PENDING_WAITS.lock().unwrap().retain(|w| w.0 != tid);
+    r
+}
+
+extern "system" fn xb_wait_single(h: *mut c_void, ms: u32) -> u32 {
+    tracked_wait(h, ms, || unsafe { WaitForSingleObject(h, ms) })
+}
+
+extern "system" fn xb_wait_single_ex(h: *mut c_void, ms: u32, alertable: i32) -> u32 {
+    tracked_wait(h, ms, || unsafe { WaitForSingleObjectEx(h, ms, alertable) })
+}
+
+/// The first few title return addresses on the stack, as text.
+fn caller_chain() -> String {
+    // Raw stack scan (the title's tiny wait wrapper has no unwind data, so the unwinder stops at it).
+    let marker = 0usize;
+    let top = &marker as *const usize as usize;
+    let (base, size) = (IMG_BASE.load(Ordering::Relaxed), IMG_SIZE.load(Ordering::Relaxed));
+    let mut v: Vec<String> = Vec::new();
+    for i in 0..512usize {
+        let p = (top + i * 8) as *const usize;
+        let mut q = 0usize;
+        let mut got = 0usize;
+        if unsafe { ReadProcessMemory(GetCurrentProcess(), p as *const c_void, &mut q as *mut usize as *mut c_void, 8, &mut got) } == 0 {
+            break;
+        }
+        if q >= base && q < base + size {
+            v.push(format!("{:#x}", q - base));
+            if v.len() >= 7 {
+                break;
+            }
+        }
+    }
+    format!("title+ {}", v.join(" "))
 }
 
 struct ThreadStart {
@@ -2258,6 +2306,8 @@ fn override_for(dll: &str, func: &str) -> Option<usize> {
         "CreateSemaphoreExW" if event_trace() => Some(xb_create_semaphore as usize),
         "ReleaseSemaphore" if event_trace() => Some(xb_release_semaphore as usize),
         "WaitForMultipleObjects" if event_trace() => Some(xb_wait_multiple as usize),
+        "WaitForSingleObject" if event_trace() => Some(xb_wait_single as usize),
+        "WaitForSingleObjectEx" if event_trace() => Some(xb_wait_single_ex as usize),
         "LoadLibraryExW" if RING.load(Ordering::Relaxed) != 0 || std::env::var_os("XB1_FILES").is_some() => Some(xb_load_library_ex_w as usize),
         "CreateFile2" if RING.load(Ordering::Relaxed) != 0 || std::env::var_os("XB1_FILES").is_some() => Some(xb_create_file2 as usize),
         "FindFirstFileExA" if RING.load(Ordering::Relaxed) != 0 || std::env::var_os("XB1_FILES").is_some() => Some(xb_find_first_file_ex_a as usize),
@@ -3019,6 +3069,9 @@ fn load(data: &[u8], dir: &Path, run: bool, report: bool, dump_iat: bool) -> Res
                 for h in WAIT_ALL_HANDLES.lock().unwrap().iter() {
                     let r = unsafe { WaitForSingleObject(*h as *mut c_void, 0) };
                     rlog!("[watchdog] wait-all handle {h:#x}: {}", match r { 0 => "signaled", 0x102 => "not signaled", _ => "invalid or abandoned" });
+                }
+                for (tid, h, caller) in PENDING_WAITS.lock().unwrap().iter() {
+                    rlog!("[watchdog] thread {tid} waits forever on {h:#x} from {caller}");
                 }
                 // XB1_WATCH_HANDLES="0x2f4,0x2f8": whether each handle is signaled at this moment.
                 if let Ok(list) = std::env::var("XB1_WATCH_HANDLES") {
