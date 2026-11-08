@@ -1444,6 +1444,18 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         let child = create_generic(&format!("{}#slot{N}", o.class), &o.iid);
         unsafe { *(arg1 as *mut *mut c_void) = child };
         wlog!("[winrt] {} (iid {:?}): slot {N} called with out-param {arg1:p} -> returned a new stand-in object", o.class, o.iid);
+        {
+            // The first calls: which title code makes them (a stand-in answered thousands of times a second in Forza Horizon 3).
+            unsafe extern "system" { fn RtlCaptureStackBackTrace(skip: u32, count: u32, frames: *mut *mut c_void, hash: *mut u32) -> u16; }
+            static CALLERS: AtomicU32 = AtomicU32::new(0);
+            { let n = CALLERS.fetch_add(1, Ordering::Relaxed); if n < 40 || n % 50000 == 0 {
+                let mut f = [ptr::null_mut::<c_void>(); 6];
+                unsafe { RtlCaptureStackBackTrace(1, 6, f.as_mut_ptr(), ptr::null_mut()) };
+                let (base, size) = crate::image_range();
+                let v: Vec<String> = f.iter().map(|p| *p as usize).filter(|a| *a >= base && *a < base + size).map(|a| format!("{:#x}", a - base)).collect();
+                wlog!("[winrt]   caller title+ {}", v.join(" "));
+            } }
+        }
         HRESULT(0)
     } else {
         // `(NULL name, Object** out)` (title call site 0x2ca99a): the object goes to the second argument.
