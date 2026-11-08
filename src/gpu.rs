@@ -166,8 +166,8 @@ const EMBED_VERIFIED_SHIFTED: [usize; 5] = [34, 46, 49, 59, 63];
 /// Added from Forza Horizon 3's per-frame calls (same table base): 7 `VSSetConstantBuffers(0, 1, &b)` (desktop 7), 13
 /// `Draw(vertex count, start)` (desktop 13: `a2` = 3 or 966, `a3` = 0) and 22 `GSSetConstantBuffers(0, 1, &b)` (desktop 22),
 /// all three with the argument shapes of their desktop namesakes and no console-only values.
-const EMBED_EXTRA: [(usize, usize); 14] =
-    [(8, 8), (19, 19), (10, 10), (12, 12), (16, 16), (18, 18), (32, 33), (35, 36), (42, 43), (43, 44), (52, 53), (7, 7), (13, 13), (22, 22)];
+const EMBED_EXTRA: [(usize, usize); 15] =
+    [(8, 8), (19, 19), (10, 10), (12, 12), (16, 16), (18, 18), (32, 33), (35, 36), (42, 43), (43, 44), (52, 53), (7, 7), (13, 13), (22, 22), (47, 48)];
 
 /// `(embedded index, entry)` pairs that forward to the real context. Built once.
 fn forwarded_entries() -> &'static Vec<(usize, usize)> {
@@ -229,6 +229,10 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
             // Only indices with direct evidence forward (see EMBED_VERIFIED_SHIFTED); the others log
             // their arguments so they can be identified from the calls.
             if log_all || !EMBED_VERIFIED_SHIFTED.contains(&console_slot) {
+                continue;
+            }
+            if console_slot == 49 {
+                v.push((index_of(EMBED_TABLE + 49 * 8), ctx_clear_rtv as usize));
                 continue;
             }
             let thunk = forward_context_thunk(unsafe { thunks.add((64 + console_slot - EMBED_SHIFTED_FROM) * 32) }, console_slot + 1);
@@ -1237,6 +1241,9 @@ unsafe extern "system" fn ctx_bind_object(this: *mut c_void, _a2: usize, obj: *m
         unsafe { f(real, obj, if _a2 == 0 { 57 } else { 42 }, _a4 as u32) }; // 57 is R16_UINT, 42 R32_UINT; the last argument is the byte offset
         return;
     }
+    if kind == Some(15) {
+        LAST_PS.store(obj as usize, Ordering::Relaxed);
+    }
     let slot = match kind {
         Some(11) => 17,
         Some(12) => 11,
@@ -1664,6 +1671,19 @@ unsafe extern "system" fn ctx_draw_indexed(this: *mut c_void, packed: u64) {
     unsafe { f(real, count, start, 0) };
 }
 
+/// Console index 49 = desktop 50 `ClearRenderTargetView(rtv, color[4])`: logged (the first calls), then forwarded.
+unsafe extern "system" fn ctx_clear_rtv(this: *mut c_void, rtv: *mut c_void, color: *const f32) {
+    static N: AtomicU32 = AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 12 && !color.is_null() {
+        let c = unsafe { std::slice::from_raw_parts(color, 4) };
+        glog!("[gpu] ClearRenderTargetView #{n}: rtv {rtv:p} color {} {} {} {}", c[0], c[1], c[2], c[3]);
+    }
+    let real = unsafe { real_context(this) };
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const f32) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(50))) };
+    unsafe { f(real, rtv, color) };
+}
+
 /// Console index 43: `RSSetViewports(count, viewports)`; the first calls log the rectangles.
 unsafe extern "system" fn ctx_viewports(this: *mut c_void, count: u32, vp: *const f32) {
     static LOGS: AtomicU32 = AtomicU32::new(0);
@@ -1729,6 +1749,61 @@ const EXTENDED_CREATORS: [(usize, usize, usize); 14] = [
     (26, 2, 9),  // CreateCounter
 ];
 
+/// Pixel shader objects and their bytecode; the last pixel shader the title bound.
+static PS_BYTECODE: std::sync::Mutex<Option<std::collections::HashMap<usize, Vec<u8>>>> = std::sync::Mutex::new(None);
+static LAST_PS: AtomicUsize = AtomicUsize::new(0);
+
+/// `XB1_DUMP_PS=<dir>`: writes the pixel shader bound at the first draws to `<dir>\ps_<n>.bin`.
+fn dump_bound_ps(n: u32, real: *mut c_void) {
+    let Ok(dir) = std::env::var("XB1_DUMP_PS") else { return };
+    // Ask the real context which pixel shader is bound (PSGetShader is desktop slot 74).
+    let mut ps = 0usize;
+    unsafe {
+        let get: unsafe extern "system" fn(*mut c_void, *mut *mut c_void, *mut c_void, *mut u32) = std::mem::transmute(*((*(real as *const *const usize)).add(74)));
+        let mut obj: *mut c_void = ptr::null_mut();
+        get(real, &mut obj, ptr::null_mut(), ptr::null_mut());
+        ps = obj as usize;
+        if !obj.is_null() {
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*((*(obj as *const *const usize)).add(2)));
+            rel(obj);
+        }
+    }
+    LAST_PS.store(ps, Ordering::Relaxed);
+    // The first pixel-shader resource (t0): its texture size and format (PSGetShaderResources is desktop slot 73).
+    if n < 8 {
+        unsafe {
+            let get: unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) = std::mem::transmute(*((*(real as *const *const usize)).add(73)));
+            let mut srv: *mut c_void = ptr::null_mut();
+            get(real, 0, 1, &mut srv);
+            if srv.is_null() {
+                glog!("[gpu] draw {n}: no shader resource at t0");
+            } else {
+                let svt = *(srv as *const *const usize);
+                let get_res: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = std::mem::transmute(*svt.add(7));
+                let mut res: *mut c_void = ptr::null_mut();
+                get_res(srv, &mut res);
+                if !res.is_null() {
+                    let rvt = *(res as *const *const usize);
+                    let gd: unsafe extern "system" fn(*mut c_void, *mut u32) = std::mem::transmute(*rvt.add(10));
+                    let mut d = [0u32; 11];
+                    gd(res, d.as_mut_ptr());
+                    glog!("[gpu] draw {n}: t0 srv {srv:p} texture {res:p} {}x{} mips {} array {} fmt {} bind {:#x} misc {:#x}", d[0], d[1], d[2], d[3], d[4], d[8], d[10]);
+                    let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*rvt.add(2));
+                    rel(res);
+                }
+                let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*svt.add(2));
+                rel(srv);
+            }
+        }
+    }
+    if let Some(b) = PS_BYTECODE.lock().unwrap().as_ref().and_then(|m| m.get(&ps)) {
+        let _ = std::fs::write(format!("{dir}/ps_{n}.bin"), b);
+        glog!("[gpu] pixel shader {ps:#x} ({} bytes) written for draw {n}", b.len());
+    } else {
+        glog!("[gpu] draw {n}: bound pixel shader {ps:#x} has no recorded bytecode");
+    }
+}
+
 /// Wrapper for the creators above: `(device, a1..a5)`; the real method ignores the arguments it
 /// does not use.
 unsafe extern "system" fn device_create_extended<const SLOT: usize>(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> HRESULT {
@@ -1750,6 +1825,24 @@ unsafe extern "system" fn device_create_extended<const SLOT: usize>(this: *mut c
                     older_sdk_state_get_desc(unsafe { *out });
                 }
                 CREATED_KINDS.lock().unwrap().get_or_insert_with(Default::default).insert(unsafe { *out } as usize, SLOT);
+                if SLOT == 20 && !crate::VCCORLIB110.load(Ordering::Relaxed) {
+                    // The blend state as the desktop sees it (GetDesc is slot 7: AlphaToCoverage, Independent, then 8 x
+                    // {enable, src, dest, op, src alpha, dest alpha, op alpha, write mask}).
+                    static BLOGS: AtomicU32 = AtomicU32::new(0);
+                    if BLOGS.fetch_add(1, Ordering::Relaxed) < 10 {
+                        let obj = unsafe { *out };
+                        let mut d = [0u32; 80];
+                        let vt = unsafe { *(obj as *const *const usize) };
+                        let gd: unsafe extern "system" fn(*mut c_void, *mut u32) = unsafe { std::mem::transmute(*vt.add(7)) };
+                        unsafe { gd(obj, d.as_mut_ptr()) };
+                        glog!("[gpu] blend state: desktop desc rt0 {:x?}; raw title desc {}", &d[2..10], safe_dump(a1 as u64, 48));
+                    }
+                }
+                if SLOT == 15 && a1 > 0x10000 && a2 > 16 && a2 < (1 << 22) {
+                    // Pixel shader bytecode by object (for `XB1_DUMP_PS`).
+                    let bytes = unsafe { std::slice::from_raw_parts(a1 as *const u8, a2) }.to_vec();
+                    PS_BYTECODE.lock().unwrap().get_or_insert_with(Default::default).insert(unsafe { *out } as usize, bytes);
+                }
             }
         }
     }
@@ -2242,6 +2335,18 @@ unsafe fn create_view(this: *mut c_void, slot: usize, name: &str, resource: *mut
     }
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, *mut *mut c_void) -> HRESULT =
         unsafe { std::mem::transmute(*((*(p.real as *const *const usize)).add(slot))) };
+    {
+        static VLOGS: AtomicU32 = AtomicU32::new(0);
+        if !desc.is_null() && slot != 5 && VLOGS.fetch_add(1, Ordering::Relaxed) < 60 {
+            let mut d = [0u32; 16];
+            let real_res = unsafe { unwrap_object(resource) };
+            let vt = unsafe { *(real_res as *const *const usize) };
+            let gd: unsafe extern "system" fn(*mut c_void, *mut u32) = unsafe { std::mem::transmute(*vt.add(10)) };
+            unsafe { gd(real_res, d.as_mut_ptr()) };
+            let v = unsafe { std::slice::from_raw_parts(desc as *const u32, 3) };
+            glog!("[gpu] {name}: view format {} dim {} on resource {}x{} format {} bind {:#x}", v[0], v[1], d[0], d[1], d[4], d[8]);
+        }
+    }
     let hr = unsafe { f(p.real, unwrap_object(resource), desc, out) };
     if hr.0 >= 0 && !out.is_null() {
         shift_view_vtable(unsafe { *out });
@@ -3293,6 +3398,15 @@ unsafe extern "system" fn ctx_draw_old(this: *mut c_void, count: u32, start: u32
         glog!("[gpu] Draw({count}, {start})");
     }
     draw_trace("plain", count, start, this);
+    {
+        static DUMPS: AtomicU32 = AtomicU32::new(0);
+        let d = DUMPS.fetch_add(1, Ordering::Relaxed);
+        if d < 40 {
+            dump_bound_ps(d, unsafe { real_context(this) });
+        } else if d >= 40 {
+            DUMPS.store(40, Ordering::Relaxed);
+        }
+    }
     {
         // The first plain draws of each size: the state dwords the topology might be in (`XB1_NEW_DRAW_PLAIN` is the old path).
         static SEEN: AtomicU32 = AtomicU32::new(0);
