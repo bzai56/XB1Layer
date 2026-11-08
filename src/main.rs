@@ -394,6 +394,35 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
             rlog!("[guard] skipped a render frame with a NULL render target entry (#{n})");
         }
         let ctx = *info.add(1);
+        if n < 3 {
+            // The vector the function indexes: [[r13 + 0x70] + 0x48] = {begin, end}; rbx = the index that was NULL.
+            let r13 = *(ctx.add(0xE0) as *const usize);
+            let rbx = *(ctx.add(0x90) as *const usize);
+            let o70 = *((r13 + 0x70) as *const usize);
+            let vec = *((o70 + 0x48) as *const usize);
+            let (b, e) = (*(vec as *const usize), *((vec + 8) as *const usize));
+            let cnt = (e.wrapping_sub(b)) / 8;
+            let mut ents = String::new();
+            for i in 0..cnt.min(6) {
+                ents.push_str(&format!(" {:#x}", *((b + i * 8) as *const usize)));
+            }
+            rlog!("[guard] index {rbx}, vector at {b:#x} of {cnt} entries:{ents}");
+        }
+        if std::env::var_os("XB1_PLANE_COPY").is_some() {
+            // Experiment: fill the empty vector with the first display plane's back buffer and run the instruction again.
+            let tex = gpu::first_plane_back_buffer();
+            if tex != 0 {
+                let r13 = *(ctx.add(0xE0) as *const usize);
+                let o70 = *((r13 + 0x70) as *const usize);
+                let vec = *((o70 + 0x48) as *const usize);
+                let (b, e) = (*(vec as *const usize), *((vec + 8) as *const usize));
+                for i in 0..((e - b) / 8) {
+                    *((b + i * 8) as *mut usize) = tex;
+                }
+                *(ctx.add(0xB0) as *mut usize) = tex; // rdi
+                return -1; // retry `mov rax, [rdi]`
+            }
+        }
         *(ctx.add(0xF8) as *mut u64) = (IMG_BASE.load(Ordering::Relaxed) + 0x1cd6bbf) as u64;
         return -1;
     }
@@ -782,6 +811,10 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
         let mut loc = RawBuf::new();
         describe(addr, &mut loc);
         rlog!("[exception] {code:#x} at {}", loc.as_str());
+        if is_cpp && std::env::var_os("XB1_CPPEXC").is_some() {
+            // Who threw (title return addresses on the stack), with the HRESULT the throw helper was called with (ecx at title+0x244f10).
+            rlog!("[cppexc] {}", caller_chain());
+        }
         if BACKTRACE_ON_CRASH.load(Ordering::Relaxed) && code == 0xC000_0005 {
             // Allocates, so only on request (XB1_BT=1): the heap is usually fine for faults in the layer.
             rlog!("{}", std::backtrace::Backtrace::force_capture());

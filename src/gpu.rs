@@ -1106,7 +1106,7 @@ fn create_back_buffer(context_proxy: *mut c_void) -> usize {
     }
     // D3D11_TEXTURE2D_DESC: width, height, mips, array, format, {samples, quality}, usage, bind, cpu, misc.
     let desc: [u32; 11] = [
-        DISPLAY_WIDTH, DISPLAY_HEIGHT, 1, 1, 28 /* R8G8B8A8_UNORM */, 1, 0, 0 /* DEFAULT */, 0x28 /* RENDER_TARGET | SHADER_RESOURCE (0x20|0x8) */, 0, 0,
+        DISPLAY_WIDTH, DISPLAY_HEIGHT, 1, 1, if std::env::var_os("XB1_PLANE_COPY").is_some() { 24 } else { 28 } /* R10G10B10A2_UNORM when the plane is copied to the swap chain, else R8G8B8A8_UNORM */, 1, 0, 0 /* DEFAULT */, 0x28 /* RENDER_TARGET | SHADER_RESOURCE (0x20|0x8) */, 0, 0,
     ];
     let create: unsafe extern "system" fn(*mut c_void, *const u32, *const c_void, *mut *mut c_void) -> HRESULT =
         unsafe { std::mem::transmute(*((*(device as *const *const usize)).add(5))) };
@@ -1128,6 +1128,12 @@ fn create_back_buffer(context_proxy: *mut c_void) -> usize {
 
 /// Chains handed out so far (`context_ext_212`), one per plane.
 static DISPLAY_CHAINS: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+
+/// The first display plane's back buffer (0 until created).
+pub fn first_plane_back_buffer() -> usize {
+    let c = DISPLAY_CHAINS[0].load(Ordering::Acquire);
+    if c == 0 { 0 } else { unsafe { (*(c as *const DisplayChain)).back_buffer } }
+}
 
 /// The back buffers of the display chains created so far.
 fn display_chain_buffers() -> Vec<usize> {
@@ -2142,6 +2148,32 @@ unsafe fn readback_texture(real: *mut c_void, res: *mut c_void, d: [u32; 11]) {
                     line.push_str(&format!(" ({x},{y}) {v:#010x} r{} g{} b{} a{};", v & 0x3ff, (v >> 10) & 0x3ff, (v >> 20) & 0x3ff, v >> 30));
                 }
             }
+            if let Ok(dir) = std::env::var("XB1_DUMP_IMG") {
+                // Whole texture to a PPM (formats 28 = RGBA8, 23 / 24 = R10G10B10A2) for looking at it: at most 40 files.
+                static IMGS: AtomicU32 = AtomicU32::new(0);
+                let k = IMGS.fetch_add(1, Ordering::Relaxed);
+                if k < 40 && matches!(d[4], 28 | 87 | 23 | 24) && d[0] > 64 && d[1] > 64 {
+                    let (w, h) = (d[0] as usize, d[1] as usize);
+                    let mut out = Vec::with_capacity(w * h * 3 + 32);
+                    out.extend_from_slice(format!("P6
+{w} {h}
+255
+").as_bytes());
+                    for yy in 0..h {
+                        let row = (m[0] + yy * pitch) as *const u8;
+                        for xx in 0..w {
+                            let v = *(row.add(xx * 4) as *const u32);
+                            let (r, g, b) = if d[4] == 28 || d[4] == 87 {
+                                ((v & 0xff) as u8, ((v >> 8) & 0xff) as u8, ((v >> 16) & 0xff) as u8)
+                            } else {
+                                ((((v & 0x3ff) >> 2) as u8), ((((v >> 10) & 0x3ff) >> 2) as u8), ((((v >> 20) & 0x3ff) >> 2) as u8))
+                            };
+                            out.extend_from_slice(&[r, g, b]);
+                        }
+                    }
+                    let _ = std::fs::write(format!("{dir}/img_{k:02}_{:x}_{}x{}_f{}.ppm", res as usize, w, h, d[4]), &out);
+                }
+            }
             glog!("[gpu] readback of the t0 texture (format {}):{}", d[4], line);
             let unmap: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*ctx_vt.add(15));
             unmap(real, st, 0);
@@ -2905,6 +2937,11 @@ pub unsafe extern "system" fn present_array(a1: u64, a2: u64, a3: u64, a4: u64, 
     static COUNT: AtomicU32 = AtomicU32::new(0);
     let n = COUNT.fetch_add(1, Ordering::Relaxed);
     PRESENT_ARRAY_CALLS.fetch_add(1, Ordering::Relaxed);
+    static A4_HIST: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
+    A4_HIST[(a4 as usize).min(7)].fetch_add(1, Ordering::Relaxed);
+    if n % 3000 == 0 {
+        glog!("[gpu] DXGIXPresentArray plane counts (a4 = 0..7): {:?}", A4_HIST.iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<_>>());
+    }
     FRAMES.fetch_add(1, Ordering::Relaxed);
     {
         let d = DRAWS_IN_FRAME.swap(0, Ordering::Relaxed);
@@ -2912,7 +2949,7 @@ pub unsafe extern "system" fn present_array(a1: u64, a2: u64, a3: u64, a4: u64, 
             glog!("[gpu] draws in the last frame: {d}");
         }
     }
-    if std::env::var_os("XB1_DUMP_PS").is_some() && (n == 150 || n == 900 || n == 1500) && T0_RES.load(Ordering::Relaxed) != 0 {
+    if std::env::var_os("XB1_DUMP_PS").is_some() && (n == 150 || n == 900 || n == 1500 || (n > 0 && n % 6000 == 0)) && T0_RES.load(Ordering::Relaxed) != 0 {
         let (res, real) = (T0_RES.load(Ordering::Relaxed), T0_REAL.load(Ordering::Relaxed));
         let packed = T0_DESC.load(Ordering::Relaxed);
         let mut d = [0u32; 11];
@@ -2953,8 +2990,36 @@ pub unsafe extern "system" fn present_array(a1: u64, a2: u64, a3: u64, a4: u64, 
     // `XB1_NO_PRESENT=1` keeps the old behaviour (log only).
     if a4 > 0 && a4 <= 4 && a5 > 0x10000 && std::env::var_os("XB1_NO_PRESENT").is_none() {
         let own = crate::display::SWAP_CHAIN.load(Ordering::Acquire);
+        if std::env::var_os("XB1_PLANE_COPY").is_some() && own != 0 {
+            // Experiment: the title renders its frame into the display plane texture; show it.
+            let plane_tex = first_plane_back_buffer();
+            let proxy = CONTEXT_PROXY.load(Ordering::Acquire);
+            let real = if proxy == 0 { 0 } else { unsafe { (*(proxy as *const Proxy)).real as usize } };
+            if plane_tex != 0 && real != 0 {
+                unsafe {
+                    let vt = *(own as *const *const usize);
+                    let get_buffer: unsafe extern "system" fn(*mut c_void, u32, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(9));
+                    let iid = GUID::from_u128(0x6f15aaf2_d208_4e89_9ab4_489535d34f9c);
+                    let mut buf: *mut c_void = ptr::null_mut();
+                    if get_buffer(own as *mut c_void, 0, &iid, &mut buf).0 >= 0 && !buf.is_null() {
+                        let ctx_vt = *(real as *const *const usize);
+                        let copy: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(*ctx_vt.add(47));
+                        copy(real as *mut c_void, buf, unwrap_object(plane_tex as *mut c_void));
+                        let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*((*(buf as *const *const usize)).add(2)));
+                        rel(buf);
+                    }
+                }
+            }
+        }
         for i in 0..a4 as usize {
             let plane = unsafe { *((a5 as *const usize).add(i)) };
+            if plane != 0 && plane != own {
+                static OLOG: AtomicU32 = AtomicU32::new(0);
+                if OLOG.fetch_add(1, Ordering::Relaxed) < 8 {
+                    let first = if readable(plane as *const c_void, 8) { unsafe { *(plane as *const usize) } } else { 0 };
+                    glog!("[gpu] DXGIXPresentArray #{n}: plane {i} {plane:#x} is not the swap chain (vtable {first:#x}, a display chain: {}), a4 {a4}", first == chain_vtable() as usize);
+                }
+            }
             if plane != 0 && plane == own {
                 // IDXGISwapChain::Present is slot 8; one vertical sync (the title's 2 means "every second refresh").
                 let vt = unsafe { *(plane as *const *const usize) };
