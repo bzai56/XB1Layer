@@ -717,6 +717,19 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                     return -1; // EXCEPTION_CONTINUE_EXECUTION
                 }
             }
+            // Forza Horizon 3 guard: the render function (title+0x1cd6830) reads a render target entry that is NULL for the
+            // first frames after the intro hands over (title+0x1cd6a0b, `mov rax, [rdi]`). Resume at the function's clean
+            // epilogue (title+0x1cd6bbf): that frame is skipped. `XB1_NO_FH3_GUARD=1` turns it off.
+            if code == 0xC000_0005 && addr == IMG_BASE.load(Ordering::Relaxed) + 0x1cd6a0b && std::env::var_os("XB1_NO_FH3_GUARD").is_none() {
+                static SKIPPED: AtomicUsize = AtomicUsize::new(0);
+                let n = SKIPPED.fetch_add(1, Ordering::Relaxed);
+                if n < 5 || n % 100 == 0 {
+                    rlog!("[guard] skipped a render frame with a NULL render target entry (#{n})");
+                }
+                let ctx = *info.add(1);
+                *(ctx.add(0xF8) as *mut u64) = (IMG_BASE.load(Ordering::Relaxed) + 0x1cd6bbf) as u64;
+                return -1;
+            }
             // A patched fast-fail site: report it, then end the process the way the original would.
             if FASTFAIL_SITES.iter().any(|s| s.load(Ordering::Relaxed) == addr) {
                 let ctx = *info.add(1);
