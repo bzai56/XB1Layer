@@ -221,6 +221,7 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
                 2 => proxy_release as usize,
                 3 => context_get_device as usize,
                 8 => ps_set_shader_resources as usize,
+                14 if std::env::var_os("XB1_PLAIN_MAP").is_none() => ctx_map_new as usize,
                 s => forward_context_thunk(unsafe { thunks.add(s * 32) }, s),
             };
             v.push((index_of(EMBED_TABLE + slot * 8), entry));
@@ -286,6 +287,10 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
         if !log_all && std::env::var_os("XB1_NO_FINISH_CL").is_none() {
             // Console index 113 (+0x768) = desktop 114 `FinishCommandList(restore, ID3D11CommandList** out)`.
             v.push((index_of(EMBED_TABLE + 113 * 8), ctx_finish_command_list as usize));
+            if std::env::var_os("XB1_NO_VSCS_SRV").is_none() {
+                v.push((index_of(EMBED_TABLE + 24 * 8), ctx_vs_srv as usize));
+                v.push((index_of(EMBED_TABLE + 66 * 8), ctx_cs_srv as usize));
+            }
             // Console index 57 (+0x5a8) = desktop 58 `ExecuteCommandList(commandList, restore)`.
             v.push((index_of(EMBED_TABLE + 57 * 8), ctx_execute_command_list as usize));
         }
@@ -1699,8 +1704,23 @@ fn draw_trace(kind: &str, count: u32, start: u32, ctx: *mut c_void) {
     }
 }
 
+/// Sets a full-target scissor rectangle on the context a draw is recorded on (`XB1_FULL_SCISSOR=1`): a rasterizer state with the
+/// scissor test enabled and no scissor rectangle ever set clips every pixel on the desktop (the title's own scissor call, if it
+/// has one, is not mapped).
+fn full_scissor(this: *mut c_void) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| env_flag("XB1_FULL_SCISSOR")) {
+        return;
+    }
+    let real = unsafe { real_context(this) };
+    let rect: [i32; 4] = [0, 0, 1920, 1080];
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const i32) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(45))) };
+    unsafe { f(real, 1, rect.as_ptr()) };
+}
+
 /// Counts the draw and, for `XB1_DRAW_PROBE=<present number>` / `XB1_DRAW_PROBE_FROM=<draw>`, probes the render target.
 fn frame_probe(this: *mut c_void) {
+    full_scissor(this);
     {
         // XB1_DRAW_PROBE=<present number>: from that present on, probe the first 90 draws.
         static PROBE: OnceLock<u32> = OnceLock::new();
@@ -1764,6 +1784,28 @@ unsafe extern "system" fn ctx_set_blend(this: *mut c_void, state: *mut c_void, f
     unsafe { f(real, state, factor, mask) };
 }
 
+static MAP_OK: AtomicU32 = AtomicU32::new(0);
+static MAP_FAIL: AtomicU32 = AtomicU32::new(0);
+
+/// Console index 14 = desktop `Map(resource, subresource, mapType, flags, mapped*)` (forwarded as before), with the results counted
+/// and the first failures logged: the title maps buffers that are DEFAULT usage on the desktop, where Map is not allowed.
+unsafe extern "system" fn ctx_map_new(this: *mut c_void, res: *mut c_void, sub: u32, map_type: u32, flags: u32, out: *mut c_void) -> HRESULT {
+    let real = unsafe { real_context(this) };
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut c_void) -> HRESULT = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(14))) };
+    let hr = unsafe { f(real, res, sub, map_type, flags, out) };
+    if hr.0 >= 0 {
+        MAP_OK.fetch_add(1, Ordering::Relaxed);
+    } else {
+        let n = MAP_FAIL.fetch_add(1, Ordering::Relaxed);
+        if n < 12 {
+            // buffer description: ByteWidth, Usage, BindFlags, CPUAccessFlags (GetDesc is slot 10)
+            let d = buffer_desc(res);
+            glog!("[gpu] Map({res:p}, sub {sub}, type {map_type}, flags {flags:#x}) failed {:#x}: buffer desc {:x?}", hr.0 as u32, d);
+        }
+    }
+    hr
+}
+
 /// Console index 57 = desktop 58 `ExecuteCommandList(commandList, restoreContextState)`: seen with exactly the pointers
 /// `FinishCommandList` returned as its first argument.
 unsafe extern "system" fn ctx_execute_command_list(this: *mut c_void, cl: *mut c_void, restore: usize) {
@@ -1776,8 +1818,14 @@ unsafe extern "system" fn ctx_execute_command_list(this: *mut c_void, cl: *mut c
     if cl.is_null() {
         return;
     }
+    if std::env::var_os("XB1_MIRROR_AT_RECORD").is_none() {
+        sync_placed_buffers(real);
+    }
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, i32) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(58))) };
-    unsafe { f(real, cl, (restore & 1) as i32) };
+    // A console keeps its bindings across command lists; the desktop clears the immediate context's state after a list unless the
+    // state is restored, which dropped bindings the title made once (a vertex shader's second buffer): always restore.
+    let restore_flag = if std::env::var_os("XB1_EXEC_RESTORE_AS_TITLE").is_some() { (restore & 1) as i32 } else { 1 };
+    unsafe { f(real, cl, restore_flag) };
 }
 
 /// Console index 113 = desktop 114 `FinishCommandList(restore, ppCommandList)`: the title records most of its drawing on deferred
@@ -1874,11 +1922,37 @@ unsafe extern "system" fn ctx_viewports(this: *mut c_void, count: u32, vp: *cons
     let real = unsafe { real_context(this) };
     let f: unsafe extern "system" fn(*mut c_void, u32, *const f32) =
         unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(44))) };
+    // Forza Horizon 3 passes a second kind of "viewport" (width 3.6e9, height 223) once per frame: not a valid desktop viewport (the
+    // limit is 32767), the runtime rejects it and the draws that follow lose their viewport. Use the full 1920x1080 target then.
+    if count >= 1 && !vp.is_null() && std::env::var_os("XB1_RAW_VIEWPORT").is_none() {
+        let v = unsafe { std::slice::from_raw_parts(vp, 6) };
+        if !(v[2].is_finite() && v[3].is_finite() && v[2] > 0.0 && v[3] > 0.0 && v[2] <= 16384.0 && v[3] <= 16384.0) {
+            static BAD: AtomicU32 = AtomicU32::new(0);
+            if BAD.fetch_add(1, Ordering::Relaxed) < 3 {
+                glog!("[gpu] RSSetViewports: invalid viewport {:?}: using 1920x1080", &v[..6]);
+            }
+            let full: [f32; 6] = [0.0, 0.0, 1920.0, 1080.0, 0.0, 1.0];
+            unsafe { f(real, 1, full.as_ptr()) };
+            return;
+        }
+    }
     unsafe { f(real, count, vp) };
 }
 
 /// Console index 8: `(pointer to a variable holding a view, ..)` -> `PSSetShaderResources(0, 1, views)`.
 unsafe extern "system" fn ctx_ps_srv(this: *mut c_void, views: *const *mut c_void, a3: usize, a4: usize) {
+    unsafe { srv_array(this, views, a3, a4, 8) }
+}
+/// Console index 24 = desktop 25 `VSSetShaderResources`: the same slot-array argument as the pixel stage (`(views*, 0, packed)`).
+unsafe extern "system" fn ctx_vs_srv(this: *mut c_void, views: *const *mut c_void, a3: usize, a4: usize) {
+    unsafe { srv_array(this, views, a3, a4, 25) }
+}
+/// Console index 66 = desktop 67 `CSSetShaderResources`.
+unsafe extern "system" fn ctx_cs_srv(this: *mut c_void, views: *const *mut c_void, a3: usize, a4: usize) {
+    unsafe { srv_array(this, views, a3, a4, 67) }
+}
+
+unsafe fn srv_array(this: *mut c_void, views: *const *mut c_void, a3: usize, a4: usize, desktop_slot: usize) {
     {
         static ALOG: AtomicU32 = AtomicU32::new(0);
         let n = ALOG.fetch_add(1, Ordering::Relaxed);
@@ -1909,7 +1983,7 @@ unsafe extern "system" fn ctx_ps_srv(this: *mut c_void, views: *const *mut c_voi
     }
     let real = unsafe { real_context(this) };
     let f: unsafe extern "system" fn(*mut c_void, u32, u32, *const *mut c_void) =
-        unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(8))) };
+        unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(desktop_slot))) };
     // The argument is an array of consecutive 8-byte slots (the slot number is the index; NULL means unbound) that ends at the
     // first value that is not a view: the Bink video shader reads three planes (`[Y, Cr, Cb, 0, ...]`), which were never bound
     // (first the count was fixed at 1, then the array was read with a wrong stride, which bound only two planes).
@@ -1927,13 +2001,26 @@ unsafe extern "system" fn ctx_ps_srv(this: *mut c_void, views: *const *mut c_voi
                 break;
             }
             restore_object_vtable(p as *mut c_void);
-            // Stale or foreign values after the real entries must not be bound: only real shader resource views.
+            // Stale or foreign values after the real entries must not be bound: only real shader resource views (a buffer UAV
+            // the title uses as one is converted).
+            let mut p = p;
             if i > 0 && (!has_image_vtable(p as *const c_void) || qi_kind(p as *mut c_void) != "SRV") {
-                break;
+                match if has_image_vtable(p as *const c_void) { uav_as_srv(p as *mut c_void) } else { None } {
+                    Some(srv) => p = srv,
+                    None => break,
+                }
             }
             list[i] = p as *mut c_void;
             i += 1;
             count = i;
+        }
+        if desktop_slot == 25 && readable(views as *const c_void, 32) {
+            static VLOG: AtomicU32 = AtomicU32::new(0);
+            if VLOG.fetch_add(1, Ordering::Relaxed) < 60 {
+                let q = unsafe { std::slice::from_raw_parts(views as *const usize, 4) };
+                let second = q[2];
+                glog!("[gpu] VS shader resources: raw array {:x?}, a3 {a3:#x}, a4 {a4:#x}; entry 2 an image-vtable object: {} (first qword {:#x}); interfaces of entry 2 (SRV, UAV, RTV, DSV): {:?}", q, second != 0 && second % 8 == 0 && readable(second as *const c_void, 8) && has_image_vtable(second as *const c_void), if second != 0 && readable(second as *const c_void, 8) { unsafe { *(second as *const usize) } } else { 0 }, view_interfaces(second as *mut c_void));
+            }
         }
         if count > 1 {
             static MLOG: AtomicU32 = AtomicU32::new(0);
@@ -1967,13 +2054,13 @@ unsafe extern "system" fn ctx_ps_srv(this: *mut c_void, views: *const *mut c_voi
                 }
             }
         }
+        CTX_SRVS.lock().unwrap().get_or_insert_with(Default::default).insert((real as usize, desktop_slot as u32), list[..count].iter().map(|p| *p as usize).collect());
         // Placed textures: upload what the title wrote into their memory (once, and again when it changes).
         for k in 0..count {
             let v = list[k];
             if v.is_null() || !has_image_vtable(v as *const c_void) {
                 continue;
             }
-            static VIEW_RES: std::sync::Mutex<Option<std::collections::HashMap<usize, usize>>> = std::sync::Mutex::new(None);
             let cached = VIEW_RES.lock().unwrap().as_ref().and_then(|m| m.get(&(v as usize)).copied());
             let res = match cached {
                 Some(r) => r,
@@ -2022,6 +2109,7 @@ const EXTENDED_CREATORS: [(usize, usize, usize); 14] = [
 
 /// Pixel shader objects and their bytecode; the last pixel shader the title bound.
 static PS_BYTECODE: std::sync::Mutex<Option<std::collections::HashMap<usize, Vec<u8>>>> = std::sync::Mutex::new(None);
+static VS_BYTECODE: std::sync::Mutex<Option<std::collections::HashMap<usize, Vec<u8>>>> = std::sync::Mutex::new(None);
 static LAST_PS: AtomicUsize = AtomicUsize::new(0);
 
 /// `XB1_DUMP_PS=<dir>`: writes the pixel shader bound at the first draws to `<dir>\ps_<n>.bin`.
@@ -2080,8 +2168,85 @@ fn dump_bound_ps(n: u32, real: *mut c_void) {
 
 /// `XB1_DRAW_PROBE=<frame>`: before each draw of that frame (the first 90), logs the current render target 0 (resource, size,
 /// format) and one pixel of it (960, 540), to find which draw writes the green-only values.
+/// Prints the fixed-function state of the context a draw is recorded on: viewport, scissor, rasterizer, blend, depth.
+unsafe fn probe_pipeline_state(real: *mut c_void, draw: u32) {
+    unsafe {
+        let vt = *(real as *const *const usize);
+        // RSGetViewports(&n, vp*) 95; RSGetScissorRects(&n, rects*) 96; RSGetState(&s) 94; OMGetBlendState(&s, factor, &mask) 91;
+        // OMGetDepthStencilState(&s, &ref) 92.
+        let get_vp: unsafe extern "system" fn(*mut c_void, *mut u32, *mut f32) = std::mem::transmute(*vt.add(95));
+        let mut n = 1u32;
+        let mut vp = [0f32; 6];
+        get_vp(real, &mut n, vp.as_mut_ptr());
+        let get_sc: unsafe extern "system" fn(*mut c_void, *mut u32, *mut i32) = std::mem::transmute(*vt.add(96));
+        let mut m = 1u32;
+        let mut rc = [0i32; 4];
+        get_sc(real, &mut m, rc.as_mut_ptr());
+        let get_rs: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = std::mem::transmute(*vt.add(94));
+        let mut rs: *mut c_void = ptr::null_mut();
+        get_rs(real, &mut rs);
+        let mut rd = [0u32; 10];
+        if !rs.is_null() {
+            let rvt = *(rs as *const *const usize);
+            let gd: unsafe extern "system" fn(*mut c_void, *mut u32) = std::mem::transmute(*rvt.add(7));
+            gd(rs, rd.as_mut_ptr());
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*rvt.add(2));
+            rel(rs);
+        }
+        let get_bs: unsafe extern "system" fn(*mut c_void, *mut *mut c_void, *mut f32, *mut u32) = std::mem::transmute(*vt.add(91));
+        let mut bs: *mut c_void = ptr::null_mut();
+        let mut fac = [0f32; 4];
+        let mut mask = 0u32;
+        get_bs(real, &mut bs, fac.as_mut_ptr(), &mut mask);
+        let mut bd = [0u32; 80];
+        if !bs.is_null() {
+            let bvt = *(bs as *const *const usize);
+            let gd: unsafe extern "system" fn(*mut c_void, *mut u32) = std::mem::transmute(*bvt.add(7));
+            gd(bs, bd.as_mut_ptr());
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*bvt.add(2));
+            rel(bs);
+        }
+        let get_ds: unsafe extern "system" fn(*mut c_void, *mut *mut c_void, *mut u32) = std::mem::transmute(*vt.add(92));
+        let mut ds: *mut c_void = ptr::null_mut();
+        let mut sref = 0u32;
+        get_ds(real, &mut ds, &mut sref);
+        let mut dd = [0u32; 14];
+        if !ds.is_null() {
+            let dvt = *(ds as *const *const usize);
+            let gd: unsafe extern "system" fn(*mut c_void, *mut u32) = std::mem::transmute(*dvt.add(7));
+            gd(ds, dd.as_mut_ptr());
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*dvt.add(2));
+            rel(ds);
+        }
+        if let Ok(dir) = std::env::var("XB1_DUMP_PS") {
+            // The shaders bound on this context (PSGetShader 74, VSGetShader 76), written once per shader.
+            let get_sh: unsafe extern "system" fn(*mut c_void, *mut *mut c_void, *mut c_void, *mut u32) = std::mem::transmute(*vt.add(74));
+            let get_vs: unsafe extern "system" fn(*mut c_void, *mut *mut c_void, *mut c_void, *mut u32) = std::mem::transmute(*vt.add(76));
+            for (kind, getf) in [("ps", get_sh), ("vs", get_vs)] {
+                let mut o: *mut c_void = ptr::null_mut();
+                getf(real, &mut o, ptr::null_mut(), ptr::null_mut());
+                if !o.is_null() {
+                    let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*((*(o as *const *const usize)).add(2)));
+                    rel(o);
+                    let bytes = if kind == "ps" { PS_BYTECODE.lock().unwrap().as_ref().and_then(|m| m.get(&(o as usize)).cloned()) } else { VS_BYTECODE.lock().unwrap().as_ref().and_then(|m| m.get(&(o as usize)).cloned()) };
+                    if let Some(b) = bytes {
+                        let path = format!("{dir}/ui_{kind}_{:x}.bin", o as usize);
+                        if !std::path::Path::new(&path).exists() {
+                            let _ = std::fs::write(&path, &b);
+                        }
+                        glog!("[gpu] probe draw {draw}: bound {kind} {o:p} ({} bytes)", b.len());
+                    }
+                }
+            }
+        }
+        glog!("[gpu] probe draw {draw}: viewport {:?} scissor {:?} | raster fill {} cull {} scissorEnable {} depthClip {} | blend rt0 en {} src {} dst {} mask {:#x} sampleMask {:#x} | depth en {} write {} func {} stencil {}",
+            &vp[..6], rc, rd[0], rd[1], rd[7], rd[6], bd[2], bd[3], bd[4], bd[9], mask, dd[0], dd[1], dd[2], dd[3]);
+    }
+}
+
 unsafe fn probe_render_target(real: *mut c_void, draw: u32) {
     unsafe {
+        probe_pipeline_state(real, draw);
         // The pixel shader's resources t0..t3: texture, size, format (PSGetShaderResources is desktop slot 73).
         let vt0 = *(real as *const *const usize);
         let get_srv: unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) = std::mem::transmute(*vt0.add(73));
@@ -2157,6 +2322,53 @@ static DRAWS_IN_FRAME: AtomicU32 = AtomicU32::new(0);
 static T0_RES: AtomicUsize = AtomicUsize::new(0);
 static T0_REAL: AtomicUsize = AtomicUsize::new(0);
 static T0_DESC: AtomicU64 = AtomicU64::new(0);
+
+/// Fraction of sampled pixels (every 61st) that are not all zero, plus the mean of the colour channels, for an RGBA8 or
+/// R10G10B10A2 1920x1080 texture; None if the copy fails. Used by `XB1_PLANE_STATS=1`.
+unsafe fn nonzero_stats(real: *mut c_void, res: *mut c_void, fmt: u32) -> Option<(f32, f32)> {
+    unsafe {
+        let ctx_vt = *(real as *const *const usize);
+        let get_device: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = std::mem::transmute(*ctx_vt.add(3));
+        let mut dev: *mut c_void = ptr::null_mut();
+        get_device(real, &mut dev);
+        if dev.is_null() {
+            return None;
+        }
+        let desc: [u32; 11] = [1920, 1080, 1, 1, fmt, 1, 0, 3, 0, 0x20000, 0];
+        let create: unsafe extern "system" fn(*mut c_void, *const u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(*((*(dev as *const *const usize)).add(5)));
+        let mut st: *mut c_void = ptr::null_mut();
+        if create(dev, desc.as_ptr(), ptr::null(), &mut st).0 < 0 || st.is_null() {
+            return None;
+        }
+        let copy: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(*ctx_vt.add(47));
+        copy(real, st, res);
+        let map: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32, *mut [usize; 3]) -> HRESULT = std::mem::transmute(*ctx_vt.add(14));
+        let mut m = [0usize; 3];
+        let mut out = None;
+        if map(real, st, 0, 1, 0, &mut m).0 >= 0 {
+            let pitch = m[1] & 0xffff_ffff;
+            let (mut nz, mut tot, mut sum) = (0u32, 0u32, 0u64);
+            let mut i = 0usize;
+            while i < 1920 * 1080 {
+                let (x, y) = (i % 1920, i / 1920);
+                let v = *((m[0] + y * pitch + x * 4) as *const u32);
+                let (r, g, b) = if fmt == 28 { (v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff) } else { ((v & 0x3ff) >> 2, ((v >> 10) & 0x3ff) >> 2, ((v >> 20) & 0x3ff) >> 2) };
+                if r | g | b != 0 {
+                    nz += 1;
+                }
+                sum += (r + g + b) as u64;
+                tot += 1;
+                i += 61;
+            }
+            out = Some((nz as f32 / tot as f32, sum as f32 / tot as f32 / 3.0));
+            let unmap: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*ctx_vt.add(15));
+            unmap(real, st, 0);
+        }
+        let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*((*(st as *const *const usize)).add(2)));
+        rel(st);
+        out
+    }
+}
 
 /// Copies a 2D texture into a staging texture and logs a few pixels (raw 32-bit values; as R10G10B10A2 for format 23/24).
 unsafe fn readback_texture(real: *mut c_void, res: *mut c_void, d: [u32; 11]) {
@@ -2279,6 +2491,17 @@ unsafe extern "system" fn device_create_extended<const SLOT: usize>(this: *mut c
                             glog!("[gpu] blend state #{nb}: write masks {:x?} (independent {}), rt0 {:x?}", masks, d[1], &d[2..10]);
                         }
                     }
+                }
+                if matches!(SLOT, 12 | 15 | 18) && a1 > 0x10000 && a2 > 16 && a2 < (1 << 22) {
+                    let bytes = unsafe { std::slice::from_raw_parts(a1 as *const u8, a2) };
+                    let d = parse_srv_decls(bytes);
+                    if d.iter().any(|x| x.kind == 1) {
+                        SHADER_DECLS.lock().unwrap().get_or_insert_with(Default::default).insert(unsafe { *out } as usize, d);
+                    }
+                }
+                if SLOT == 12 && a1 > 0x10000 && a2 > 16 && a2 < (1 << 22) {
+                    let bytes = unsafe { std::slice::from_raw_parts(a1 as *const u8, a2) }.to_vec();
+                    VS_BYTECODE.lock().unwrap().get_or_insert_with(Default::default).insert(unsafe { *out } as usize, bytes);
                 }
                 if SLOT == 15 && a1 > 0x10000 && a2 > 16 && a2 < (1 << 22) {
                     // Pixel shader bytecode by object (for `XB1_DUMP_PS`).
@@ -2432,6 +2655,371 @@ struct PlacedTexture {
 static PLACED_TEXTURES: std::sync::Mutex<Vec<PlacedTexture>> = std::sync::Mutex::new(Vec::new());
 /// Placed textures by resource, with the hash of the memory last uploaded and the present number of the last check.
 static PLACED_TEX_MAP: std::sync::Mutex<Option<std::collections::HashMap<usize, (PlacedTexture, u64, u32)>>> = std::sync::Mutex::new(None);
+
+/// View -> resource cache of the shader-resource binder (also read for the bound-texture statistics).
+static VIEW_RES: std::sync::Mutex<Option<std::collections::HashMap<usize, usize>>> = std::sync::Mutex::new(None);
+
+/// (distinct resources seen bound as shader resources, how many of those are placed textures, how many of those uploaded).
+fn bound_texture_stats() -> (usize, usize, usize) {
+    let view_res = VIEW_RES.lock().unwrap();
+    let map = PLACED_TEX_MAP.lock().unwrap();
+    let mut seen = std::collections::HashSet::new();
+    let (mut placed, mut up) = (0, 0);
+    if let Some(v) = view_res.as_ref() {
+        for r in v.values() {
+            if seen.insert(*r) {
+                if let Some(m) = map.as_ref() {
+                    if let Some(e) = m.get(r) {
+                        placed += 1;
+                        if e.1 != 0 {
+                            up += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (seen.len(), placed, up)
+}
+
+// ---------------------------------------------------------------------------------------
+// Typed shadows of structured buffers
+// ---------------------------------------------------------------------------------------
+//
+// A console buffer is plain memory; a shader reads it typed (`dcl_resource_buffer`, `ld` of 16 bytes at element index * stride) or
+// structured, whatever the buffer view says. The title's buffer views are created on STRUCTURED buffers with a stride (36, 160 ...)
+// and the UI vertex shader reads its vertices with typed loads: on the desktop a typed load from a structured view returns zeros, so
+// every UI quad collapsed. Before a draw whose shader declares a typed buffer at a slot where the title bound a structured view,
+// a small compute shader repacks the first components of each element into a typed shadow buffer (made once per view) and the
+// shadow's view is bound instead. `XB1_NO_TYPED_SHADOW=1` turns this off.
+
+#[derive(Clone, Copy)]
+struct BufView {
+    stride: u32,
+    first: u32,
+    num: u32,
+}
+#[derive(Clone)]
+struct SrvDecl {
+    reg: u32,
+    kind: u8, // 1 typed buffer, 2 structured, 3 raw
+    ty: u8,   // component type of a typed buffer: 5 float, 4 uint, 3 sint, ...
+}
+static BUF_VIEWS: std::sync::Mutex<Option<std::collections::HashMap<usize, BufView>>> = std::sync::Mutex::new(None);
+static SHADER_DECLS: std::sync::Mutex<Option<std::collections::HashMap<usize, Vec<SrvDecl>>>> = std::sync::Mutex::new(None);
+static CTX_SRVS: std::sync::Mutex<Option<std::collections::HashMap<(usize, u32), Vec<usize>>>> = std::sync::Mutex::new(None);
+static SHADOWS: std::sync::Mutex<Option<std::collections::HashMap<(usize, u32, u8), (usize, usize)>>> = std::sync::Mutex::new(None); // (view, comps, type) -> (shadow srv, shadow uav)
+static REPACK_CS: std::sync::Mutex<Option<std::collections::HashMap<(u32, u32), usize>>> = std::sync::Mutex::new(None);
+
+/// The shader resource declarations (`dcl_resource_*`) of a DXBC shader.
+fn parse_srv_decls(b: &[u8]) -> Vec<SrvDecl> {
+    let mut out = Vec::new();
+    if b.len() < 36 || &b[0..4] != b"DXBC" {
+        return out;
+    }
+    let rd = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    let chunks = rd(28) as usize;
+    for c in 0..chunks.min(32) {
+        let table = 32 + c * 4;
+        if table + 4 > b.len() {
+            continue;
+        }
+        let off = rd(table) as usize;
+        if off + 8 > b.len() {
+            continue;
+        }
+        let tag = &b[off..off + 4];
+        if tag != b"SHEX" && tag != b"SHDR" {
+            continue;
+        }
+        let size = rd(off + 4) as usize;
+        let end = (off + 8 + size).min(b.len());
+        let words: Vec<u32> = b[off + 8..end].chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
+        // The title's shaders have a console-specific block before the standard instruction stream: start at the first
+        // `dcl_globalFlags` (opcode 106, length 1).
+        let mut i = 2usize;
+        while i < words.len() && !(words[i] & 0x7ff == 106 && (words[i] >> 24) & 0x7f == 1) {
+            i += 1;
+        }
+        while i < words.len() {
+            let tok = words[i];
+            let op = tok & 0x7ff;
+            let len = ((tok >> 24) & 0x7f) as usize;
+            if len == 0 {
+                break;
+            }
+            match op {
+                88 if (tok >> 11) & 0x1f == 1 && i + 3 < words.len() => out.push(SrvDecl { reg: words[i + 2], kind: 1, ty: (words[i + 3] & 0xf) as u8 }),
+                161 if i + 2 < words.len() => out.push(SrvDecl { reg: words[i + 2], kind: 3, ty: 0 }),
+                162 if i + 2 < words.len() => out.push(SrvDecl { reg: words[i + 2], kind: 2, ty: 0 }),
+                _ => {}
+            }
+            i += len;
+        }
+        break;
+    }
+    out
+}
+
+/// Before a draw: for each typed buffer slot of `shader` where the title bound a structured view, bind a repacked typed shadow.
+static FIX_CALLS: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+
+fn fix_typed_buffer_srvs(real: *mut c_void, stage_slot: usize, shader: usize) {
+    FIX_CALLS[0].fetch_add(1, Ordering::Relaxed);
+    let Some(decls) = SHADER_DECLS.lock().unwrap().as_ref().and_then(|m| m.get(&shader).cloned()) else { return };
+    FIX_CALLS[1].fetch_add(1, Ordering::Relaxed);
+    if stage_slot == 25 {
+        static CLOG: AtomicU32 = AtomicU32::new(0);
+        if CLOG.fetch_add(1, Ordering::Relaxed) < 2 {
+            // Which pointers in the context object (the title's inlined state) are shader resource views?
+            let this = CURRENT_CTX_PROXY.with(|c| c.get());
+            if this != 0 {
+                let mut found = String::new();
+                for off in (0x100..0x600usize).step_by(8) {
+                    let q = unsafe { *((this + off) as *const usize) };
+                    if q > 0x10000 && q % 8 == 0 && readable(q as *const c_void, 8) && has_image_vtable(q as *const c_void) {
+                        let (a, b, c, d) = view_interfaces(q as *mut c_void);
+                        found.push_str(&format!(" +{off:#x}:{}{}{}{}", if a { "S" } else { "" }, if b { "U" } else { "" }, if c { "R" } else { "" }, if d { "D" } else { "" }));
+                    }
+                }
+                glog!("[gpu] context object {this:#x}: view-like pointers in the inlined state:{found}");
+            }
+        }
+    }
+    {
+        static RLOG: AtomicU32 = AtomicU32::new(0);
+        if stage_slot == 25 && RLOG.fetch_add(1, Ordering::Relaxed) < 4 {
+            // What the real context has bound at VS t0 / t1 (VSGetShaderResources is slot 84).
+            unsafe {
+                let vt = *(real as *const *const usize);
+                let get: unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) = std::mem::transmute(*vt.add(84));
+                let mut v = [ptr::null_mut::<c_void>(); 4];
+                get(real, 0, 4, v.as_mut_ptr());
+                glog!("[gpu] a draw with the typed-buffer vertex shader: real VS t0..t3 = {:?}; declared regs {:?}", v, decls.iter().map(|d| (d.reg, d.kind)).collect::<Vec<_>>());
+                for p in v.iter().filter(|p| !p.is_null()) {
+                    let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*((*(*p as *const *const usize)).add(2)));
+                    rel(*p);
+                }
+            }
+        }
+    }
+    let Some(list) = CTX_SRVS.lock().unwrap().as_ref().and_then(|m| m.get(&(real as usize, stage_slot as u32)).cloned()) else { return };
+    FIX_CALLS[2].fetch_add(1, Ordering::Relaxed);
+    let mut out = list.clone();
+    let mut changed = false;
+    for d in decls.iter().filter(|d| d.kind == 1) {
+        let reg = d.reg as usize;
+        if reg >= list.len() || list[reg] == 0 {
+            continue;
+        }
+        let view = list[reg];
+        let found = BUF_VIEWS.lock().unwrap().as_ref().and_then(|m| m.get(&view).copied());
+        {
+            static DLOG: AtomicU32 = AtomicU32::new(0);
+            if DLOG.fetch_add(1, Ordering::Relaxed) < 6 {
+                glog!("[gpu] typed buffer slot t{reg} of the shader: view {view:#x}, a structured view the layer knows: {}, srv list {:x?}", found.is_some(), list);
+            }
+        }
+        let Some(info) = found else { continue };
+        let words = (info.stride / 4) as usize;
+        let comps = words.clamp(1, 4) as u32;
+        if let Some(sh) = ensure_shadow_and_repack(real, view, info, comps, d.ty) {
+            FIX_CALLS[3].fetch_add(1, Ordering::Relaxed);
+            out[reg] = sh;
+            changed = true;
+        }
+    }
+    if changed {
+        let vt = unsafe { *(real as *const *const usize) };
+        let f: unsafe extern "system" fn(*mut c_void, u32, u32, *const usize) = unsafe { std::mem::transmute(*vt.add(stage_slot)) };
+        unsafe { f(real, 0, out.len() as u32, out.as_ptr()) };
+    }
+}
+
+fn ensure_shadow_and_repack(real: *mut c_void, view: usize, info: BufView, comps: u32, ty: u8) -> Option<usize> {
+    let vt = unsafe { *(real as *const *const usize) };
+    let key = (view, comps, ty);
+    let existing = SHADOWS.lock().unwrap().as_ref().and_then(|m| m.get(&key).copied());
+    let (srv, uav) = match existing {
+        Some(x) => x,
+        None => unsafe {
+            let get_device: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = std::mem::transmute(*vt.add(3));
+            let mut dev: *mut c_void = ptr::null_mut();
+            get_device(real, &mut dev);
+            if dev.is_null() {
+                return None;
+            }
+            let dvt = *(dev as *const *const usize);
+            let n = info.num.max(1);
+            // typed shadow: raw-capable buffer (UAV written as bytes, typed SRV read)
+            let bdesc: [u32; 6] = [n * comps * 4, 0, 0x88, 0, 0x20, 0];
+            let create_buf: unsafe extern "system" fn(*mut c_void, *const u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(*dvt.add(3));
+            let mut buf: *mut c_void = ptr::null_mut();
+            if create_buf(dev, bdesc.as_ptr(), ptr::null(), &mut buf).0 < 0 || buf.is_null() {
+                return None;
+            }
+            let fmt: u32 = match (ty, comps) {
+                (4, 1) => 42,
+                (4, 2) => 17,
+                (4, 3) => 7,
+                (4, _) => 3,
+                (3, 1) => 43,
+                (3, 2) => 18,
+                (3, 3) => 8,
+                (3, _) => 4,
+                (_, 1) => 41,
+                (_, 2) => 16,
+                (_, 3) => 6,
+                (_, _) => 2,
+            };
+            let sdesc: [u32; 8] = [fmt, 1, 0, n, 0, 0, 0, 0];
+            let create_srv: unsafe extern "system" fn(*mut c_void, *mut c_void, *const u32, *mut *mut c_void) -> HRESULT = std::mem::transmute(*dvt.add(7));
+            let mut s: *mut c_void = ptr::null_mut();
+            if create_srv(dev, buf, sdesc.as_ptr(), &mut s).0 < 0 || s.is_null() {
+                glog!("[gpu] typed shadow: SRV creation failed (format {fmt}, {n} elements)");
+                return None;
+            }
+            let udesc: [u32; 8] = [39, 1, 0, n * comps, 1, 0, 0, 0];
+            let create_uav: unsafe extern "system" fn(*mut c_void, *mut c_void, *const u32, *mut *mut c_void) -> HRESULT = std::mem::transmute(*dvt.add(8));
+            let mut u: *mut c_void = ptr::null_mut();
+            if create_uav(dev, buf, udesc.as_ptr(), &mut u).0 < 0 || u.is_null() {
+                glog!("[gpu] typed shadow: UAV creation failed");
+                return None;
+            }
+            static NLOG: AtomicU32 = AtomicU32::new(0);
+            if NLOG.fetch_add(1, Ordering::Relaxed) < 8 {
+                glog!("[gpu] typed shadow for structured view {view:#x} (stride {}, {} elements): {} component(s), format {fmt}", info.stride, n, comps);
+            }
+            SHADOWS.lock().unwrap().get_or_insert_with(Default::default).insert(key, (s as usize, u as usize));
+            (s as usize, u as usize)
+        },
+    };
+    // the repack compute shader for (stride words, components)
+    let words = (info.stride / 4).max(1);
+    let cs_key = (words, comps);
+    let cached = REPACK_CS.lock().unwrap().as_ref().and_then(|m| m.get(&cs_key).copied());
+    let cs = match cached {
+        Some(c) => c,
+        None => unsafe {
+            let src = format!(
+                "struct E {{ uint v[{words}]; }};\nStructuredBuffer<E> src : register(t0);\nRWByteAddressBuffer dst : register(u0);\n[numthreads(64,1,1)] void main(uint3 id : SV_DispatchThreadID) {{ uint n, s; src.GetDimensions(n, s); if (id.x >= n) return; E e = src[id.x]; [unroll] for (uint c = 0; c < {comps}; c++) dst.Store((id.x * {comps} + c) * 4, e.v[c]); }}\n"
+            );
+            let code = crate::overlay::compile_hlsl(&src, b"cs_5_0\0", b"main\0")?;
+            let get_device: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = std::mem::transmute(*vt.add(3));
+            let mut dev: *mut c_void = ptr::null_mut();
+            get_device(real, &mut dev);
+            let dvt = *(dev as *const *const usize);
+            let create_cs: unsafe extern "system" fn(*mut c_void, *const u8, usize, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(*dvt.add(18));
+            let mut c: *mut c_void = ptr::null_mut();
+            if create_cs(dev, code.as_ptr(), code.len(), ptr::null(), &mut c).0 < 0 || c.is_null() {
+                return None;
+            }
+            REPACK_CS.lock().unwrap().get_or_insert_with(Default::default).insert(cs_key, c as usize);
+            c as usize
+        },
+    };
+    unsafe {
+        // CSSetShader 69, CSSetShaderResources 67, CSSetUnorderedAccessViews 68, Dispatch 41
+        let set_cs: unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, u32) = std::mem::transmute(*vt.add(69));
+        let set_srv: unsafe extern "system" fn(*mut c_void, u32, u32, *const usize) = std::mem::transmute(*vt.add(67));
+        let set_uav: unsafe extern "system" fn(*mut c_void, u32, u32, *const usize, *const u32) = std::mem::transmute(*vt.add(68));
+        let dispatch: unsafe extern "system" fn(*mut c_void, u32, u32, u32) = std::mem::transmute(*vt.add(41));
+        let null = [0usize];
+        set_cs(real, cs as *mut c_void, ptr::null(), 0);
+        set_srv(real, 0, 1, &view);
+        set_uav(real, 0, 1, &uav, ptr::null());
+        dispatch(real, (info.num + 63) / 64, 1, 1);
+        set_uav(real, 0, 1, null.as_ptr(), ptr::null());
+        set_srv(real, 0, 1, null.as_ptr());
+        set_cs(real, ptr::null_mut(), ptr::null(), 0);
+    }
+    Some(srv)
+}
+
+static UAV_AS_SRV: std::sync::Mutex<Option<std::collections::HashMap<usize, usize>>> = std::sync::Mutex::new(None);
+
+/// A buffer view the title binds as a shader resource but that is an unordered access view on the desktop (a console buffer view
+/// is one kind of object): an equivalent shader resource view of the same buffer range, made once.
+fn uav_as_srv(obj: *mut c_void) -> Option<usize> {
+    if let Some(v) = UAV_AS_SRV.lock().unwrap().as_ref().and_then(|m| m.get(&(obj as usize)).copied()) {
+        return Some(v);
+    }
+    unsafe {
+        // QueryInterface for ID3D11UnorderedAccessView
+        let iid = GUID::from_u128(0x28acf509_7f5c_48f6_8611_f316010a6380);
+        let vt = *(obj as *const *const usize);
+        let qi: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt);
+        let mut q: *mut c_void = ptr::null_mut();
+        if qi(obj, &iid, &mut q).0 < 0 || q.is_null() {
+            return None;
+        }
+        let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(2));
+        rel(q);
+        let get_res: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = std::mem::transmute(*vt.add(7));
+        let mut res: *mut c_void = ptr::null_mut();
+        get_res(obj, &mut res);
+        if res.is_null() {
+            return None;
+        }
+        let get_desc: unsafe extern "system" fn(*mut c_void, *mut u32) = std::mem::transmute(*vt.add(8));
+        let mut d = [0u32; 8];
+        get_desc(obj, d.as_mut_ptr());
+        let get_device: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = std::mem::transmute(*vt.add(3));
+        let mut dev: *mut c_void = ptr::null_mut();
+        get_device(obj, &mut dev);
+        if dev.is_null() || d[1] != 1 {
+            return None;
+        }
+        // SRV desc: format, dimension 1 (buffer), first element, number of elements
+        let sdesc: [u32; 8] = [d[0], 1, d[2], d[3], 0, 0, 0, 0];
+        let dvt = *(dev as *const *const usize);
+        let create_srv: unsafe extern "system" fn(*mut c_void, *mut c_void, *const u32, *mut *mut c_void) -> HRESULT = std::mem::transmute(*dvt.add(7));
+        let mut srv: *mut c_void = ptr::null_mut();
+        let hr = create_srv(dev, res, sdesc.as_ptr(), &mut srv);
+        static NLOG: AtomicU32 = AtomicU32::new(0);
+        if NLOG.fetch_add(1, Ordering::Relaxed) < 6 {
+            glog!("[gpu] a buffer UAV {obj:p} bound as a shader resource: SRV of the same buffer (format {}, first {}, {} elements) -> {:#x} {srv:p}", d[0], d[2], d[3], hr.0 as u32);
+        }
+        if hr.0 < 0 || srv.is_null() {
+            return None;
+        }
+        // remember a structured source for the typed-shadow path
+        let bd = buffer_desc(res);
+        if bd[4] & 0x40 != 0 && bd[5] >= 4 {
+            BUF_VIEWS.lock().unwrap().get_or_insert_with(Default::default).insert(srv as usize, BufView { stride: bd[5], first: d[2], num: d[3] });
+        }
+        UAV_AS_SRV.lock().unwrap().get_or_insert_with(Default::default).insert(obj as usize, srv as usize);
+        Some(srv as usize)
+    }
+}
+
+/// Which view interfaces an object answers `QueryInterface` for: (SRV, UAV, RTV, DSV).
+fn view_interfaces(obj: *mut c_void) -> (bool, bool, bool, bool) {
+    if obj.is_null() || (obj as usize) % 8 != 0 || !readable(obj as *const c_void, 8) || !has_image_vtable(obj as *const c_void) {
+        return (false, false, false, false);
+    }
+    let ids = [
+        0xb0e06fe0_8192_4e1a_b1ca_36d7414710b2u128,
+        0x28acf509_7f5c_48f6_8611_f316010a6380u128,
+        0xdfdba067_0b8d_4865_875b_d7b4516cc164u128,
+        0x9fdac92a_1876_48c3_afad_25b94f84a9b6u128,
+    ];
+    let mut r = [false; 4];
+    for (k, id) in ids.iter().enumerate() {
+        let iid = GUID::from_u128(*id);
+        unsafe {
+            let vt = *(obj as *const *const usize);
+            let qi: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt);
+            let mut q: *mut c_void = ptr::null_mut();
+            if qi(obj, &iid, &mut q).0 >= 0 && !q.is_null() {
+                r[k] = true;
+                let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vt.add(2));
+                rel(q);
+            }
+        }
+    }
+    (r[0], r[1], r[2], r[3])
+}
 
 /// Element layout of a texture format: (block width, block height, bytes per element), or None if not handled.
 fn element_layout(fmt: u32) -> Option<(usize, usize, usize)> {
@@ -2603,10 +3191,16 @@ fn register_placed_buffer(resource: *mut c_void, memory: usize, size: usize) {
 /// into the context object (`+0x178`, `+0x180`, `+0x188`, with dirty bits in `+0x168`) instead of
 /// calling a bind method; applying them is the draw's job. Binds whichever of those fields holds an
 /// object we created, by creating slot, and uses a triangle list.
+thread_local! {
+    static CURRENT_CTX_PROXY: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn apply_inlined_state(this: *mut c_void, real: *mut c_void) {
+    CURRENT_CTX_PROXY.with(|c| c.set(this as usize));
     static LOGS: AtomicU32 = AtomicU32::new(0);
     let vt = unsafe { *(real as *const *const usize) };
     let mut bound = [0usize; 3];
+    let (mut vs_obj, mut ps_obj) = (0usize, 0usize);
     for (i, off) in [0x178usize, 0x180, 0x188].iter().enumerate() {
         let obj = unsafe { *((this as usize + off) as *const usize) };
         if obj < 0x10000 || obj % 8 != 0 {
@@ -2616,6 +3210,11 @@ fn apply_inlined_state(this: *mut c_void, real: *mut c_void) {
         let Some(kind) = kind else { continue };
         restore_object_vtable(obj as *mut c_void);
         bound[i] = kind;
+        if kind == 12 {
+            vs_obj = obj;
+        } else if kind == 15 {
+            ps_obj = obj;
+        }
         match kind {
             11 => {
                 let f: unsafe extern "system" fn(*mut c_void, *mut c_void) = unsafe { std::mem::transmute(*vt.add(17)) };
@@ -2628,6 +3227,23 @@ fn apply_inlined_state(this: *mut c_void, real: *mut c_void) {
             }
             _ => {}
         }
+    }
+    if std::env::var_os("XB1_NO_TYPED_SHADOW").is_none() && SHADER_DECLS.lock().unwrap().as_ref().map_or(false, |m| !m.is_empty()) {
+        // The shaders actually bound on this context (the title binds some through explicit calls, some through the inlined
+        // state): VSGetShader is slot 76, PSGetShader 74.
+        unsafe {
+            for (stage_slot, getter) in [(25usize, 76usize), (8usize, 74usize)] {
+                let get: unsafe extern "system" fn(*mut c_void, *mut *mut c_void, *mut c_void, *mut u32) = std::mem::transmute(*vt.add(getter));
+                let mut o: *mut c_void = ptr::null_mut();
+                get(real, &mut o, ptr::null_mut(), ptr::null_mut());
+                if !o.is_null() {
+                    let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*((*(o as *const *const usize)).add(2)));
+                    rel(o);
+                    fix_typed_buffer_srvs(real, stage_slot, o as usize);
+                }
+            }
+        }
+        let _ = (vs_obj, ps_obj);
     }
     let t: unsafe extern "system" fn(*mut c_void, u32) = unsafe { std::mem::transmute(*vt.add(24)) };
     unsafe { t(real, 4) };
@@ -2647,7 +3263,24 @@ extern "system" fn sync_before_draw(this: *mut c_void) {
     if *NO_MIRROR.get_or_init(|| env_flag("XB1_NO_MIRROR")) {
         return;
     }
-    let Ok(mut placed) = PLACED_BUFFERS.try_lock() else { return };
+    // Draws recorded on a deferred context are mirrored when the command list is executed (see `sync_placed_buffers`): an upload
+    // recorded into one list does not reach the other lists, and `try_lock` silently dropped uploads when two threads recorded.
+    if !is_immediate_context(this) && std::env::var_os("XB1_MIRROR_AT_RECORD").is_none() {
+        return;
+    }
+    sync_placed_buffers(real);
+}
+
+/// Whether `this` (a context proxy) is the immediate context.
+fn is_immediate_context(this: *mut c_void) -> bool {
+    let p = CONTEXT_PROXY.load(Ordering::Acquire);
+    p == 0 || p == this as usize
+}
+
+/// Uploads every placed buffer whose memory changed since the last upload, through `real` (a real context): called in front of
+/// draws on the immediate context and in front of every `ExecuteCommandList`.
+fn sync_placed_buffers(real: *mut c_void) {
+    let Ok(mut placed) = PLACED_BUFFERS.lock() else { return };
     // ID3D11DeviceContext::UpdateSubresource is slot 48.
     let update: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *const c_void, *const c_void, u32, u32) =
         unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(48))) };
@@ -2960,6 +3593,36 @@ unsafe fn create_view(this: *mut c_void, slot: usize, name: &str, resource: *mut
         }
     }
     let hr = unsafe { f(p.real, unwrap_object(resource), desc, out) };
+    if slot == 7 && hr.0 >= 0 && !out.is_null() && !desc.is_null() && !resource.is_null() && readable(resource as *const c_void, 8) {
+        let real_res = unwrap_object(resource);
+        let vt = unsafe { *(real_res as *const *const usize) };
+        let get_type: unsafe extern "system" fn(*mut c_void, *mut u32) = unsafe { std::mem::transmute(*vt.add(7)) };
+        let mut dim = 0u32;
+        unsafe { get_type(real_res, &mut dim) };
+        if dim == 1 {
+            let bd = buffer_desc(real_res);
+            if bd[4] & 0x40 != 0 && bd[5] >= 4 {
+                let dw = unsafe { std::slice::from_raw_parts(desc as *const u32, 4) };
+                let view = unsafe { *out } as usize;
+                BUF_VIEWS.lock().unwrap().get_or_insert_with(Default::default).insert(view, BufView { stride: bd[5], first: dw[2], num: dw[3] });
+            }
+        }
+    }
+    if slot == 7 && !resource.is_null() && readable(resource as *const c_void, 8) {
+        // Buffer views (the UI vertex shader reads its vertices from two typed buffer views): log the description and result.
+        let real_res = unwrap_object(resource);
+        let vt = unsafe { *(real_res as *const *const usize) };
+        let get_type: unsafe extern "system" fn(*mut c_void, *mut u32) = unsafe { std::mem::transmute(*vt.add(7)) };
+        let mut dim = 0u32;
+        unsafe { get_type(real_res, &mut dim) };
+        if dim == 1 {
+            static BLOG: AtomicU32 = AtomicU32::new(0);
+            if BLOG.fetch_add(1, Ordering::Relaxed) < 14 {
+                let bd = buffer_desc(real_res);
+                glog!("[gpu] CreateShaderResourceView on a BUFFER {real_res:p} (bytes {}, usage {}, bind {:#x}, misc {:#x}, stride {}): desc {} -> {:#x}", bd[0], bd[1], bd[2], bd[4], bd[5], safe_dump(desc as u64, 32), hr.0 as u32);
+            }
+        }
+    }
     if hr.0 >= 0 && !out.is_null() {
         shift_view_vtable(unsafe { *out });
         // Once per kind: the vtable of the created view, to identify unknown objects by vtable.
@@ -3174,6 +3837,31 @@ pub unsafe extern "system" fn present_array(a1: u64, a2: u64, a3: u64, a4: u64, 
     if n == 1500 {
         dump_placed_textures();
     }
+    if n > 0 && n % 600 == 0 && std::env::var_os("XB1_PLANE_STATS").is_some() {
+        let proxy = CONTEXT_PROXY.load(Ordering::Acquire);
+        let own = crate::display::SWAP_CHAIN.load(Ordering::Acquire);
+        let plane = first_plane_back_buffer();
+        if proxy != 0 {
+            let real = unsafe { (*(proxy as *const Proxy)).real };
+            let plane_fmt = if std::env::var_os("XB1_PLANE_COPY").is_some() { 24 } else { 28 };
+            let a = if plane != 0 { unsafe { nonzero_stats(real, plane as *mut c_void, plane_fmt) } } else { None };
+            let mut b = None;
+            if own != 0 {
+                unsafe {
+                    let vt = *(own as *const *const usize);
+                    let get_buffer: unsafe extern "system" fn(*mut c_void, u32, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(9));
+                    let iid = GUID::from_u128(0x6f15aaf2_d208_4e89_9ab4_489535d34f9c);
+                    let mut buf: *mut c_void = ptr::null_mut();
+                    if get_buffer(own as *mut c_void, 0, &iid, &mut buf).0 >= 0 && !buf.is_null() {
+                        b = nonzero_stats(real, buf, 24);
+                        let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*((*(buf as *const *const usize)).add(2)));
+                        rel(buf);
+                    }
+                }
+            }
+            glog!("[gpu] present {n}: UI plane (non-zero share, mean) {:?}; swap chain {:?}; typed shadows: draws with shaders {} / with typed decls {} / with a recorded SRV list {} / repacked {}; decl shaders {}, structured views {}", a, b, FIX_CALLS[0].load(Ordering::Relaxed), FIX_CALLS[1].load(Ordering::Relaxed), FIX_CALLS[2].load(Ordering::Relaxed), FIX_CALLS[3].load(Ordering::Relaxed), SHADER_DECLS.lock().unwrap().as_ref().map_or(0, |m| m.len()), BUF_VIEWS.lock().unwrap().as_ref().map_or(0, |m| m.len()));
+        }
+    }
     if std::env::var_os("XB1_DUMP_PS").is_some() && (n == 150 || n == 900 || n == 1500 || (n > 0 && n % 6000 == 0)) && T0_RES.load(Ordering::Relaxed) != 0 {
         let (res, real) = (T0_RES.load(Ordering::Relaxed), T0_REAL.load(Ordering::Relaxed));
         let packed = T0_DESC.load(Ordering::Relaxed);
@@ -3293,7 +3981,7 @@ pub unsafe extern "system" fn present_array(a1: u64, a2: u64, a3: u64, a4: u64, 
             let mut t = T.lock().unwrap();
             let rate = t.map(|t0| 300.0 / t0.elapsed().as_secs_f64()).unwrap_or(0.0);
             *t = Some(std::time::Instant::now());
-            glog!("[gpu] DXGIXPresentArray: {n} calls so far ({rate:.1} presents per second over the last 300); blend binds by rt0 write mask {:?}; UpdateSubresource calls {}, CopyResource calls {}", BLEND_BINDS.iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<_>>(), UPD_COUNT.load(Ordering::Relaxed), COPY_COUNT.load(Ordering::Relaxed));
+            glog!("[gpu] DXGIXPresentArray: {n} calls so far ({rate:.1} presents per second over the last 300); blend binds by rt0 write mask {:?}; UpdateSubresource calls {}, CopyResource calls {}; Map ok/failed {}/{}; bound textures (distinct, placed, uploaded) {:?}", BLEND_BINDS.iter().map(|c| c.load(Ordering::Relaxed)).collect::<Vec<_>>(), UPD_COUNT.load(Ordering::Relaxed), COPY_COUNT.load(Ordering::Relaxed), MAP_OK.load(Ordering::Relaxed), MAP_FAIL.load(Ordering::Relaxed), bound_texture_stats());
         }
     }
     0

@@ -52,6 +52,30 @@ static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::ne
 
 type D3DCompileFn = unsafe extern "system" fn(*const c_void, usize, *const u8, *const c_void, *const c_void, *const u8, *const u8, u32, u32, *mut *mut c_void, *mut *mut c_void) -> i32;
 
+/// Compiles `source` (HLSL) for `target` (e.g. `b"cs_5_0\0"`) and `entry` (NUL-terminated) with d3dcompiler_47.
+pub unsafe fn compile_hlsl(source: &str, target: &[u8], entry: &[u8]) -> Option<Vec<u8>> {
+    unsafe {
+        let m = LoadLibraryA(b"d3dcompiler_47.dll\0".as_ptr());
+        if m.is_null() {
+            return None;
+        }
+        let f = GetProcAddress(m, b"D3DCompile\0".as_ptr());
+        if f.is_null() {
+            return None;
+        }
+        let f: D3DCompileFn = std::mem::transmute(f);
+        let mut code: *mut c_void = std::ptr::null_mut();
+        let mut err: *mut c_void = std::ptr::null_mut();
+        let hr = f(source.as_ptr() as *const c_void, source.len(), std::ptr::null(), std::ptr::null(), std::ptr::null(), entry.as_ptr(), target.as_ptr(), 0, 0, &mut code, &mut err);
+        if hr < 0 || code.is_null() {
+            eprintln!("[overlay] D3DCompile failed: {hr:#x}");
+            return None;
+        }
+        let blob: ID3DBlob = Interface::from_raw(code);
+        Some(std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec())
+    }
+}
+
 unsafe fn compile(target: &[u8], entry: &[u8]) -> Option<Vec<u8>> {
     unsafe {
         let m = LoadLibraryA(b"d3dcompiler_47.dll\0".as_ptr());
