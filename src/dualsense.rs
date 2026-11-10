@@ -112,7 +112,8 @@ fn open_dualsense() -> Option<*mut c_void> {
 /// 0x01 (10 bytes) and Bluetooth full report 0x31 (78 bytes) are understood.
 fn parse(b: &[u8]) -> Option<(u32, [f32; 6])> {
     let (sticks, l2, r2, b1, b2) = match (*b.first()?, b.len()) {
-        (0x01, n) if n >= 60 => (&b[1..5], b[5], b[6], b[8], b[9]),
+        // USB reports are 64 bytes; over Bluetooth Windows pads the 10-byte simple report 0x01 to the 78-byte maximum, so only a 64-byte one is the USB layout.
+        (0x01, 64) => (&b[1..5], b[5], b[6], b[8], b[9]),
         (0x01, n) if n >= 10 => (&b[1..5], b[8], b[9], b[5], b[6]),
         (0x31, n) if n >= 12 => (&b[2..6], b[6], b[7], b[9], b[10]),
         _ => return None,
