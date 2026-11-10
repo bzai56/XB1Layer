@@ -123,14 +123,14 @@ fn game_name() -> &'static str {
     })
 }
 
-/// `<game> - <fps> FPS - XB1Layer` (the FPS part once it is known).
+/// `XB1Layer - <game> - <fps> FPS` (the FPS part once it is known).
 fn window_title(fps: Option<u32>) -> String {
     let name = game_name();
     match (name.is_empty(), fps) {
         (true, None) => "XB1Layer".to_string(),
-        (true, Some(f)) => format!("{f} FPS - XB1Layer"),
-        (false, None) => format!("{name} - XB1Layer"),
-        (false, Some(f)) => format!("{name} - {f} FPS - XB1Layer"),
+        (true, Some(f)) => format!("XB1Layer - {f} FPS"),
+        (false, None) => format!("XB1Layer - {name}"),
+        (false, Some(f)) => format!("XB1Layer - {name} - {f} FPS"),
     }
 }
 
