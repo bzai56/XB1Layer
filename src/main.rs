@@ -544,6 +544,18 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                                     }
                                 }
                             }
+                            if let Ok(spec) = std::env::var("XB1_WATCH_REGS") {
+                                // XB1_WATCH_REGS="rax,rdx": the register values at every hit.
+                                use std::fmt::Write;
+                                for rn in spec.split(',') {
+                                    let slot = match rn.trim() {
+                                        "rax" => 0x78, "rcx" => 0x80, "rdx" => 0x88, "rbx" => 0x90, "rsi" => 0xA8, "rdi" => 0xB0,
+                                        "r8" => 0xB8, "r9" => 0xC0, "r10" => 0xC8, "r11" => 0xD0, "r12" => 0xD8, "r13" => 0xE0,
+                                        "r14" => 0xE8, "r15" => 0xF0, "rsp" => 0x98, "rbp" => 0xA0, _ => continue,
+                                    };
+                                    let _ = write!(out, " {}={:#x}", rn.trim(), reg(slot));
+                                }
+                            }
                             let have_q = std::env::var_os("XB1_WATCH_Q").is_some();
                             if let Some(spec) = std::env::var("XB1_WATCH_STR").ok() {
                                 // XB1_WATCH_STR="rdx,r8": for each register print the text found at it, or

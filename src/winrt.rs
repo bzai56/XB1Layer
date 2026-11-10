@@ -1429,8 +1429,26 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         wlog!("[winrt] {} slot {N}: arg1 is a COM object -> treated as an event subscription", o.class);
         return HRESULT(0);
     }
+    if o.class == "Windows.Xbox.Input.Controller.Controllers (element 0)" && matches!(N, 7 | 12 | 38 | 41) {
+        unsafe extern "system" { fn RtlCaptureStackBackTrace(skip: u32, count: u32, frames: *mut *mut c_void, hash: *mut u32) -> u16; }
+        static SEEN: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+        let mut frames = [ptr::null_mut::<c_void>(); 2];
+        unsafe { RtlCaptureStackBackTrace(0, 2, frames.as_mut_ptr(), ptr::null_mut()) };
+        let (base, _) = crate::image_range();
+        let key = (N, (frames[0] as usize).wrapping_sub(base));
+        let mut g = SEEN.lock().unwrap();
+        if !g.contains(&key) {
+            g.push(key);
+            eprintln!("[input] controller element slot {N} called from title+{:#x} / {:#x}", key.1, (frames[1] as usize).wrapping_sub(base));
+        }
+    }
     // `IController::get_User` (slot 6 on a controller element): the shared user.
     if o.class.starts_with("Windows.Xbox.Input.Controller.Controllers (element") && !o.class.contains('#') && N == 6 && is_writable(arg1) {
+        if std::env::var_os("XB1_PAD_SLOT6_READING").is_some() {
+            let r = create_generic(&format!("{}#slot12", o.class), &o.iid);
+            unsafe { *(arg1 as *mut *mut c_void) = r };
+            return HRESULT(0);
+        }
         unsafe { *(arg1 as *mut *mut c_void) = shared_user() };
         wlog!("[winrt] controller slot 6 -> the shared user element");
         return HRESULT(0);

@@ -1115,3 +1115,11 @@ Real input is now wired to the getters (`real_buttons`: XInput, DualSense or key
 and A: the getters report the buttons (mask 0x104, 0x110) and the press-start screen still does not advance. So the getters we answer are not what gates the screen. Open
 question: which object the poll function's `[slot+0x78]` slot-6 call is meant to return (the layer answers it with the shared user because slot 6 of the controller element is `get_User`;
 if that call is `GetCurrentReading` on the gamepad interface, the reading object would never be reached through it).
+
+### Forza Horizon 3: the pad is connected as far as the title can tell (measured), press-start still ignores it
+
+Register watch (`--watch-repeat --watch-sites=...` with the new `XB1_WATCH_REGS=rax,rdx`): in the poll loop at title+`0x1a1ff98` controller slot 0 has an object and `0x1a10550` returns 0 (connected);
+slots 1 to 7 have none (`0x45d`). Inside it the title's registry lookup finds the object, the struct mode is not used (the `0x1a0ff40` result is 0) and the getter mode is, on the object the layer
+hands out for the controller element's slot 12 (also called from title+`0x1a14543`; slot 7 from `0x1a24a61`, slot 41 from `0x1a191b7`). The press mask reaches the getters (`[input] pad buttons 0x104`), raising the controller-added
+events (`XB1_INPUT_EVENTS=1`) changed nothing, the layer sees no new call at the moment of a press (no SystemUI, no account picker), and pressing Menu or A at 90 s, 120 s, 150 s, 180 s and 200 s did not
+advance the screen either. So the unknown is downstream of the poll (the title's own input layer or the press-start state machine), or the screen waits for something other than a button.
