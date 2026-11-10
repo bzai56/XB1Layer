@@ -76,36 +76,12 @@ pub unsafe fn compile_hlsl(source: &str, target: &[u8], entry: &[u8]) -> Option<
     }
 }
 
-unsafe fn compile(target: &[u8], entry: &[u8]) -> Option<Vec<u8>> {
-    unsafe {
-        let m = LoadLibraryA(b"d3dcompiler_47.dll\0".as_ptr());
-        if m.is_null() {
-            return None;
-        }
-        let f = GetProcAddress(m, b"D3DCompile\0".as_ptr());
-        if f.is_null() {
-            return None;
-        }
-        let f: D3DCompileFn = std::mem::transmute(f);
-        let mut code: *mut c_void = std::ptr::null_mut();
-        let mut err: *mut c_void = std::ptr::null_mut();
-        let hr = f(HLSL.as_ptr() as *const c_void, HLSL.len(), std::ptr::null(), std::ptr::null(), std::ptr::null(), entry.as_ptr(), target.as_ptr(), 0, 0, &mut code, &mut err);
-        if hr < 0 || code.is_null() {
-            eprintln!("[overlay] D3DCompile failed: {hr:#x}");
-            return None;
-        }
-        let blob: ID3DBlob = Interface::from_raw(code);
-        let bytes = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec();
-        Some(bytes)
-    }
-}
-
 unsafe fn init(real_ctx: *mut c_void) -> Option<State> {
     unsafe {
         let ctx: ID3D11DeviceContext = ID3D11DeviceContext::from_raw_borrowed(&real_ctx)?.clone();
         let device = ctx.GetDevice().ok()?;
-        let vs_code = compile(b"vs_5_0\0", b"vs_main\0")?;
-        let ps_code = compile(b"ps_5_0\0", b"ps_main\0")?;
+        let vs_code = compile_hlsl(HLSL, b"vs_5_0\0", b"vs_main\0")?;
+        let ps_code = compile_hlsl(HLSL, b"ps_5_0\0", b"ps_main\0")?;
         let mut vs = None;
         device.CreateVertexShader(&vs_code, None, Some(&mut vs)).ok()?;
         let mut ps = None;

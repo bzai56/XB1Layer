@@ -9,11 +9,11 @@ The goal is a layer that runs many Xbox One titles on Windows x64 without graphi
 0. **Minecraft Xbox One Edition:** a world loads and plays at 60 FPS. Next, in order: a real connected-storage backend (saves; it would replace the profile-copy patch and report a missing profile as missing), the store button crash (user report, not investigated), the unmapped embedded context calls and the guessed topology, the dialog draw order, a long play session (memory, threads), Join Game, and a comparison of the 3D picture with a console (sky, water, lighting, transparency).
 
 1. **Play Sonic Mania through and hunt glitches.** Later zones, special stages, two-player split screen, DualSense over USB; compare every screen with the original (formats, blending, sampling).
-2. **Get the full Forza Horizon 3 past its zip-mount crash** (NULL read at title+`0x1b04f7f`, see FINDINGS), then check whether its shaders are DXBC or GCN microcode, which decides the size of the graphics job. FH4 probably needs D3D12.X (unverified).
+2. **Forza Horizon 3: render the main menu.** The press-start text shows; the menu background (3D scene) is still black. Next: find why the scene render target stays empty (only 5 placed textures are bound, BC7 scene textures never are; several embedded context calls are still unmapped: +0xa10, +0x8a8, +0x748, +0x750, +0x6d0, +0x6b8, +0x8b0, +0x588, +0x4c0), verify the pad (`XB1_PAD_PULSE`) so press-start advances, then the start-up races.
 3. **Memory.** The demo asked for an 8.8 GB allocation and hit the commit limit; expect the same from a full game.
 4. **Decode GPU command packets** (AMD PM4) into desktop D3D11 calls if the title uses them (Sonic Mania does not; Forza does).
-5. **Textures.** Decode the console tile modes and de-tile placed textures.
-6. **D3D11X present path.** `DXGIXPresentArray` and `DXGIXSetVLineNotification` are logging stubs; reuse the display module.
+5. **Textures.** 1D-thin (mode 0xd) placed textures are de-tiled and uploaded; other tile modes are not.
+6. **D3D11X present path.** `DXGIXPresentArray` presents the real swap chain; display planes are composited by `src/overlay.rs`.
 7. **Identify the remaining context-table indices** (23, 24 to 31, 64 and up). Only evidenced indices forward to the driver; forwarding guesses corrupted it.
 
 ## Open problems

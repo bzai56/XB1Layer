@@ -19,11 +19,19 @@ An experimental compatibility layer for running Xbox One (GDK/XDK "Durango") x64
 - **Minecraft Xbox One Edition (1.2.0.0, an older XDK)**: the main menu, Play Game, Start Game and Create New World work, and a generated world renders in 3D with the HUD at 60 FPS in a release build (about 3,200 draw calls per frame). Keyboard and DualSense input work (the user confirmed every control), and the game has sound. The layer wraps this XDK's older DXGI/D3D11 layout and its embedded context calls, completes its storage, Xbox Live and system-keyboard operations, hands the game zeroed heap blocks (it relies on them), and carries one guarded compatibility patch (it keeps the default options when the stand-in storage returns a blank profile). Details in [FINDINGS](docs/FINDINGS.md).
 
 ## What does not work
-- **Forza Horizon 3 (full game, 1.0.125.0)**: gets through startup and file mounting, runs its render start-up and presents frames to the layer's window (a solid green picture so far, no menu yet). Nothing in the layer triggers the game's "render enabled" request, so the layer writes it at the main tick's first pass (title-specific workaround, `XB1_FH3_BOOT=0` turns it off); about half of the runs still crash on a start-up race, so start it again if it does. See `docs/FINDINGS.md`.
+- **Forza Horizon 3 (full game, 1.0.125.0)**: gets through startup and file mounting, shows the intro videos in full colour and reaches the press-start screen at a steady frame rate: the "PRESS TO START" text and the version line appear (UI overlay plane composited over the swap chain). The main-menu background is still black, the pad does not advance the screen (the pad answers are in the code but untested), the version string is random per run, and about half of the runs crash on a start-up race (start it again). The console compute stage (Dispatch, CS shader/UAV/samplers/constant buffers) is now forwarded without changing the picture. Title-specific workaround: the layer writes the game's "render enabled" request (`XB1_FH3_BOOT=0` turns it off). See `docs/FINDINGS.md`.
 - **Forza Horizon 3 kiosk demo** (retired): booted into its main loop but never drew or presented. It writes AMD PM4 command packets that nothing decodes, uses placed textures with console tiling that is not de-tiled, and its D3D11X present path (`DXGIXPresentArray`, `DXGIXSetVLineNotification`) is still a logging stub.
 - **Minecraft**: nothing is saved (the storage stand-ins keep no data); the Minecraft store button reportedly crashes the game (user report, not investigated); the credits screen shows no text (only its blurred backdrop); Join Game and anything online are untested; dialogs were seen with the menu text drawn through them (not re-checked); the 3D picture has only been looked at, not compared with a console; the topology of draws is partly guessed; a startup crash in the input table (`0x53be0e`) hit about half of the runs before the zeroed-allocation fix and none in 10 runs since.
 - **Other titles**: untested. Console context-table indices 23 and 24 to 31 are unidentified, and anything not evidenced by a logged call only logs.
 - D3D12.X titles are not supported.
+
+## Screenshots
+
+Captured from the layer's window (`tools/screenshot-window.ps1`):
+
+| Sonic Mania | Sonic Mania | Minecraft Xbox One Edition |
+|---|---|---|
+| ![Sonic Mania intro](docs/screenshots/sonic-mania-2.png) | ![Sonic Mania intro](docs/screenshots/sonic-mania-3.png) | ![Minecraft main menu](docs/screenshots/minecraft-1.png) |
 
 ## Build and run
 Requires Rust (MSVC toolchain, x64). Use a release build to play: the debug build is several times slower (in Minecraft the difference between a playable and an unplayable frame rate).

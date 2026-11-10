@@ -2230,7 +2230,7 @@ static LAST_PS: AtomicUsize = AtomicUsize::new(0);
 fn dump_bound_ps(n: u32, real: *mut c_void) {
     let Ok(dir) = std::env::var("XB1_DUMP_PS") else { return };
     // Ask the real context which pixel shader is bound (PSGetShader is desktop slot 74).
-    let mut ps = 0usize;
+    let ps;
     unsafe {
         let get: unsafe extern "system" fn(*mut c_void, *mut *mut c_void, *mut c_void, *mut u32) = std::mem::transmute(*((*(real as *const *const usize)).add(74)));
         let mut obj: *mut c_void = ptr::null_mut();
@@ -3308,14 +3308,15 @@ fn register_placed_buffer(resource: *mut c_void, memory: usize, size: usize) {
     PLACED_BUFFERS.lock().unwrap().push(PlacedBuffer { resource: resource as usize, memory, shadow: vec![0u8; size], scratch: vec![0u8; size] });
 }
 
+thread_local! {
+    static CURRENT_CTX_PROXY: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Called in front of every draw and dispatch. `this` is the context proxy.
 /// The title's inlined state cache writes the vertex shader, pixel shader and input layout straight
 /// into the context object (`+0x178`, `+0x180`, `+0x188`, with dirty bits in `+0x168`) instead of
 /// calling a bind method; applying them is the draw's job. Binds whichever of those fields holds an
 /// object we created, by creating slot, and uses a triangle list.
-thread_local! {
-    static CURRENT_CTX_PROXY: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
 
 fn apply_inlined_state(this: *mut c_void, real: *mut c_void) {
     CURRENT_CTX_PROXY.with(|c| c.set(this as usize));
