@@ -306,7 +306,18 @@ fn forwarded_entries() -> &'static Vec<(usize, usize)> {
             }
             if let Some(entry) = v.iter_mut().find(|(i, _)| *i == target) {
                 entry.1 = thunk;
+            } else if *desktop_slot == 41 && std::env::var_os("XB1_NO_COMPUTE").is_none() {
+                // console 40 (+0x520) is called (x, y, z) = Dispatch
+                v.push((target, thunk));
             }
+        }
+        if !log_all && std::env::var_os("XB1_NO_COMPUTE").is_none() {
+            // The console compute stage: 67 CSSetUnorderedAccessViews (start, count, views*), 68 CSSetShader (shader, ..),
+            // 69 CSSetSamplers, 70 CSSetConstantBuffers (start, count, array*): the argument shapes seen in the logged calls.
+            v.push((index_of(EMBED_TABLE + 67 * 8), ctx_cs_uav as usize));
+            v.push((index_of(EMBED_TABLE + 68 * 8), ctx_cs_shader as usize));
+            v.push((index_of(EMBED_TABLE + 69 * 8), ctx_cs_samplers as usize));
+            v.push((index_of(EMBED_TABLE + 70 * 8), ctx_cs_cbs as usize));
         }
         v
     });
@@ -1865,6 +1876,25 @@ unsafe extern "system" fn ctx_update_resource(this: *mut c_void, dst: *mut c_voi
             glog!("[gpu] UpdateSubresource #{n}: dst {dst:p} {}x{} mips {} fmt {} bind {:#x}, sub {sub}, box {bx:p}, pitch {row}/{depth}", d[0], d[1], d[2], d[4], d[8]);
         }
     }
+    {
+        // Video frames (R8 luma planes 1920x1088): mean of a sample of the uploaded bytes, logged now and then.
+        static VID: AtomicU32 = AtomicU32::new(0);
+        if !data.is_null() && row == 1920 && readable(data, 64) {
+            let k = VID.fetch_add(1, Ordering::Relaxed);
+            if k % 120 == 0 {
+                let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, 1920 * 1088) };
+                let (mut sum, mut cnt, mut mx) = (0u64, 0u64, 0u8);
+                let mut i = 0usize;
+                while i < bytes.len() {
+                    sum += bytes[i] as u64;
+                    mx = mx.max(bytes[i]);
+                    cnt += 1;
+                    i += 997;
+                }
+                glog!("[gpu] video luma upload #{k}: mean {:.1}, max {mx}", sum as f64 / cnt as f64);
+            }
+        }
+    }
     if dst as usize == T0_RES.load(Ordering::Relaxed) && n % 50 == 0 {
         glog!("[gpu] UpdateSubresource on the final-pass texture: sub {sub} box {bx:p} data {data:p} pitch {row}/{depth}");
     }
@@ -1947,6 +1977,74 @@ unsafe extern "system" fn ctx_ps_srv(this: *mut c_void, views: *const *mut c_voi
 unsafe extern "system" fn ctx_vs_srv(this: *mut c_void, views: *const *mut c_void, a3: usize, a4: usize) {
     unsafe { srv_array(this, views, a3, a4, 25) }
 }
+/// Reads an array of up to `count` object pointers (restoring their real vtables); returns the list.
+unsafe fn object_array(arr: usize, count: usize) -> Vec<*mut c_void> {
+    let mut out = vec![ptr::null_mut::<c_void>(); count.min(16)];
+    if arr == 0 || arr % 8 != 0 {
+        return out;
+    }
+    for (i, o) in out.iter_mut().enumerate() {
+        let p_addr = (arr + i * 8) as *const usize;
+        if !readable(p_addr as *const c_void, 8) {
+            break;
+        }
+        let p = unsafe { *p_addr };
+        if p != 0 && p % 8 == 0 && readable(p as *const c_void, 8) {
+            restore_object_vtable(p as *mut c_void);
+            *o = p as *mut c_void;
+        }
+    }
+    out
+}
+
+fn compute_log(what: &str, a: [usize; 3]) {
+    static N: [AtomicU32; 4] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+    let k = match what { "uav" => 0, "shader" => 1, "samplers" => 2, _ => 3 };
+    if N[k].fetch_add(1, Ordering::Relaxed) < 8 {
+        glog!("[gpu] compute {what}: {:#x} {:#x} {:#x}", a[0], a[1], a[2]);
+    }
+}
+
+/// Console index 67 (+0x5f8) = desktop 68 `CSSetUnorderedAccessViews(start, count, views*, initial counts*)`.
+unsafe extern "system" fn ctx_cs_uav(this: *mut c_void, start: usize, count: usize, views: usize) {
+    compute_log("uav", [start, count, views]);
+    let real = unsafe { real_context(this) };
+    let n = count.min(8);
+    let list = unsafe { object_array(views, n) };
+    let counts = [0xffff_ffffu32; 8];
+    let f: unsafe extern "system" fn(*mut c_void, u32, u32, *const *mut c_void, *const u32) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(68))) };
+    unsafe { f(real, start as u32, list.len() as u32, list.as_ptr(), counts.as_ptr()) };
+}
+
+/// Console index 68 (+0x600) = desktop 69 `CSSetShader(shader, instances, count)`.
+unsafe extern "system" fn ctx_cs_shader(this: *mut c_void, shader: *mut c_void, a3: usize, a4: usize) {
+    compute_log("shader", [shader as usize, a3, a4]);
+    let real = unsafe { real_context(this) };
+    if !shader.is_null() && shader as usize % 8 == 0 && readable(shader as *const c_void, 8) {
+        restore_object_vtable(shader);
+    }
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, u32) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(69))) };
+    unsafe { f(real, shader, ptr::null(), 0) };
+}
+
+/// Console index 69 (+0x608) = desktop 70 `CSSetSamplers(start, count, samplers*)`.
+unsafe extern "system" fn ctx_cs_samplers(this: *mut c_void, start: usize, count: usize, arr: usize) {
+    compute_log("samplers", [start, count, arr]);
+    let real = unsafe { real_context(this) };
+    let list = unsafe { object_array(arr, count) };
+    let f: unsafe extern "system" fn(*mut c_void, u32, u32, *const *mut c_void) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(70))) };
+    unsafe { f(real, start as u32, list.len() as u32, list.as_ptr()) };
+}
+
+/// Console index 70 (+0x610) = desktop 71 `CSSetConstantBuffers(start, count, buffers*)`.
+unsafe extern "system" fn ctx_cs_cbs(this: *mut c_void, start: usize, count: usize, arr: usize) {
+    compute_log("constant buffers", [start, count, arr]);
+    let real = unsafe { real_context(this) };
+    let list = unsafe { object_array(arr, count) };
+    let f: unsafe extern "system" fn(*mut c_void, u32, u32, *const *mut c_void) = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(71))) };
+    unsafe { f(real, start as u32, list.len() as u32, list.as_ptr()) };
+}
+
 /// Console index 66 = desktop 67 `CSSetShaderResources`.
 unsafe extern "system" fn ctx_cs_srv(this: *mut c_void, views: *const *mut c_void, a3: usize, a4: usize) {
     unsafe { srv_array(this, views, a3, a4, 67) }
@@ -2264,6 +2362,7 @@ unsafe fn probe_render_target(real: *mut c_void, draw: u32) {
     unsafe {
         probe_pipeline_state(real, draw);
         // The pixel shader's resources t0..t3: texture, size, format (PSGetShaderResources is desktop slot 73).
+        let mut y_plane = false;
         let vt0 = *(real as *const *const usize);
         let get_srv: unsafe extern "system" fn(*mut c_void, u32, u32, *mut *mut c_void) = std::mem::transmute(*vt0.add(73));
         for slot in 0..4u32 {
@@ -2284,6 +2383,9 @@ unsafe fn probe_render_target(real: *mut c_void, draw: u32) {
                 glog!("[gpu] probe draw {draw}: t{slot} {res:p} {}x{} fmt {} bind {:#x}", d[0], d[1], d[4], d[8]);
                 if d[0] == 1024 && d[1] == 1024 && d[4] == 28 {
                     ATLAS_RES.store(res as usize, Ordering::Relaxed);
+                }
+                if d[0] == 1920 && d[1] == 1088 && d[4] == 61 {
+                    y_plane = true;
                 }
                 if d[0] > 16 && d[1] > 16 && d[0] <= 4096 {
                     readback_texture(real, res, d);
@@ -2313,6 +2415,9 @@ unsafe fn probe_render_target(real: *mut c_void, draw: u32) {
             let gd: unsafe extern "system" fn(*mut c_void, *mut u32) = std::mem::transmute(*tvt.add(10));
             let mut d = [0u32; 11];
             gd(res, d.as_mut_ptr());
+            if y_plane && d[0] == 1920 && d[1] == 1080 && d[4] == 28 {
+                BINK_RT.store(res as usize, Ordering::Relaxed);
+            }
             if d[0] == 1920 && d[1] == 1080 {
                 // a one-pixel look through the existing readback helper's staging copy (whole texture; only draws of one frame)
                 glog!("[gpu] probe draw {draw}: rt0 {res:p} {}x{} fmt {} t0={}", d[0], d[1], d[4], res as usize == T0_RES.load(Ordering::Relaxed));
@@ -2333,6 +2438,7 @@ unsafe fn probe_render_target(real: *mut c_void, draw: u32) {
     }
 }
 
+static BINK_RT: AtomicUsize = AtomicUsize::new(0);
 static ATLAS_RES: AtomicUsize = AtomicUsize::new(0);
 static DRAWS_IN_FRAME: AtomicU32 = AtomicU32::new(0);
 static T0_RES: AtomicUsize = AtomicUsize::new(0);
@@ -3875,7 +3981,9 @@ pub unsafe extern "system" fn present_array(a1: u64, a2: u64, a3: u64, a4: u64, 
                     }
                 }
             }
-            glog!("[gpu] present {n}: UI plane (non-zero share, mean) {:?}; swap chain {:?}; typed shadows: draws with shaders {} / with typed decls {} / with a recorded SRV list {} / repacked {}; decl shaders {}, structured views {}", a, b, FIX_CALLS[0].load(Ordering::Relaxed), FIX_CALLS[1].load(Ordering::Relaxed), FIX_CALLS[2].load(Ordering::Relaxed), FIX_CALLS[3].load(Ordering::Relaxed), SHADER_DECLS.lock().unwrap().as_ref().map_or(0, |m| m.len()), BUF_VIEWS.lock().unwrap().as_ref().map_or(0, |m| m.len()));
+            let bink = BINK_RT.load(Ordering::Relaxed);
+            let c = if bink != 0 { unsafe { nonzero_stats(real, bink as *mut c_void, 28) } } else { None };
+            glog!("[gpu] present {n}: video conversion target {:?}; UI plane (non-zero share, mean) {:?}; swap chain {:?}; typed shadows: draws with shaders {} / with typed decls {} / with a recorded SRV list {} / repacked {}; decl shaders {}, structured views {}", c, a, b, FIX_CALLS[0].load(Ordering::Relaxed), FIX_CALLS[1].load(Ordering::Relaxed), FIX_CALLS[2].load(Ordering::Relaxed), FIX_CALLS[3].load(Ordering::Relaxed), SHADER_DECLS.lock().unwrap().as_ref().map_or(0, |m| m.len()), BUF_VIEWS.lock().unwrap().as_ref().map_or(0, |m| m.len()));
         }
     }
     if std::env::var_os("XB1_DUMP_PS").is_some() && (n == 150 || n == 900 || n == 1500 || (n > 0 && n % 6000 == 0)) && T0_RES.load(Ordering::Relaxed) != 0 {

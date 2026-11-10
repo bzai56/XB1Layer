@@ -1030,6 +1030,19 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         }
         *LAST.lock().unwrap() = format!("{} slot {N} arg1 {arg1:p} arg2 {arg2:p} a3 {a3:p}", o.class);
     }
+    // Forza Horizon 3 reads the pad through a reading object (the controller element's slot 12): about twenty property getters, booleans
+    // (slots 6 to 15, 28, 29, 32, 33, 26) and floats (16, 18, 19, 20, 24, 25), polled every frame. The generic stand-in wrote a pointer
+    // into each, so the booleans held random bytes. Answer with real values: zero, or (XB1_PAD_PULSE=1, a test mode) one boolean slot
+    // pressed at a time after the intros, to find which slot is which button.
+    if o.class.starts_with("Windows.Xbox.Input.Controller.Controllers (element") && o.class.ends_with("#slot12") && !crate::VCCORLIB110.load(Ordering::Relaxed) && (6..=33).contains(&N) && is_writable(arg1) && std::env::var_os("XB1_OLD_PAD_ANSWERS").is_none() {
+        const FLOATS: [usize; 6] = [16, 18, 19, 20, 24, 25];
+        if FLOATS.contains(&N) {
+            unsafe { ptr::write_unaligned(arg1 as *mut f32, 0.0) };
+        } else {
+            unsafe { *(arg1 as *mut u8) = pad_bool(N) as u8 };
+        }
+        return HRESULT(0);
+    }
     // The gamepad as `IGamepad^` (older SDK): slot 8 is `GetCurrentReading(GamepadReading*)`, polled every frame into a
     // 40-byte buffer; same reading as Sonic Mania's newer SDK (36 bytes: time, buttons, triggers, sticks).
     if o.class == "Windows.Xbox.Input.Gamepad (element)" && N == 8 && is_writable(arg1) {
@@ -1635,6 +1648,27 @@ fn vector_view_vtbl() -> *const usize {
 /// The one signed-in user element (see `vector_view_get_at`).
 /// Fills a `GamepadReading` from the first XInput pad and, while the layer's window has the focus,
 /// the keyboard (arrows = d-pad, Z/X/A/S = A/B/X/Y, Enter = Menu, Backspace = View, Q/W = shoulders).
+
+/// The value of boolean getter `slot` of the pad reading object. Test mode `XB1_PAD_PULSE=<start seconds>`: after that many seconds
+/// since the first poll, each candidate slot is pressed for 1.5 s in turn (3 s apart), logged as `[input] pulse slot N`.
+fn pad_bool(slot: usize) -> bool {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    static LAST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+    let start = *START.get_or_init(std::time::Instant::now);
+    let Some(from) = std::env::var("XB1_PAD_PULSE").ok().and_then(|v| v.parse::<f64>().ok()) else { return false };
+    const CANDIDATES: [usize; 15] = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 28, 29, 33, 26, 32];
+    let t = start.elapsed().as_secs_f64() - from;
+    if t < 0.0 {
+        return false;
+    }
+    let idx = (t / 3.0) as usize % CANDIDATES.len();
+    let pressed_phase = (t % 3.0) < 1.5;
+    if pressed_phase && LAST.swap(idx, Ordering::Relaxed) != idx {
+        eprintln!("[input] pulse slot {} at {:.1} s", CANDIDATES[idx], t + from);
+    }
+    pressed_phase && CANDIDATES[idx] == slot
+}
+
 unsafe fn fill_gamepad_reading(out: *mut u8) {
     #[repr(C)]
     #[derive(Default)]

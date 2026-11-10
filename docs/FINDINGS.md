@@ -1066,3 +1066,12 @@ In a 25 s log-only run the WinRT stand-ins logged **1.4 million** calls on one o
 - **Other fixes made on the way:** placed buffers are now mirrored on the immediate context right before every `ExecuteCommandList` (the old mirror recorded the upload into whichever deferred context was drawing and `try_lock` could drop it), `ExecuteCommandList` always restores the immediate context's state (the desktop otherwise clears it, losing bindings the title makes once), a buffer UAV bound as a shader resource is converted to an SRV, the vertex-stage and compute-stage shader-resource calls (indices 24 and 66) share the slot-array binder and texture upload, `UpdateSubresource`, `CopyResource`, `Map` are wrapped (counted, logged).
 - **Start-up crashes depend on the machine's state:** right after a rebuild 4 of 4 runs hit the heap crash at the user stand-ins, a few warm runs later 0 of 8; do a warm-up run after every build (the crash list and its likely sources are unchanged).
 - **Next:** find how the title binds the second typed buffer (`t1`), probably through one of the unmapped calls (109 / 110) or an argument encoding of index 24 that the layer ignores; then check that the shadow repack triggers and that the UI plane fills.
+
+## Forza Horizon 3: the console compute stage is mapped (main menu background still black)
+
+Identified from the logged argument shapes of the newer SDK's embedded context table: `+0x520` (index 40) is `Dispatch(x, y, z)` (calls such as `(1,1,1)`, `(8,5,1)`),
+`+0x5f8` (67) `CSSetUnorderedAccessViews(start, count, views*)`, `+0x600` (68) `CSSetShader(shader, ..)`, `+0x608` (69) `CSSetSamplers(start, count, array*)`
+and `+0x610` (70) `CSSetConstantBuffers(start, count, array*)`. They now forward to desktop slots 41, 68, 69, 70 and 71 (`XB1_NO_COMPUTE=1` turns it off).
+Verified: the calls arrive with those shapes and the title keeps running, with the press-start text as before. Not verified: that the
+dispatches produce anything useful. The main-menu background is still black after the intros, so the compute stage alone was not the missing piece.
+Not re-checked after this change: Sonic Mania (different SDK table; the new entries only touch indices 40 and 67-70).
