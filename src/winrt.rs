@@ -1442,6 +1442,13 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
             eprintln!("[input] controller element slot {N} called from title+{:#x} / {:#x}", key.1, (frames[1] as usize).wrapping_sub(base));
         }
     }
+    // `IController::get_Type` (slot 7 on a controller element) is an HSTRING: the title (title+0x1a24a40) duplicates it with `WindowsDuplicateString`.
+    // The generic stand-in wrote an object pointer there, which is not a string handle.
+    if o.class.starts_with("Windows.Xbox.Input.Controller.Controllers (element") && !o.class.contains('#') && N == 7 && is_writable(arg1) && !crate::VCCORLIB110.load(Ordering::Relaxed) && std::env::var_os("XB1_NO_CONTROLLER_TYPE").is_none() {
+        unsafe { *(arg1 as *mut *mut c_void) = std::mem::transmute::<HSTRING, *mut c_void>(HSTRING::from("Windows.Xbox.Input.Gamepad")) };
+        wlog_rare!("[winrt] controller slot 7 -> HSTRING \"Windows.Xbox.Input.Gamepad\"");
+        return HRESULT(0);
+    }
     // `IController::get_User` (slot 6 on a controller element): the shared user.
     if o.class.starts_with("Windows.Xbox.Input.Controller.Controllers (element") && !o.class.contains('#') && N == 6 && is_writable(arg1) {
         if std::env::var_os("XB1_PAD_SLOT6_READING").is_some() {

@@ -1151,3 +1151,7 @@ black, one the green "A" button icon. The icon came out cut off (only the top ha
 is padded to 8 only (4 tiles per row), so its rows were read from the wrong tiles. With the pitch rule "64 for 64 elements or more, else 8" the icon decodes completely (`XB1_PITCH64_ALL=1` restores the old rule). Verified on the dumped icon;
 the picture's glyph slot ("PRESS [ ] TO START") is still empty in my runs: the glyph textures that would fill it are either the white placeholder (what you saw as the white box) or all-zero (not yet written by the title, which the mirror does not upload),
 so the title has not streamed the icon for the controller it thinks is present, which fits the open input question (no controller type chosen).
+
+Controller element slot 7 (called every frame from title+`0x1a24a61`) is `IController::get_Type`, an HSTRING: the caller passes it to `WindowsDuplicateString` (import thunk `0x17cffc4`) and releases it with `WindowsDeleteString` (`0x17cffbe`).
+The layer wrote an object pointer there; it now answers `"Windows.Xbox.Input.Gamepad"` (`XB1_NO_CONTROLLER_TYPE=1` restores the old answer). The press-start screen and the glyph slot did not change with it (Menu and A presses at 40 s, 48 s, 56 s), so the title does not use the type
+string for them; the string is only duplicated and released inside `0x1a10550`.
