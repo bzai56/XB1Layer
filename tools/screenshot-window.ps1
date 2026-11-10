@@ -11,7 +11,7 @@ public static class W {
 }
 "@
 [W]::SetProcessDPIAware() | Out-Null
-$p = Get-Process | Where-Object { $_.MainWindowTitle -like "*$title*" } | Select-Object -First 1
+$p = Get-Process xb1layer -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
 if (-not $p) { Write-Error "no window titled $title"; exit 1 }
 $r = New-Object W+Rc
 [W]::GetClientRect($p.MainWindowHandle, [ref]$r) | Out-Null

@@ -31,9 +31,9 @@ An experimental compatibility layer for running Xbox One (GDK/XDK "Durango") x64
 
 The window shows the game name, the frame rate and the logo. Captured from the layer's window (`tools/screenshot-window.ps1`):
 
-| Sonic Mania | Sonic Mania | Minecraft Xbox One Edition |
-|---|---|---|
-| ![Sonic Mania intro](docs/screenshots/sonic-mania-2.png) | ![Sonic Mania intro](docs/screenshots/sonic-mania-3.png) | ![Minecraft main menu](docs/screenshots/minecraft-1.png) |
+| Sonic Mania (title screen) | Minecraft Xbox One Edition (main menu) |
+|---|---|
+| ![Sonic Mania title screen](docs/screenshots/sonic-mania-title.png) | ![Minecraft main menu](docs/screenshots/minecraft-1.png) |
 
 ## Build and run
 Requires Rust (MSVC toolchain, x64). Use a release build to play: the debug build is several times slower (in Minecraft the difference between a playable and an unplayable frame rate).
