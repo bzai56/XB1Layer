@@ -20,6 +20,9 @@ unsafe extern "system" {
     fn RegisterClassW(wc: *const WndClass) -> u16;
     fn ShowWindow(hwnd: *mut c_void, cmd: i32) -> i32;
     fn LoadCursorW(inst: *mut c_void, name: usize) -> *mut c_void;
+    fn SetWindowTextW(hwnd: *mut c_void, text: *const u16) -> i32;
+    fn SendMessageW(hwnd: *mut c_void, msg: u32, w: usize, l: isize) -> isize;
+    fn CreateIconFromResourceEx(bits: *const u8, size: u32, icon: i32, ver: u32, cx: i32, cy: i32, flags: u32) -> *mut c_void;
     fn AdjustWindowRect(rect: *mut [i32; 4], style: u32, menu: i32) -> i32;
 }
 
@@ -58,7 +61,10 @@ fn output_window(width: i32, height: i32) -> usize {
         let (tx, rx) = std::sync::mpsc::channel::<usize>();
         std::thread::spawn(move || unsafe {
             let class = wide("XB1LayerWindow");
-            let title = wide("XB1Layer");
+            let title = wide(&window_title(None));
+            // The logo (a PNG, `assets/icon-256.png`) as the window and class icon.
+            let png: &[u8] = include_bytes!("../assets/icon-256.png");
+            let icon = CreateIconFromResourceEx(png.as_ptr(), png.len() as u32, 1, 0x0003_0000, 256, 256, 0);
             let inst = GetModuleHandleW(std::ptr::null());
             let wc = WndClass {
                 style: 0x0003, // CS_HREDRAW | CS_VREDRAW
@@ -66,7 +72,7 @@ fn output_window(width: i32, height: i32) -> usize {
                 cls_extra: 0,
                 wnd_extra: 0,
                 instance: inst,
-                icon: std::ptr::null_mut(),
+                icon,
                 cursor: LoadCursorW(std::ptr::null_mut(), 32512), // IDC_ARROW
                 background: std::ptr::null_mut(),
                 menu: std::ptr::null(),
@@ -77,6 +83,10 @@ fn output_window(width: i32, height: i32) -> usize {
             let mut rect = [0, 0, width, height];
             AdjustWindowRect(&mut rect, style, 0);
             let hwnd = CreateWindowExW(0, class.as_ptr(), title.as_ptr(), style, 100, 100, rect[2] - rect[0], rect[3] - rect[1], std::ptr::null_mut(), std::ptr::null_mut(), inst, std::ptr::null_mut());
+            if !icon.is_null() {
+                SendMessageW(hwnd, 0x0080, 0, icon as isize); // WM_SETICON, ICON_SMALL
+                SendMessageW(hwnd, 0x0080, 1, icon as isize); // ICON_BIG
+            }
             ShowWindow(hwnd, 5); // SW_SHOW
             let _ = tx.send(hwnd as usize);
             let mut msg = [0u8; 48];
@@ -87,6 +97,41 @@ fn output_window(width: i32, height: i32) -> usize {
         });
         rx.recv().unwrap_or(0)
     })
+}
+
+/// The title's display name: the `<DisplayName>` of the `AppxManifest.xml` next to the executable passed on the command line
+/// (when it is a plain string), else the executable's file name without `.exe`.
+fn game_name() -> &'static str {
+    static NAME: OnceLock<String> = OnceLock::new();
+    NAME.get_or_init(|| {
+        let exe = std::env::args().skip(1).find(|a| a.to_ascii_lowercase().ends_with(".exe"));
+        let Some(exe) = exe else { return String::new() };
+        let path = std::path::Path::new(&exe);
+        let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+        if let Ok(xml) = std::fs::read_to_string(dir.join("AppxManifest.xml")) {
+            if let Some(i) = xml.find("<DisplayName>") {
+                let rest = &xml[i + 13..];
+                if let Some(j) = rest.find('<') {
+                    let n = rest[..j].trim();
+                    if !n.is_empty() && !n.starts_with("ms-resource") {
+                        return n.to_string();
+                    }
+                }
+            }
+        }
+        path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+    })
+}
+
+/// `<game> - <fps> FPS - XB1Layer` (the FPS part once it is known).
+fn window_title(fps: Option<u32>) -> String {
+    let name = game_name();
+    match (name.is_empty(), fps) {
+        (true, None) => "XB1Layer".to_string(),
+        (true, Some(f)) => format!("{f} FPS - XB1Layer"),
+        (false, None) => format!("{name} - XB1Layer"),
+        (false, Some(f)) => format!("{name} - {f} FPS - XB1Layer"),
+    }
 }
 
 static ORIGINAL_FOR_HWND: OnceLock<usize> = OnceLock::new();
@@ -130,6 +175,11 @@ pub fn limit_frame_rate() {
         if c.2 < 5 {
             eprintln!("[display] {} frames in the last second", c.1);
             c.2 += 1;
+        }
+        let hwnd = output_window(1920, 1080);
+        if hwnd != 0 {
+            let t = wide(&window_title(Some(c.1)));
+            unsafe { SetWindowTextW(hwnd as *mut c_void, t.as_ptr()) };
         }
         *c = (Some(now), 0, c.2);
     }

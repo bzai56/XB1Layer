@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.png" alt="XB1Layer logo" width="160"></p>
+
 # XB1Layer
 
 An experimental compatibility layer for running Xbox One (GDK/XDK "Durango") x64 titles on Windows x64.
@@ -27,7 +29,7 @@ An experimental compatibility layer for running Xbox One (GDK/XDK "Durango") x64
 
 ## Screenshots
 
-Captured from the layer's window (`tools/screenshot-window.ps1`):
+The window shows the game name, the frame rate and the logo. Captured from the layer's window (`tools/screenshot-window.ps1`):
 
 | Sonic Mania | Sonic Mania | Minecraft Xbox One Edition |
 |---|---|---|
