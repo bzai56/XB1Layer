@@ -1109,3 +1109,9 @@ The merged per-user state is then read further down; a controller counts as conn
 (`XB1_PAD_ALL=1`), slot 6 as a rising 64-bit timestamp: none advanced the screen. Not found yet: what the press-start state machine waits for (the button glyph between
 "PRESS" and "TO START" is also missing, which suggests it does not yet see a controller type). Next: log the return value of `0x1a10550` per slot (a register-print watch site on the
 `eax` after the call at `0x1a1ff98`) and the interface IDs the title queries on the controller, to see whether the title considers the pad connected at all.
+
+Real input is now wired to the getters (`real_buttons`: XInput, DualSense or keyboard, mapped by the title's own getter-to-bit order: slots 6 A, 7 B, 8 X, 9 Y, 11 Menu, 10 View,
+12 to 15 d-pad up/down/left/right, 28 and 29 shoulders, 33 and 30 thumbsticks). With a connected DualSense the layer logs `[input] pad buttons 0x...` on every change, and `XB1_AUTOPRESS="40:4:2;50:16:2"` presses Menu
+and A: the getters report the buttons (mask 0x104, 0x110) and the press-start screen still does not advance. So the getters we answer are not what gates the screen. Open
+question: which object the poll function's `[slot+0x78]` slot-6 call is meant to return (the layer answers it with the shared user because slot 6 of the controller element is `get_User`;
+if that call is `GetCurrentReading` on the gamepad interface, the reading object would never be reached through it).

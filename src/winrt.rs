@@ -1666,11 +1666,43 @@ fn vector_view_vtbl() -> *const usize {
 
 /// The value of boolean getter `slot` of the pad reading object. Test mode `XB1_PAD_PULSE=<start seconds>`: after that many seconds
 /// since the first poll, each candidate slot is pressed for 1.5 s in turn (3 s apart), logged as `[input] pulse slot N`.
+/// The pad's buttons as the layer reads them (XInput, DualSense, keyboard; the older SDK's `GamepadButtons` bits), cached for a few milliseconds
+/// because the title polls about twenty getters per frame.
+fn real_buttons() -> u32 {
+    static CACHE: Mutex<Option<(std::time::Instant, u32)>> = Mutex::new(None);
+    let mut c = CACHE.lock().unwrap();
+    if let Some((t, b)) = *c {
+        if t.elapsed() < std::time::Duration::from_millis(4) {
+            return b;
+        }
+    }
+    let mut buf = [0u8; 48];
+    unsafe { fill_gamepad_reading(buf.as_mut_ptr()) };
+    let b = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    if c.map_or(0, |(_, o)| o) != b {
+        eprintln!("[input] pad buttons {b:#x}");
+    }
+    *c = Some((std::time::Instant::now(), b));
+    b
+}
+
+/// Boolean getter slot -> `GamepadButtons` bit, from the title's own poll function (`0x1a10550`): the mask bit of each getter follows the
+/// struct bit it reads in struct mode (6 A, 7 B, 8 X, 9 Y, 11 Menu, 10 View, 12 to 15 d-pad up/down/left/right, 28/29 shoulders, 33 and 30 thumbsticks).
+fn slot_button_bit(slot: usize) -> u32 {
+    match slot {
+        6 => 16, 7 => 32, 8 => 64, 9 => 128, 11 => 4, 10 => 8, 12 => 256, 13 => 512, 14 => 1024, 15 => 2048,
+        28 => 4096, 29 => 8192, 33 => 16384, 30 => 32768,
+        _ => 0,
+    }
+}
+
 fn pad_bool(slot: usize) -> bool {
     static START: OnceLock<std::time::Instant> = OnceLock::new();
     static LAST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
     let start = *START.get_or_init(std::time::Instant::now);
-    let Some(from) = std::env::var("XB1_PAD_PULSE").ok().and_then(|v| v.parse::<f64>().ok()) else { return false };
+    let Some(from) = std::env::var("XB1_PAD_PULSE").ok().and_then(|v| v.parse::<f64>().ok()) else {
+        return real_buttons() & slot_button_bit(slot) != 0 && slot_button_bit(slot) != 0;
+    };
     const CANDIDATES: [usize; 21] = [7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 21, 22, 23, 26, 27, 28, 29, 30, 31, 32, 33];
     let t = start.elapsed().as_secs_f64() - from;
     if t < 0.0 {
