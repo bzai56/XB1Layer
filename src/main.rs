@@ -488,8 +488,29 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                     if WATCH_REPEAT.load(Ordering::Relaxed) {
                         // Compact line per hit: the logged file, line, category and message.
                         let hit = WATCH_HITS.fetch_add(1, Ordering::Relaxed);
+                        // XB1_WATCH_COUNT=1: no per-hit lines; the hits per site are counted and the sites that fired are printed once a second.
+                        static COUNTING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                        static COUNTS: [AtomicUsize; 256] = [const { AtomicUsize::new(0) }; 256];
+                        static LAST_PRINT: AtomicUsize = AtomicUsize::new(0);
+                        let counting = *COUNTING.get_or_init(|| std::env::var_os("XB1_WATCH_COUNT").is_some());
+                        if counting {
+                            COUNTS[i].fetch_add(1, Ordering::Relaxed);
+                            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as usize).unwrap_or(0);
+                            if LAST_PRINT.swap(now, Ordering::Relaxed) != now {
+                                let mut w = RawBuf::new();
+                                use std::fmt::Write;
+                                let _ = write!(w, "[count] t={now}");
+                                for (k, c) in COUNTS.iter().enumerate() {
+                                    let v = c.swap(0, Ordering::Relaxed);
+                                    if v > 0 {
+                                        let _ = write!(w, " {:#x}:{v}", WATCH_ADDR[k].load(Ordering::Relaxed).wrapping_sub(base));
+                                    }
+                                }
+                                rlog!("{}", w.as_str());
+                            }
+                        }
                         static MAXHITS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-                        if hit < *MAXHITS.get_or_init(|| std::env::var("XB1_WATCH_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(400)) || std::env::var_os("XB1_WATCH_FILTER").is_some() {
+                        if !counting && hit < *MAXHITS.get_or_init(|| std::env::var("XB1_WATCH_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(400)) || std::env::var_os("XB1_WATCH_FILTER").is_some() {
                             let rsp = reg(0x98) as usize;
                             let mut out = RawBuf::new();
                             let put = |out: &mut RawBuf, label: &str, p: u64, max: usize| {
