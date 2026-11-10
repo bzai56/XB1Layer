@@ -1953,6 +1953,9 @@ unsafe extern "system" fn ctx_cs_srv(this: *mut c_void, views: *const *mut c_voi
 }
 
 unsafe fn srv_array(this: *mut c_void, views: *const *mut c_void, a3: usize, a4: usize, desktop_slot: usize) {
+    // `a3` is the start slot (the packed `a4` is a base plus 0x20 per slot): the title binds one view per call. Binding always at
+    // slot 0 made every view at a higher slot overwrite slot 0.
+    let start: u32 = if std::env::var_os("XB1_SRV_START_ZERO").is_none() && a3 < 128 { a3 as u32 } else { 0 };
     {
         static ALOG: AtomicU32 = AtomicU32::new(0);
         let n = ALOG.fetch_add(1, Ordering::Relaxed);
@@ -2015,8 +2018,12 @@ unsafe fn srv_array(this: *mut c_void, views: *const *mut c_void, a3: usize, a4:
             count = i;
         }
         if desktop_slot == 25 && readable(views as *const c_void, 32) {
+            // every distinct array the title passes (by its first four qwords and the packed argument)
+            static SEEN: std::sync::Mutex<Option<std::collections::HashSet<([usize; 4], usize)>>> = std::sync::Mutex::new(None);
+            let q4: [usize; 4] = unsafe { *(views as *const [usize; 4]) };
+            let fresh = SEEN.lock().unwrap().get_or_insert_with(Default::default).insert((q4, a4));
             static VLOG: AtomicU32 = AtomicU32::new(0);
-            if VLOG.fetch_add(1, Ordering::Relaxed) < 60 {
+            if fresh && VLOG.fetch_add(1, Ordering::Relaxed) < 40 {
                 let q = unsafe { std::slice::from_raw_parts(views as *const usize, 4) };
                 let second = q[2];
                 glog!("[gpu] VS shader resources: raw array {:x?}, a3 {a3:#x}, a4 {a4:#x}; entry 2 an image-vtable object: {} (first qword {:#x}); interfaces of entry 2 (SRV, UAV, RTV, DSV): {:?}", q, second != 0 && second % 8 == 0 && readable(second as *const c_void, 8) && has_image_vtable(second as *const c_void), if second != 0 && readable(second as *const c_void, 8) { unsafe { *(second as *const usize) } } else { 0 }, view_interfaces(second as *mut c_void));
@@ -2054,7 +2061,16 @@ unsafe fn srv_array(this: *mut c_void, views: *const *mut c_void, a3: usize, a4:
                 }
             }
         }
-        CTX_SRVS.lock().unwrap().get_or_insert_with(Default::default).insert((real as usize, desktop_slot as u32), list[..count].iter().map(|p| *p as usize).collect());
+        {
+            let mut g = CTX_SRVS.lock().unwrap();
+            let e = g.get_or_insert_with(Default::default).entry((real as usize, desktop_slot as u32)).or_default();
+            if e.len() < start as usize + count {
+                e.resize(start as usize + count, 0);
+            }
+            for k in 0..count {
+                e[start as usize + k] = list[k] as usize;
+            }
+        }
         // Placed textures: upload what the title wrote into their memory (once, and again when it changes).
         for k in 0..count {
             let v = list[k];
@@ -2081,11 +2097,11 @@ unsafe fn srv_array(this: *mut c_void, views: *const *mut c_void, a3: usize, a4:
                 mirror_placed_texture(res);
             }
         }
-        unsafe { f(real, 0, count.max(1) as u32, list.as_ptr()) };
+        unsafe { f(real, start, count.max(1) as u32, list.as_ptr()) };
         return;
     }
     restore_object_vtable(unsafe { *views });
-    unsafe { f(real, 0, 1, views) };
+    unsafe { f(real, start, 1, views) };
 }
 
 /// Device slot -> (index of the out-pointer among the arguments after `this`, real vtable slots of
