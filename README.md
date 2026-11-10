@@ -63,9 +63,9 @@ Run a title from its own folder so relative paths resolve.
 [MIT](LICENSE).
 
 ## Contributing
-Contributions are welcome. The biggest open problems are mapping the rest of the console's embedded context functions to desktop D3D11 and, for titles that use it, decoding the GPU command packets (see the [Roadmap](docs/ROADMAP.md)). Reports of what other titles need are useful too.
+Contributions are welcome. The biggest open problems are rendering the Forza Horizon 3 main menu (the scene render target stays empty; several embedded context calls are still unmapped), verifying gamepad input in that title, the start-up crash races, and, for titles that use them, decoding GPU command packets (see the [Roadmap](docs/ROADMAP.md)). Reports of what other titles need are useful too.
 
 ## Docs
 - [Architecture](docs/ARCHITECTURE.md)
-- [Findings](docs/FINDINGS.md) (a chronological log: the Forza Horizon 3 kiosk demo, Sonic Mania and Minecraft; later sections correct earlier ones)
+- [Findings](docs/FINDINGS.md) (a chronological log: the Forza Horizon 3 kiosk demo, Sonic Mania, Minecraft and the full Forza Horizon 3; later sections correct earlier ones)
 - [Roadmap](docs/ROADMAP.md)
