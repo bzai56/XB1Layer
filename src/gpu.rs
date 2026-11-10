@@ -1841,11 +1841,63 @@ unsafe extern "system" fn ctx_execute_command_list(this: *mut c_void, cl: *mut c
 
 /// Console index 113 = desktop 114 `FinishCommandList(restore, ppCommandList)`: the title records most of its drawing on deferred
 /// contexts (DrawBundleRecordContext threads); the call was an unmapped stub, so no command list ever existed.
+/// Real deferred contexts that have had a viewport set since their state was last cleared. The console's default viewport is the
+/// bound render target; the desktop's is empty, and Forza Horizon 3's video conversion draw (the first draw of a list) sets none.
+static VIEWPORT_SET: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<usize>>> = std::sync::LazyLock::new(Default::default);
+
+/// Before a draw on a deferred context with no viewport yet: the viewport becomes the size of render target 0.
+fn default_viewport(real: *mut c_void) {
+    if VIEWPORT_SET.lock().unwrap().contains(&(real as usize)) || std::env::var_os("XB1_NO_DEFAULT_VIEWPORT").is_some() {
+        return;
+    }
+    unsafe {
+        let vt = *(real as *const *const usize);
+        let get: unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void, *mut *mut c_void) = std::mem::transmute(*vt.add(89));
+        let mut rtv: *mut c_void = ptr::null_mut();
+        let mut dsv: *mut c_void = ptr::null_mut();
+        get(real, 1, &mut rtv, &mut dsv);
+        let release = |o: *mut c_void| {
+            if !o.is_null() {
+                let r: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*((*(o as *const *const usize)).add(2)));
+                r(o);
+            }
+        };
+        if !rtv.is_null() {
+            let rvt = *(rtv as *const *const usize);
+            let get_res: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) = std::mem::transmute(*rvt.add(7));
+            let mut res: *mut c_void = ptr::null_mut();
+            get_res(rtv, &mut res);
+            if !res.is_null() {
+                let mut d = [0u32; 11];
+                let gd: unsafe extern "system" fn(*mut c_void, *mut u32) = std::mem::transmute(*((*(res as *const *const usize)).add(10)));
+                gd(res, d.as_mut_ptr());
+                if d[0] > 0 && d[1] > 0 && d[0] <= 16384 && d[1] <= 16384 {
+                    let vp: [f32; 6] = [0.0, 0.0, d[0] as f32, d[1] as f32, 0.0, 1.0];
+                    let set: unsafe extern "system" fn(*mut c_void, u32, *const f32) = std::mem::transmute(*vt.add(44));
+                    set(real, 1, vp.as_ptr());
+                    static LOGS: AtomicU32 = AtomicU32::new(0);
+                    if LOGS.fetch_add(1, Ordering::Relaxed) < 4 {
+                        glog!("[gpu] draw without a viewport on deferred context {real:p}: using the render target size {}x{}", d[0], d[1]);
+                    }
+                }
+                release(res);
+            }
+            release(rtv);
+        }
+        release(dsv);
+    }
+    VIEWPORT_SET.lock().unwrap().insert(real as usize);
+}
+
 unsafe extern "system" fn ctx_finish_command_list(this: *mut c_void, restore: usize, out: *mut *mut c_void, _a4: usize) -> HRESULT {
     static N: AtomicU32 = AtomicU32::new(0);
     let real = unsafe { real_context(this) };
     let f: unsafe extern "system" fn(*mut c_void, i32, *mut *mut c_void) -> HRESULT = unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(114))) };
     let hr = unsafe { f(real, (restore & 1) as i32, out) };
+    if restore & 1 == 0 {
+        // The deferred context's state (the viewport too) is cleared by a finish without restore.
+        VIEWPORT_SET.lock().unwrap().remove(&(real as usize));
+    }
     let n = N.fetch_add(1, Ordering::Relaxed);
     if n < 6 || n % 2000 == 0 {
         let cl = if out.is_null() { ptr::null_mut() } else { unsafe { *out } };
@@ -1949,14 +2001,25 @@ unsafe extern "system" fn ctx_viewports(this: *mut c_void, count: u32, vp: *cons
         let v = unsafe { std::slice::from_raw_parts(vp, 6) };
         glog!("[gpu]   trace: viewport({count}) x {} y {} w {} h {} depth {}..{}", v[0], v[1], v[2], v[3], v[4], v[5]);
     }
+    if !vp.is_null() && count >= 1 {
+        let v = unsafe { std::slice::from_raw_parts(vp, 6) };
+        if v[2] > 0.0 && v[2] <= 2.0 {
+            static TINY: AtomicU32 = AtomicU32::new(0);
+            if TINY.fetch_add(1, Ordering::Relaxed) < 10 {
+                glog!("[gpu] RSSetViewports({count}) tiny: {:?} words {:x?} ctx {this:p}", &v[..6], unsafe { std::slice::from_raw_parts(vp as *const u32, 6) });
+            }
+        }
+    }
     let real = unsafe { real_context(this) };
+    VIEWPORT_SET.lock().unwrap().insert(real as usize);
     let f: unsafe extern "system" fn(*mut c_void, u32, *const f32) =
         unsafe { std::mem::transmute(*((*(real as *const *const usize)).add(44))) };
     // Forza Horizon 3 passes a second kind of "viewport" (width 3.6e9, height 223) once per frame: not a valid desktop viewport (the
     // limit is 32767), the runtime rejects it and the draws that follow lose their viewport. Use the full 1920x1080 target then.
     if count >= 1 && !vp.is_null() && std::env::var_os("XB1_RAW_VIEWPORT").is_none() {
         let v = unsafe { std::slice::from_raw_parts(vp, 6) };
-        if !(v[2].is_finite() && v[3].is_finite() && v[2] > 0.0 && v[3] > 0.0 && v[2] <= 16384.0 && v[3] <= 16384.0) {
+        // A 1x1 viewport is the title's placeholder for the video conversion draw: it covers the whole target on the console.
+        if !(v[2].is_finite() && v[3].is_finite() && v[2] > 1.0 && v[3] > 1.0 && v[2] <= 16384.0 && v[3] <= 16384.0) {
             static BAD: AtomicU32 = AtomicU32::new(0);
             if BAD.fetch_add(1, Ordering::Relaxed) < 3 {
                 glog!("[gpu] RSSetViewports: invalid viewport {:?}: using 1920x1080", &v[..6]);
@@ -3382,6 +3445,9 @@ extern "system" fn sync_before_draw(this: *mut c_void) {
     DRAWS_SINCE_PRESENT.fetch_add(1, Ordering::Relaxed);
     let real = unsafe { (*(this as *const Proxy)).real };
     apply_inlined_state(this, real);
+    if !is_immediate_context(this) {
+        default_viewport(real);
+    }
     static NO_MIRROR: OnceLock<bool> = OnceLock::new();
     if *NO_MIRROR.get_or_init(|| env_flag("XB1_NO_MIRROR")) {
         return;
@@ -4099,6 +4165,7 @@ pub unsafe extern "system" fn present_array(a1: u64, a2: u64, a3: u64, a4: u64, 
                     glog!("[gpu] DXGIXPresentArray #{n}: Present on the swap chain -> {:#x}", hr as u32);
                 }
                 // No extra frame limiter: the vertical sync of `Present(1, 0)` already paces (a second limiter on top halved the rate).
+                crate::display::count_frame();
             }
         }
         if n > 0 && n % 300 == 0 {

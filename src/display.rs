@@ -147,6 +147,7 @@ pub fn limit_frame_rate() {
     static NEXT: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
     let fps = *FPS.get_or_init(|| std::env::var("XB1_FPS").ok().and_then(|v| v.parse().ok()).unwrap_or(60.0));
     if fps <= 0.0 {
+        count_frame();
         return;
     }
     let period = Duration::from_secs_f64(1.0 / fps);
@@ -166,7 +167,13 @@ pub fn limit_frame_rate() {
         }
     }
     *next = Some(target + period);
-    // Frames per second, logged a few times so the pacing can be checked.
+    count_frame();
+}
+
+/// Counts a presented frame; once a second the window title shows the frame rate (and the first few are logged).
+pub fn count_frame() {
+    use std::time::{Duration, Instant};
+    let now = Instant::now();
     static COUNT: std::sync::Mutex<(Option<Instant>, u32, u32)> = std::sync::Mutex::new((None, 0, 0));
     let mut c = COUNT.lock().unwrap();
     let start = *c.0.get_or_insert(now);

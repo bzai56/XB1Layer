@@ -1075,3 +1075,17 @@ and `+0x610` (70) `CSSetConstantBuffers(start, count, array*)`. They now forward
 Verified: the calls arrive with those shapes and the title keeps running, with the press-start text as before. Not verified: that the
 dispatches produce anything useful. The main-menu background is still black after the intros, so the compute stage alone was not the missing piece.
 Not re-checked after this change: Sonic Mania (different SDK table; the new entries only touch indices 40 and 67-70).
+
+## Forza Horizon 3: the main-menu background renders (viewport fix)
+
+Why the menu was black: the press-start background is a Bink 2 video. Its frames were uploaded and the conversion draw (Y, Cr, Cb planes to an RGBA8 target, then
+copied into the UI plane) ran every frame, but the render target stayed all zero (non-zero share 3e-5). A draw probe on a menu frame showed that draw with
+the viewport `[0, 0, 1, 1]`: the title sets a 1x1 viewport (`RSSetViewports` words `0,0,1.0,1.0,0,1.0`) for it, which covers one pixel on the desktop. The
+intro videos worked because their draw had a 1920x1080 viewport. The layer now treats any viewport with width or height of 1 or less like the other invalid
+ones the title passes (zero, 3.6e9 wide) and uses 1920x1080 (`XB1_RAW_VIEWPORT=1` restores the raw values). After that the UI plane is 99.9 % non-zero and the
+press-start screen shows the video background (cars on a street) with the "PRESS TO START" text and version line over it. Verified by screenshot
+(`docs/screenshots/forza-horizon-3-press-start.png`) and the plane statistics. Sonic Mania re-checked (title screen, no exceptions).
+Also: a deferred context that draws before any viewport was set now gets the size of its render target (`XB1_NO_DEFAULT_VIEWPORT=1` turns that off; it
+did not fire in the runs here), and the window title shows the frame rate for Forza Horizon 3 too (about 42 FPS in these runs; the title presents through
+`DXGIXPresentArray`, which is paced by the swap chain's vertical sync).
+Still open: the pad does not advance the screen (answers are in the code, untested), the version string is random per run, start-up crash races.

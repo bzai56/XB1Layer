@@ -21,7 +21,7 @@ An experimental compatibility layer for running Xbox One (GDK/XDK "Durango") x64
 - **Minecraft Xbox One Edition (1.2.0.0, an older XDK)**: the main menu, Play Game, Start Game and Create New World work, and a generated world renders in 3D with the HUD at 60 FPS in a release build (about 3,200 draw calls per frame). Keyboard and DualSense input work (the user confirmed every control), and the game has sound. The layer wraps this XDK's older DXGI/D3D11 layout and its embedded context calls, completes its storage, Xbox Live and system-keyboard operations, hands the game zeroed heap blocks (it relies on them), and carries one guarded compatibility patch (it keeps the default options when the stand-in storage returns a blank profile). Details in [FINDINGS](docs/FINDINGS.md).
 
 ## What does not work
-- **Forza Horizon 3 (full game, 1.0.125.0)**: gets through startup and file mounting, shows the intro videos in full colour and reaches the press-start screen at a steady frame rate: the "PRESS TO START" text and the version line appear (UI overlay plane composited over the swap chain). The main-menu background is still black, the pad does not advance the screen (the pad answers are in the code but untested), the version string is random per run, and about half of the runs crash on a start-up race (start it again). The console compute stage (Dispatch, CS shader/UAV/samplers/constant buffers) is now forwarded without changing the picture. Title-specific workaround: the layer writes the game's "render enabled" request (`XB1_FH3_BOOT=0` turns it off). See `docs/FINDINGS.md`.
+- **Forza Horizon 3 (full game, 1.0.125.0)**: gets through startup and file mounting, shows the intro videos in full colour and reaches the press-start screen with its video background (cars on a street), the "PRESS TO START" text and the version line, at about 40 FPS. The pad does not advance the screen yet (the pad answers are in the code but untested), so the game menu and any 3D gameplay are not reached; the version string is random per run; about half of the runs crash on a start-up race (start it again). Title-specific workaround: the layer writes the game's "render enabled" request (`XB1_FH3_BOOT=0` turns it off). See `docs/FINDINGS.md`.
 - **Forza Horizon 3 kiosk demo** (retired): booted into its main loop but never drew or presented. It writes AMD PM4 command packets that nothing decodes, uses placed textures with console tiling that is not de-tiled, and its D3D11X present path (`DXGIXPresentArray`, `DXGIXSetVLineNotification`) is still a logging stub.
 - **Minecraft**: nothing is saved (the storage stand-ins keep no data); the Minecraft store button reportedly crashes the game (user report, not investigated); the credits screen shows no text (only its blurred backdrop); Join Game and anything online are untested; dialogs were seen with the menu text drawn through them (not re-checked); the 3D picture has only been looked at, not compared with a console; the topology of draws is partly guessed; a startup crash in the input table (`0x53be0e`) hit about half of the runs before the zeroed-allocation fix and none in 10 runs since.
 - **Other titles**: untested. Console context-table indices 23 and 24 to 31 are unidentified, and anything not evidenced by a logged call only logs.
@@ -31,9 +31,9 @@ An experimental compatibility layer for running Xbox One (GDK/XDK "Durango") x64
 
 The window shows the game name, the frame rate and the logo. Captured from the layer's window (`tools/screenshot-window.ps1`):
 
-| Sonic Mania (title screen) | Minecraft Xbox One Edition (main menu) |
-|---|---|
-| ![Sonic Mania title screen](docs/screenshots/sonic-mania-title.png) | ![Minecraft main menu](docs/screenshots/minecraft-1.png) |
+| Sonic Mania (title screen) | Minecraft Xbox One Edition (main menu) | Forza Horizon 3 (press-start screen) |
+|---|---|---|
+| ![Sonic Mania title screen](docs/screenshots/sonic-mania-title.png) | ![Minecraft main menu](docs/screenshots/minecraft-1.png) | ![Forza Horizon 3 press-start screen](docs/screenshots/forza-horizon-3-press-start.png) |
 
 ## Build and run
 Requires Rust (MSVC toolchain, x64). Use a release build to play: the debug build is several times slower (in Minecraft the difference between a playable and an unplayable frame rate).
@@ -63,7 +63,7 @@ Run a title from its own folder so relative paths resolve.
 [MIT](LICENSE).
 
 ## Contributing
-Contributions are welcome. The biggest open problems are rendering the Forza Horizon 3 main menu (the scene render target stays empty; several embedded context calls are still unmapped), verifying gamepad input in that title, the start-up crash races, and, for titles that use them, decoding GPU command packets (see the [Roadmap](docs/ROADMAP.md)). Reports of what other titles need are useful too.
+Contributions are welcome. The biggest open problems are getting Forza Horizon 3 past the press-start screen (gamepad input is unverified; several embedded context calls are still unmapped), the start-up crash races, and, for titles that use them, decoding GPU command packets (see the [Roadmap](docs/ROADMAP.md)). Reports of what other titles need are useful too.
 
 ## Docs
 - [Architecture](docs/ARCHITECTURE.md)
