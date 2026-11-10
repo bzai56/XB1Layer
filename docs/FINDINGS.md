@@ -1143,3 +1143,11 @@ that read the "any activity" flag (`0x172fc7a`, `0x70858x`, `0xc724cc`) do see t
 `0x20f88b0` (its callers) and whether a controller event type exists that the layer's answers keep from being created (the per-controller caps `0x1a10250`, the connected handler `0x1a1a490`, and the controller-added event arguments are the candidates).
 
 User report (Forza Horizon 3, press-start screen): a white box appears at the spot between "PRESS" and "TO START". That is the controller button glyph (from `media\ui\textures\data_bound\controllericons.zip`, opened by the title): the quad is now drawn but its texture is not bound or uploaded (white = unbound/blank sampler result). In the runs here the slot stayed empty, so the glyph probably pulses or only shows when the title picks a controller type. This is a texture problem (see the placed-texture notes), separate from the input question. `XB1_HWBP_RW=1` (read/write hardware watch) was added; the one attempt to watch the per-controller mask copy (`rcx+0xc8` at title+`0x1a21630`) ended in start-up crashes in every run and was not pursued.
+
+### Forza Horizon 3: the button glyph textures (small placed textures use an 8-element pitch)
+
+`XB1_DUMP_SEEN=<dir>` (new) writes every texture the title bound as a shader input at present 5000 as a PPM (44 distinct at the press-start screen). Among them three 32x32 RGBA8 textures: one all white, one all
+black, one the green "A" button icon. The icon came out cut off (only the top half, the rest black): it is a placed texture in tile mode 0xd, and the de-tiler assumed the base level's pitch is padded to 64 elements for every texture; a 32-wide texture
+is padded to 8 only (4 tiles per row), so its rows were read from the wrong tiles. With the pitch rule "64 for 64 elements or more, else 8" the icon decodes completely (`XB1_PITCH64_ALL=1` restores the old rule). Verified on the dumped icon;
+the picture's glyph slot ("PRESS [ ] TO START") is still empty in my runs: the glyph textures that would fill it are either the white placeholder (what you saw as the white box) or all-zero (not yet written by the title, which the mirror does not upload),
+so the title has not streamed the icon for the controller it thinks is present, which fits the open input question (no controller type chosen).

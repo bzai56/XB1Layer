@@ -2256,6 +2256,9 @@ unsafe fn srv_array(this: *mut c_void, views: *const *mut c_void, a3: usize, a4:
             };
             if res != 0 {
                 mirror_placed_texture(res);
+                if *SEEN_TEX_ON.get_or_init(|| std::env::var_os("XB1_DUMP_SEEN").is_some()) {
+                    SEEN_TEX.lock().unwrap().insert(res);
+                }
             }
         }
         unsafe { f(real, start, count.max(1) as u32, list.as_ptr()) };
@@ -2602,11 +2605,11 @@ unsafe fn readback_texture(real: *mut c_void, res: *mut c_void, d: [u32; 11]) {
                     line.push_str(&format!(" ({x},{y}) {v:#010x} r{} g{} b{} a{};", v & 0x3ff, (v >> 10) & 0x3ff, (v >> 20) & 0x3ff, v >> 30));
                 }
             }
-            if let Ok(dir) = std::env::var("XB1_DUMP_IMG") {
+            if let Ok(dir) = std::env::var("XB1_DUMP_IMG").or_else(|_| std::env::var("XB1_DUMP_SEEN")) {
                 // Whole texture to a PPM (formats 28 = RGBA8, 23 / 24 = R10G10B10A2) for looking at it: at most 40 files.
                 static IMGS: AtomicU32 = AtomicU32::new(0);
                 let k = IMGS.fetch_add(1, Ordering::Relaxed);
-                if k < 40 && matches!(d[4], 28 | 87 | 23 | 24) && d[0] > 64 && d[1] > 64 {
+                if k < 120 && matches!(d[4], 28 | 87 | 23 | 24) && d[0] >= 8 && d[1] >= 8 {
                     let (w, h) = (d[0] as usize, d[1] as usize);
                     let mut out = Vec::with_capacity(w * h * 3 + 32);
                     out.extend_from_slice(format!("P6
@@ -3248,7 +3251,9 @@ fn mirror_placed_texture(resource: usize) {
     for l in 0..mips {
         let (lw, lh) = ((w >> l).max(1), (h >> l).max(1));
         let (ew, eh) = ((lw + bw - 1) / bw, (lh + bh - 1) / bh);
-        let pitch_el = if l == 0 { (ew + 63) / 64 * 64 } else { (ew + 7) / 8 * 8 };
+        // The base level's pitch is 64 elements for textures of 64 or more elements, but a small texture (the 32x32 button glyph) is only
+        // padded to 8: with 64 its rows were read from the wrong tiles and the lower half stayed empty. XB1_PITCH64_ALL=1 restores 64.
+        let pitch_el = if l == 0 && (ew >= 64 || std::env::var_os("XB1_PITCH64_ALL").is_some()) { (ew + 63) / 64 * 64 } else { (ew + 7) / 8 * 8 };
         let (tx, ty) = (pitch_el / 8, (eh + 7) / 8);
         levels.push((ew, eh, tx, ty, off));
         off += tx * ty * 64 * bpe;
@@ -3312,6 +3317,34 @@ fn mirror_placed_texture(resource: usize) {
     let n = NLOG.fetch_add(1, Ordering::Relaxed);
     if n < 8 || n % 500 == 0 {
         glog!("[gpu] placed texture {resource:#x} {w}x{h} fmt {fmt} mips {mips}: uploaded {off} bytes from {:#x} (#{n})", pt.memory);
+    }
+}
+
+/// `XB1_DUMP_SEEN=<dir>`: every texture the title bound as a shader input is written (at present 3000) as a PPM, small ones included
+/// (the button glyph, the white fallback textures).
+static SEEN_TEX_ON: OnceLock<bool> = OnceLock::new();
+static SEEN_TEX: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<usize>>> = std::sync::LazyLock::new(Default::default);
+
+fn dump_seen_textures() {
+    let Ok(dir) = std::env::var("XB1_DUMP_SEEN") else { return };
+    let proxy = CONTEXT_PROXY.load(Ordering::Acquire);
+    if proxy == 0 {
+        return;
+    }
+    let real = unsafe { (*(proxy as *const Proxy)).real };
+    let list: Vec<usize> = SEEN_TEX.lock().unwrap().iter().copied().collect();
+    glog!("[gpu] dumping {} bound textures to {dir}", list.len());
+    for res in list {
+        unsafe {
+            let tvt = *(res as *const *const usize);
+            let gd: unsafe extern "system" fn(*mut c_void, *mut u32) = std::mem::transmute(*tvt.add(10));
+            let mut d = [0u32; 11];
+            gd(res as *mut c_void, d.as_mut_ptr());
+            glog!("[gpu]   bound texture {res:#x}: {}x{} mips {} format {}", d[0], d[1], d[2], d[4]);
+            if matches!(d[4], 28 | 87 | 23 | 24) && d[0] >= 8 && d[0] <= 2048 {
+                readback_texture(real, res as *mut c_void, d);
+            }
+        }
     }
 }
 
@@ -4025,6 +4058,9 @@ pub unsafe extern "system" fn present_array(a1: u64, a2: u64, a3: u64, a4: u64, 
     }
     if n == 1500 {
         dump_placed_textures();
+    }
+    if n == 5000 {
+        dump_seen_textures();
     }
     if n > 0 && n % 600 == 0 && std::env::var_os("XB1_PLANE_STATS").is_some() {
         let proxy = CONTEXT_PROXY.load(Ordering::Acquire);
