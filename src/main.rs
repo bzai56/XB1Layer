@@ -705,7 +705,7 @@ extern "system" fn crash_logger(info: *const *const u8) -> i32 {
                                 target = *(target as *const usize) + usize::from_str_radix(o2.trim_start_matches("0x"), 16).unwrap_or(0);
                             }
                             *(ctx.add(0x48) as *mut u64) = target as u64; // Dr0
-                            *(ctx.add(0x70) as *mut u64) = 1 | (1 << 16) | (3 << 18); // L0, write, 8 bytes
+                            *(ctx.add(0x70) as *mut u64) = 1 | (if std::env::var_os("XB1_HWBP_RW").is_some() { 3u64 } else { 1u64 } << 16) | (3 << 18); // L0, write, 8 bytes
                             arm_hwbp_all_threads(target);
                             rlog!("  hardware write breakpoint armed on {target:#x} (all threads)");
                         }
@@ -1781,7 +1781,7 @@ unsafe fn arm_hwbp_on(thread: *mut c_void, addr: usize) {
     let mut c = Ctx([0u8; 1232]);
     *(c.0.as_mut_ptr().add(0x30) as *mut u32) = 0x0010_0010; // CONTEXT_AMD64 | CONTEXT_DEBUG_REGISTERS
     *(c.0.as_mut_ptr().add(0x48) as *mut u64) = addr as u64;
-    *(c.0.as_mut_ptr().add(0x70) as *mut u64) = 1 | (1 << 16) | (3 << 18);
+    *(c.0.as_mut_ptr().add(0x70) as *mut u64) = 1 | (if std::env::var_os("XB1_HWBP_RW").is_some() { 3u64 } else { 1u64 } << 16) | (3 << 18);
     SetThreadContext(thread, c.0.as_ptr() as *const c_void);
 }
 
