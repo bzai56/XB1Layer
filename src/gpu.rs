@@ -3964,7 +3964,7 @@ pub unsafe extern "system" fn present_array(a1: u64, a2: u64, a3: u64, a4: u64, 
             }
             if plane != 0 && plane == own {
                 // The UI overlay: the title draws its UI into the display plane's texture; blend it over the swap chain's buffer.
-                if std::env::var("XB1_UI_COMPOSITE").as_deref() == Ok("1") {
+                if std::env::var("XB1_UI_COMPOSITE").as_deref() != Ok("0") {
                     let plane_tex = first_plane_back_buffer();
                     let proxy = CONTEXT_PROXY.load(Ordering::Acquire);
                     if plane_tex != 0 && proxy != 0 {
