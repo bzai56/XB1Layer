@@ -1097,3 +1097,15 @@ With `XB1_PAD_PULSE=<seconds>` each non-float slot (6 to 15, 17, 21 to 23, 26 to
 press-start screen never advanced. So none of those boolean getters alone is the "press start" input, or the title also needs something else (a controller
 that is associated with the signed-in user, the controller events, or a different reading object: the element's slot 7 and 41 are polled each frame too and
 are still generic stand-ins). Next: log what the title does with slots 7 and 41, and which of the Controller class's other slots it reads at the press-start screen.
+
+### Forza Horizon 3: what the title's pad code does (static reading, press-start still not passed)
+
+The poll function is at title+`0x1a1feb0` (called each frame); it walks 8 controller slots (struct stride `0x1720`), takes `[slot+0x78]` slot 6 (a controller sub-object) and calls
+`0x1a10550(slot, object, state*)`, which returns 0 when the object answers the title's interface queries (else `0x45d`: no pad). That function has two modes: if
+the object also yields a reading *struct* (`GetCurrentReading`, slot 8, 40 bytes: timestamp u64, buttons u32 at +8, then LT, RT, LX, LY, RX, RY floats) it uses that; otherwise
+it polls the reading *object's* getters: slots 6 to 15, 28, 29, 33 are button booleans (the mask bit is the slot's position), 24, 25, 26, 32 are "is available" booleans that guard the float getters 16 to 20.
+The merged per-user state is then read further down; a controller counts as connected when `0x1a10550` returned 0 (the flag at `[state+4]` triggers the title's
+"controller connected" handler `0x1a1a490` once). Tests done (screenshots, press-start screen kept looping): every boolean getter pressed in turn, all of them pressed at once
+(`XB1_PAD_ALL=1`), slot 6 as a rising 64-bit timestamp: none advanced the screen. Not found yet: what the press-start state machine waits for (the button glyph between
+"PRESS" and "TO START" is also missing, which suggests it does not yet see a controller type). Next: log the return value of `0x1a10550` per slot (a register-print watch site on the
+`eax` after the call at `0x1a1ff98`) and the interface IDs the title queries on the controller, to see whether the title considers the pad connected at all.

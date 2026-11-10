@@ -1043,6 +1043,13 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
                 eprintln!("[input] pad reading getter slot {N} polled (class {})", o.class);
             }
         }
+        if N == 6 && std::env::var_os("XB1_PAD_SLOT6_BOOL").is_none() {
+            // Slot 6 as the reading's timestamp (a 64-bit time that advances): a stale or zero stamp may make the title ignore the reading.
+            static T0: OnceLock<std::time::Instant> = OnceLock::new();
+            let t = T0.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64 + 1_000_000;
+            unsafe { ptr::write_unaligned(arg1 as *mut u64, t) };
+            return HRESULT(0);
+        }
         const FLOATS: [usize; 6] = [16, 18, 19, 20, 24, 25];
         if FLOATS.contains(&N) {
             unsafe { ptr::write_unaligned(arg1 as *mut f32, 0.0) };
@@ -1664,7 +1671,7 @@ fn pad_bool(slot: usize) -> bool {
     static LAST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
     let start = *START.get_or_init(std::time::Instant::now);
     let Some(from) = std::env::var("XB1_PAD_PULSE").ok().and_then(|v| v.parse::<f64>().ok()) else { return false };
-    const CANDIDATES: [usize; 22] = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 21, 22, 23, 26, 27, 28, 29, 30, 31, 32, 33];
+    const CANDIDATES: [usize; 21] = [7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 21, 22, 23, 26, 27, 28, 29, 30, 31, 32, 33];
     let t = start.elapsed().as_secs_f64() - from;
     if t < 0.0 {
         return false;
@@ -1673,6 +1680,9 @@ fn pad_bool(slot: usize) -> bool {
     let pressed_phase = (t % 3.0) < 1.5;
     if pressed_phase && LAST.swap(idx, Ordering::Relaxed) != idx {
         eprintln!("[input] pulse slot {} at {:.1} s", CANDIDATES[idx], t + from);
+    }
+    if std::env::var_os("XB1_PAD_ALL").is_some() {
+        return pressed_phase;
     }
     pressed_phase && CANDIDATES[idx] == slot
 }
