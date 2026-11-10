@@ -1089,3 +1089,11 @@ Also: a deferred context that draws before any viewport was set now gets the siz
 did not fire in the runs here), and the window title shows the frame rate for Forza Horizon 3 too (about 42 FPS in these runs; the title presents through
 `DXGIXPresentArray`, which is paced by the swap chain's vertical sync).
 Still open: the pad does not advance the screen (answers are in the code, untested), the version string is random per run, start-up crash races.
+
+## Forza Horizon 3: pad test (negative result)
+
+The reading object (controller element, slot 12) is polled every frame through getter slots 6 to 17, 24 to 26, 28 to 30, 32 and 33 (logged as `[input] pad reading getter slot N polled`).
+With `XB1_PAD_PULSE=<seconds>` each non-float slot (6 to 15, 17, 21 to 23, 26 to 33) was set to true in turn for 1.5 s (3 s apart, two full cycles watched by screenshot): the
+press-start screen never advanced. So none of those boolean getters alone is the "press start" input, or the title also needs something else (a controller
+that is associated with the signed-in user, the controller events, or a different reading object: the element's slot 7 and 41 are polled each frame too and
+are still generic stand-ins). Next: log what the title does with slots 7 and 41, and which of the Controller class's other slots it reads at the press-start screen.

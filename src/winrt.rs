@@ -1035,6 +1035,14 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
     // into each, so the booleans held random bytes. Answer with real values: zero, or (XB1_PAD_PULSE=1, a test mode) one boolean slot
     // pressed at a time after the intros, to find which slot is which button.
     if o.class.starts_with("Windows.Xbox.Input.Controller.Controllers (element") && o.class.ends_with("#slot12") && !crate::VCCORLIB110.load(Ordering::Relaxed) && (6..=33).contains(&N) && is_writable(arg1) && std::env::var_os("XB1_OLD_PAD_ANSWERS").is_none() {
+        {
+            static SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+            let mut g = SEEN.lock().unwrap();
+            if !g.contains(&N) {
+                g.push(N);
+                eprintln!("[input] pad reading getter slot {N} polled (class {})", o.class);
+            }
+        }
         const FLOATS: [usize; 6] = [16, 18, 19, 20, 24, 25];
         if FLOATS.contains(&N) {
             unsafe { ptr::write_unaligned(arg1 as *mut f32, 0.0) };
@@ -1656,7 +1664,7 @@ fn pad_bool(slot: usize) -> bool {
     static LAST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
     let start = *START.get_or_init(std::time::Instant::now);
     let Some(from) = std::env::var("XB1_PAD_PULSE").ok().and_then(|v| v.parse::<f64>().ok()) else { return false };
-    const CANDIDATES: [usize; 15] = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 28, 29, 33, 26, 32];
+    const CANDIDATES: [usize; 22] = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 21, 22, 23, 26, 27, 28, 29, 30, 31, 32, 33];
     let t = start.elapsed().as_secs_f64() - from;
     if t < 0.0 {
         return false;
