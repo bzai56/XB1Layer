@@ -1429,6 +1429,19 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
         wlog!("[winrt] {} slot {N}: arg1 is a COM object -> treated as an event subscription", o.class);
         return HRESULT(0);
     }
+    if o.class.starts_with("Windows.Xbox.Management.Deployment.") {
+        unsafe extern "system" { fn RtlCaptureStackBackTrace(skip: u32, count: u32, frames: *mut *mut c_void, hash: *mut u32) -> u16; }
+        static SEEN: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+        let mut frames = [ptr::null_mut::<c_void>(); 2];
+        unsafe { RtlCaptureStackBackTrace(0, 2, frames.as_mut_ptr(), ptr::null_mut()) };
+        let (base, _) = crate::image_range();
+        let key = (N, (frames[1] as usize).wrapping_sub(base));
+        let mut g = SEEN.lock().unwrap();
+        if !g.contains(&key) {
+            g.push(key);
+            eprintln!("[input] {} slot {N} called from title+{:#x}", o.class, key.1);
+        }
+    }
     if o.class == "Windows.Xbox.Input.Controller.Controllers (element 0)" && matches!(N, 7 | 12 | 38 | 41) {
         unsafe extern "system" { fn RtlCaptureStackBackTrace(skip: u32, count: u32, frames: *mut *mut c_void, hash: *mut u32) -> u16; }
         static SEEN: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());

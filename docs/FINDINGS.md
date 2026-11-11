@@ -1155,3 +1155,10 @@ so the title has not streamed the icon for the controller it thinks is present, 
 Controller element slot 7 (called every frame from title+`0x1a24a61`) is `IController::get_Type`, an HSTRING: the caller passes it to `WindowsDuplicateString` (import thunk `0x17cffc4`) and releases it with `WindowsDeleteString` (`0x17cffbe`).
 The layer wrote an object pointer there; it now answers `"Windows.Xbox.Input.Gamepad"` (`XB1_NO_CONTROLLER_TYPE=1` restores the old answer). The press-start screen and the glyph slot did not change with it (Menu and A presses at 40 s, 48 s, 56 s), so the title does not use the type
 string for them; the string is only duplicated and released inside `0x1a10550`.
+
+### Forza Horizon 3: other things the press-start screen waits for (checked, none confirmed)
+
+- No attract mode: left alone for about 270 s the screen only loops the press-start video (`press_start.bk2`); the title's idle path (`Attract.bk2`, `BASE_PressStartAttract`) never kicks in. The idle timers (`0x172fc7a`, `0x70858x`, `0xc724cc`) count only while the "any activity" flag is clear and read it every frame, so either their threshold is longer than that or they are gated by something that is also missing for input.
+- A background poller (about ten times a second, `0x14a24b0` via `0x1c30480` and `0x1c357b0`) activates `Windows.Xbox.Management.Deployment.PackageTransferManager`, calls its slot 6 and then slot 10, a 32-bit "state" it compares with 1 or 3 (`dec eax; test eax,0xfffffffd`). The layer's generic answer writes a pointer's low half there; the value is
+  never 1 or 3 in practice, so the title takes the "nothing pending" branch. Not a confirmed blocker.
+- Other controller-element slots the title calls every frame and the layer still answers generically: 12 (returns the reading/properties object whose getters are answered), 38 `(HSTRING, out)`, 41 (a call with a non-pointer argument, probably a vibration or LED setter).
