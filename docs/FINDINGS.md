@@ -1162,3 +1162,11 @@ string for them; the string is only duplicated and released inside `0x1a10550`.
 - A background poller (about ten times a second, `0x14a24b0` via `0x1c30480` and `0x1c357b0`) activates `Windows.Xbox.Management.Deployment.PackageTransferManager`, calls its slot 6 and then slot 10, a 32-bit "state" it compares with 1 or 3 (`dec eax; test eax,0xfffffffd`). The layer's generic answer writes a pointer's low half there; the value is
   never 1 or 3 in practice, so the title takes the "nothing pending" branch. Not a confirmed blocker.
 - Other controller-element slots the title calls every frame and the layer still answers generically: 12 (returns the reading/properties object whose getters are answered), 38 `(HSTRING, out)`, 41 (a call with a non-pointer argument, probably a vibration or LED setter).
+
+## Controller element slots 36/38/41 (checked, not an input handshake)
+
+The per-frame calls on the controller stand-in that were still answered generically were logged with their arguments:
+slot 41 takes a plain integer (4 or 9), which looks like vibration or LED state; slots 36 and 38 take the string
+`"PauseHeartbeat"` (so they are not controller calls at all, the interface identification for that stand-in is shared
+with something else); slot 12 returns the reading object as before. None of these looks like something the press-start
+screen waits for, so the missing piece is still the path from pad state to UI input events.

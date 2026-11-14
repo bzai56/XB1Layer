@@ -1387,6 +1387,17 @@ unsafe extern "system" fn generic_slot<const N: usize>(this: *mut c_void, arg1: 
     }
     // A string in arg1 (`GetXxx(name, Object** out)`): the object goes to the second argument.
     if looks_like_hstring_header(arg1) && (arg2 as usize) % 8 == 0 && is_writable(arg2) {
+        if o.class.starts_with("Windows.Xbox.Input.Controller") {
+            static SEEN_N: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
+            let mut g = SEEN_N.lock().unwrap();
+            if !g.iter().any(|(c, n)| c == &o.class && *n == N) {
+                g.push((o.class.clone(), N));
+                let h: HSTRING = unsafe { std::mem::transmute(arg1) };
+                let line = format!("[input] STRARG {} slot {N} = {:?}\n", o.class, h.to_string());
+                eprint!("{line}");
+                std::mem::forget(h);
+            }
+        }
         unsafe { *(arg2 as *mut *mut c_void) = create_generic(&format!("{}#slot{N}", o.class), &o.iid) };
         wlog!("[winrt] {} slot {N}: (string, out) -> a stand-in object", o.class);
         return HRESULT(0);
