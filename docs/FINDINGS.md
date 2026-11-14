@@ -1170,3 +1170,13 @@ slot 41 takes a plain integer (4 or 9), which looks like vibration or LED state;
 `"PauseHeartbeat"` (so they are not controller calls at all, the interface identification for that stand-in is shared
 with something else); slot 12 returns the reading object as before. None of these looks like something the press-start
 screen waits for, so the missing piece is still the path from pad state to UI input events.
+
+## Press-start: event counters and controller-added events (negative)
+
+- With `--watch-repeat` and `XB1_WATCH_COUNT=1` on the UI event dispatchers (title+0x21354d0, 0x2133030, 0x214fc40, 0x20f88b0, 0x20f9390),
+  they run heavily while the screens load, then not at all while the press-start screen idles (only the main tick and the
+  poll function run). A burst with 0x20f9390 comes about 25 s after load whether or not a button is pressed (it moved with
+  the load time, not with `XB1_AUTOPRESS`), so it is the video / scene cycling, not input.
+- Raising the controller added / pairing handlers for this SDK (`XB1_INPUT_EVENTS=1`, which is off by default for FH3) works
+  (`Invoke -> 0x0` for the registered handlers) but the screen still does not react to a press.
+- So no input event ever reaches the UI layer; what turns pad state into events is still unknown.
